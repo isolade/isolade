@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2237.8 50.0 124 124%22 role=%22img%22 aria-label=%22Isolade%22%3E %3Cdefs%3E %3ClinearGradient id=%22body%22 x1=%220.15%22 y1=%220%22 x2=%220.85%22 y2=%221%22%3E %3Cstop offset=%220%22 stop-color=%22%23FEF08A%22/%3E %3Cstop offset=%220.5%22 stop-color=%22%23FACC15%22/%3E %3Cstop offset=%221%22 stop-color=%22%23EAB308%22/%3E %3C/linearGradient%3E %3ClinearGradient id=%22leaf%22 x1=%220%22 y1=%220%22 x2=%221%22 y2=%221%22%3E %3Cstop offset=%220%22 stop-color=%22%23A3E635%22/%3E %3Cstop offset=%221%22 stop-color=%22%234D7C0F%22/%3E %3C/linearGradient%3E %3C/defs%3E %3Cg transform=%22translate(0,0) scale(1.0)%22%3E %3Cpath d=%22M72,92 V78 C72,58 128,58 128,78 V92%22 fill=%22none%22 stroke=%22url(%23leaf)%22 stroke-width=%2213%22 stroke-linecap=%22round%22/%3E %3Cpath d=%22M128,70 C141,61 154,66 154,66 C154,66 149,81 136,83 C129,84 127,76 128,70 Z%22 fill=%22url(%23leaf)%22/%3E %3Cpath d=%22M133,72 C139,70 147,68 150,67%22 fill=%22none%22 stroke=%22%231a2e05%22 stroke-width=%221.4%22 stroke-linecap=%22round%22 opacity=%220.45%22/%3E %3Crect x=%2252%22 y=%2284%22 width=%2296%22 height=%2284%22 rx=%2229%22 fill=%22url(%23body)%22 stroke=%22%23CA8A04%22 stroke-width=%223%22/%3E %3Ccircle cx=%2250%22 cy=%22126%22 r=%226.5%22 fill=%22%23EAB308%22/%3E %3Ccircle cx=%22150%22 cy=%22126%22 r=%226.5%22 fill=%22%23EAB308%22/%3E %3Ccircle cx=%22100%22 cy=%22121%22 r=%2211%22 fill=%22%237c4a0b%22/%3E %3Cpath d=%22M94.5,127 L105.5,127 L108.5,150 L91.5,150 Z%22 fill=%22%237c4a0b%22/%3E %3Cellipse cx=%2282%22 cy=%22102%22 rx=%2215%22 ry=%229%22 fill=%22%23fff%22 opacity=%220.28%22 transform=%22rotate(-28 82 102)%22/%3E %3C/g%3E %3C/svg%3E" />
+    <title>Isolade</title>
+    <!-- Apply the persisted theme's mode + background before first paint to
+         avoid a flash. Full token overrides are applied by initTheme() once
+         the app module loads. Keep in sync with lib/settings.ts. -->
+    <script>
+      (function () {
+        try {
+          var boot = JSON.parse(
+            localStorage.getItem("isolade.themeBoot") || "null",
+          );
+          var mode = (boot && boot.mode) || "dark";
+          var background = (boot && boot.background) || "#0d1117";
+          var root = document.documentElement;
+          if (mode === "dark") root.classList.add("dark");
+          root.style.colorScheme = mode;
+          root.style.backgroundColor = background;
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

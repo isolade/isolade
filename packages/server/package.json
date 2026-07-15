@@ -1,0 +1,22 @@
+{
+  "name": "@isolade/server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --watch --no-clear-screen src/index.ts",
+    "start": "bun run src/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@isolade/sandbox": "workspace:*",
+    "@isolade/shared": "workspace:*",
+    "drizzle-orm": "^0.45",
+    "hono": "^4",
+    "toml-eslint-parser": "^1.0.3",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}

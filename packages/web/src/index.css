@@ -1,0 +1,374 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  color-scheme: light;
+  --radius: 0.5rem;
+  /* "Light": a soft, low-glare light palette. The canvas is a subtle gray
+     (#f6f8fa) with white, elevated cards, deliberately off-white rather than
+     pure #fff. Other light themes (e.g. Solarized Light) layer their own
+     tokens on top of this base. */
+  --background: #f6f8fa; /* canvas.subtle */
+  --foreground: #1f2328; /* fg.default */
+  --card: #ffffff; /* canvas.default */
+  --card-foreground: #1f2328;
+  --popover: #ffffff;
+  --popover-foreground: #1f2328;
+  --primary: #1f2328;
+  --primary-foreground: #ffffff;
+  --secondary: #eaeef2; /* neutral.muted surface */
+  --secondary-foreground: #1f2328;
+  --muted: #eaeef2;
+  --muted-foreground: #656d76; /* fg.muted */
+  --accent: #eaeef2;
+  --accent-foreground: #1f2328;
+  --destructive: #cf222e; /* danger.fg */
+  --destructive-foreground: #ffffff;
+  --border: #d0d7de; /* border.default */
+  --input: #d0d7de;
+  --ring: #0969da; /* accent.fg */
+  --link: #0969da; /* accent.fg: GitHub's link color */
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+}
+
+.dark {
+  color-scheme: dark;
+  /* "Dark" tracks GitHub Dark (Primer): the #0d1117 canvas with its cool
+     blue-gray tint and #30363d separators. The pure-black #000 look lives in
+     the Extra Dark theme. */
+  --background: #0d1117; /* canvas.default */
+  --foreground: #e6edf3; /* fg.default */
+  --card: #161b22; /* canvas.overlay */
+  --card-foreground: #e6edf3;
+  --popover: #161b22;
+  --popover-foreground: #e6edf3;
+  --primary: #e6edf3;
+  --primary-foreground: #0d1117;
+  --secondary: #21262d; /* btn.bg */
+  --secondary-foreground: #e6edf3;
+  --muted: #21262d;
+  --muted-foreground: #8b949e; /* fg.muted */
+  --accent: #30363d; /* btn.hover.bg / border.default */
+  --accent-foreground: #e6edf3;
+  --destructive: #da3633; /* danger.emphasis */
+  --destructive-foreground: #ffffff;
+  --border: #30363d; /* border.default */
+  --input: #30363d;
+  --ring: #2f81f7; /* accent.fg */
+  --link: #2f81f7; /* accent.fg: GitHub's link color */
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+}
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-link: var(--link);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* Spinner rotation pivot. lucide icons (Loader2/RefreshCw) spun with
+   `.animate-spin` wobble in WebKit/WKWebView (the Tauri app's webview)
+   because a percentage `transform-origin` on an <svg> resolves against the SVG
+   viewport coordinate system rather than the element box, so the pivot drifts
+   off-centre. Pinning transform-box to the icon's own fill box makes `center`
+   the icon's geometric centre, so every spinner rotates cleanly in place. */
+svg.animate-spin {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+/* Cheap, library-free virtualization for the chat history. Every chat tab of
+   an instance stays mounted and is hidden with `display:none` (see
+   InstanceView), so activating a tab flips it back to `display:block` and the
+   browser must lay out and paint the entire message list in one synchronous
+   frame. For a long chat — many messages, big highlighted code blocks — that
+   first layout is what makes the click feel sluggish.
+
+   `content-visibility:auto` lets the browser skip layout+paint for rows
+   outside (and not near) the viewport, so showing a tab only costs the handful
+   of messages actually on screen; the rest render lazily as they scroll in.
+   `contain-intrinsic-size: auto <fallback>` supplies a placeholder height for
+   skipped rows so the scrollbar stays sane, and the `auto` keyword makes the
+   browser remember each row's real size once it has been rendered, so scroll
+   position is stable after the first reveal. */
+.chat-message {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 100px;
+}
+
+/* Syntax-highlighting token colors for rehype-highlight (highlight.js
+   classes) in chat code blocks. Values are GitHub Primer's prettylights
+   syntax palette so highlighted code matches the GitHub Light / GitHub Dark
+   themes above. Class→token mapping ported from highlight.js's github.css /
+   github-dark.css. */
+:root {
+  --hljs-comment: #57606a;
+  --hljs-keyword: #cf222e;
+  --hljs-attr: #0550ae;
+  --hljs-string: #0a3069;
+  --hljs-title: #8250df;
+  --hljs-built-in: #953800;
+  --hljs-name: #116329;
+  --hljs-section: #0550ae;
+  --hljs-bullet: #3b2300;
+  --hljs-subst: #1f2328;
+  --hljs-addition-fg: #116329;
+  --hljs-addition-bg: #dafbe1;
+  --hljs-deletion-fg: #82071e;
+  --hljs-deletion-bg: #ffebe9;
+}
+
+.dark {
+  --hljs-comment: #8b949e;
+  --hljs-keyword: #ff7b72;
+  --hljs-attr: #79c0ff;
+  --hljs-string: #a5d6ff;
+  --hljs-title: #d2a8ff;
+  --hljs-built-in: #ffa657;
+  --hljs-name: #7ee787;
+  --hljs-section: #1f6feb;
+  --hljs-bullet: #f2cc60;
+  --hljs-subst: #c9d1d9;
+  --hljs-addition-fg: #aff5b4;
+  --hljs-addition-bg: #033a16;
+  --hljs-deletion-fg: #ffdcd7;
+  --hljs-deletion-bg: #67060c;
+}
+
+.hljs-comment,
+.hljs-code,
+.hljs-formula {
+  color: var(--hljs-comment);
+}
+
+.hljs-doctag,
+.hljs-keyword,
+.hljs-meta .hljs-keyword,
+.hljs-template-tag,
+.hljs-template-variable,
+.hljs-type,
+.hljs-variable.language_ {
+  color: var(--hljs-keyword);
+}
+
+.hljs-attr,
+.hljs-attribute,
+.hljs-literal,
+.hljs-meta,
+.hljs-number,
+.hljs-operator,
+.hljs-selector-attr,
+.hljs-selector-class,
+.hljs-selector-id,
+.hljs-variable {
+  color: var(--hljs-attr);
+}
+
+.hljs-regexp,
+.hljs-string,
+.hljs-meta .hljs-string {
+  color: var(--hljs-string);
+}
+
+.hljs-title,
+.hljs-title.class_,
+.hljs-title.class_.inherited__,
+.hljs-title.function_ {
+  color: var(--hljs-title);
+}
+
+.hljs-built_in,
+.hljs-symbol {
+  color: var(--hljs-built-in);
+}
+
+.hljs-name,
+.hljs-quote,
+.hljs-selector-tag,
+.hljs-selector-pseudo {
+  color: var(--hljs-name);
+}
+
+.hljs-subst {
+  color: var(--hljs-subst);
+}
+
+.hljs-section {
+  color: var(--hljs-section);
+  font-weight: 600;
+}
+
+.hljs-bullet {
+  color: var(--hljs-bullet);
+}
+
+.hljs-emphasis {
+  font-style: italic;
+}
+
+.hljs-strong {
+  font-weight: 600;
+}
+
+.hljs-addition {
+  color: var(--hljs-addition-fg);
+  background-color: var(--hljs-addition-bg);
+}
+
+.hljs-deletion {
+  color: var(--hljs-deletion-fg);
+  background-color: var(--hljs-deletion-bg);
+}
+
+/* Sweeping highlight across text to convey activity without a spinner (see
+   .text-shimmer below). Mirrors Claude Desktop's "Reading…" shimmer. */
+@keyframes shimmer-sweep {
+  0% {
+    background-position: 200% center;
+  }
+  100% {
+    background-position: -200% center;
+  }
+}
+
+/* Shared sweeping-highlight treatment for anything that's actively working: the
+   verb of an in-flight tool call and the sidebar title of a chat whose agent is
+   busy. The text sits at the dimmed muted-foreground and a bright full-strength
+   band sweeps across it, so the highlight reads as a clear travelling glint
+   against a lower base rather than a faint dip in otherwise full-strength text.
+   The base is the same muted-foreground used across the UI for secondary text,
+   so the text stays perfectly legible between sweeps. Tune the duration for
+   speed; the gradient band width for how broad the glint reads. */
+.text-shimmer {
+  background-image: linear-gradient(
+    90deg,
+    var(--muted-foreground) 0%,
+    var(--muted-foreground) 35%,
+    var(--foreground) 50%,
+    var(--muted-foreground) 65%,
+    var(--muted-foreground) 100%
+  );
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer-sweep 2.4s linear infinite;
+}
+
+/* Simulated macOS window chrome for the browser. In the native Tauri build the
+   OS draws the real window (rounded corners, shadow, traffic lights); opened in
+   a plain browser the UI has none of that and bleeds edge-to-edge. When App
+   detects it is *not* running under Tauri it wraps the UI in `.mac-stage` →
+   `.mac-window` to float it as a macOS window on a black backdrop. This chrome
+   is the single source of truth for the window look: the demo recorder
+   (scripts/demo/record.ts) drives the app in the browser and captures this very
+   `.mac-window` (it only swaps the black `.mac-stage` backdrop for a transparent,
+   shadow-sized margin at capture time), so the radius/shadow/::after highlight
+   here are exactly what ships in the README demo. */
+.mac-stage {
+  height: 100vh;
+  height: 100dvh;
+  /* Just enough black around the window to show its rounded corners. */
+  padding: 8px;
+  background: #000;
+}
+.mac-window {
+  position: relative;
+  height: 100%;
+  border-radius: 16px; /* macOS window corner radius */
+  overflow: hidden; /* clip the app's corners to the radius */
+  /* Trap the app's internal z-index layers (e.g. the z-40 settings overlay)
+     inside the window so none of them can paint over the chrome highlight
+     below. Radix overlays portal to <body> (outside the window) and so still
+     float above the whole frame, as a real modal should. */
+  isolation: isolate;
+  box-shadow:
+    0 0 0 0.5px rgba(0, 0, 0, 0.5),
+    0 6px 16px rgba(0, 0, 0, 0.3),
+    0 18px 48px rgba(0, 0, 0, 0.42);
+}
+/* The subtle inset highlight macOS paints along a window's edge (brightest on
+   the top edge). Sits above the app and ignores pointer events. */
+.mac-window::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 16px;
+  pointer-events: none;
+  /* Above every in-app layer trapped by `isolation` above (max is z-40) so the
+     frame always reads, including over the full-bleed settings overlay. */
+  z-index: 60;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.14);
+}
+
+/* xterm 6 hardcodes an opaque `background-color: #000` on the viewport (and
+   the composition view) in its own stylesheet, which paints over the
+   transparent theme background. The terminal renders black regardless of the
+   `rgba(0,0,0,0)` theme + allowTransparency. Force them transparent so the
+   terminal shows the surface it's mounted on: bg-background in the tab strip,
+   the muted panel tint in the terminal sidebar. */
+.terminal-shell .xterm-viewport,
+.terminal-shell .composition-view {
+  background-color: transparent !important;
+}
+
+.terminal-shell--mac .xterm .xterm-scrollable-element > .scrollbar.vertical {
+  width: 14px !important;
+  right: 3px !important;
+}
+
+.terminal-shell--mac .xterm .xterm-scrollable-element > .scrollbar.vertical > .slider {
+  width: 10px !important;
+  left: 4px !important;
+  box-sizing: border-box;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 9999px;
+  opacity: 0.7;
+}

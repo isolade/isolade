@@ -1,0 +1,29 @@
+{
+  "productName": "Isolade",
+  "mainBinaryName": "Isolade",
+  "version": "0.0.0",
+  "identifier": "dev.isolade",
+  "build": {
+    "frontendDist": "../packages/web/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "bun run gen:icons && bun run --cwd packages/web dev -- --clearScreen false",
+    "beforeBuildCommand": "bun run gen:icons && bun run --cwd packages/web build"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "resources": [
+      "binaries/Isolade",
+      "binaries/msb-runtime/microsandbox.*.node",
+      "binaries/msb-runtime/bin/msb",
+      "binaries/msb-runtime/lib/libkrunfw.*"
+    ],
+    "icon": ["icons/icon.icns"]
+  }
+}

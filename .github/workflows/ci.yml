@@ -1,0 +1,550 @@
+name: CI
+
+# Every PR and every push to main enters through this workflow. Prepare selects
+# the requested jobs. Finish depends on every possible prerequisite, stages all
+# release assets when requested, and provides the one result branch protection
+# needs to require.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Auto: Detect changes (macOS only on main) · macOS: macOS only · Full: Validate + Linux + macOS · Validate: Checks only · Release: Full + draft upload (release/v* only)"
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - macos
+          - full
+          - validate
+          - release
+
+concurrency:
+  group: >-
+    ci-${{
+      github.event_name == 'workflow_dispatch' && format('{0}-{1}', inputs.target, github.ref) ||
+      github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) ||
+      github.ref
+    }}
+  # Preserve completed work on main. For PRs, only the newest head matters.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      target: ${{ steps.plan.outputs.target }}
+      official: ${{ steps.plan.outputs.official }}
+      validate: ${{ steps.plan.outputs.validate }}
+      linux: ${{ steps.plan.outputs.linux }}
+      macos: ${{ steps.plan.outputs.macos }}
+      upload: ${{ steps.plan.outputs.upload }}
+      version: ${{ steps.metadata.outputs.version }}
+    env:
+      BUILD_BRANCH: ${{ github.head_ref || github.ref_name }}
+      HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+      BASE_BRANCH: ${{ github.event.pull_request.base.ref || '' }}
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          # Change detection and release metadata validation use the PR head.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select build path
+        id: plan
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          REQUESTED_TARGET: ${{ inputs.target || '' }}
+        run: |
+          set -euo pipefail
+
+          # A release PR must come from this repository, target main, and use
+          # the exact release/vX.Y.Z naming convention. A manual release build
+          # is already scoped to a ref in this repository, but it must select a
+          # branch (not a similarly named tag). A branch name alone does not
+          # establish provenance because a fork can use the same name.
+          official=false
+          if [[ "$BUILD_BRANCH" =~ ^release/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+              if [[ "$HEAD_REPOSITORY" == "$GITHUB_REPOSITORY" && "$BASE_BRANCH" == "main" ]]; then
+                official=true
+              fi
+            elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$GITHUB_REF_TYPE" == "branch" ]]; then
+              official=true
+            fi
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            target="$REQUESTED_TARGET"
+          elif [[ "$official" == "true" ]]; then
+            target=release
+          else
+            target=auto
+          fi
+
+          if [[ "$target" == "release" && "$official" != "true" ]]; then
+            echo "::error::The release target must run from a release/vX.Y.Z branch in this repository." >&2
+            exit 1
+          fi
+
+          validate=false
+          linux=false
+          macos=false
+          upload=false
+
+          case "$target" in
+            auto)
+              validate=true
+              range=""
+              main_changes=false
+
+              if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+                range="$BASE_SHA...$HEAD_SHA"
+              elif [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+                main_changes=true
+                if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] || ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+                  # Be conservative for an unusual first/force push whose
+                  # previous commit is unavailable.
+                  linux=true
+                  macos=true
+                else
+                  range="$BASE_SHA..$HEAD_SHA"
+                fi
+              elif [[ "$BUILD_BRANCH" == "main" ]]; then
+                # workflow_dispatch has no "before" SHA. On main, apply the
+                # push policy to the selected commit itself.
+                main_changes=true
+                parent="$(git rev-parse "${HEAD_SHA}^" 2>/dev/null || true)"
+                if [[ -z "$parent" ]]; then
+                  linux=true
+                  macos=true
+                else
+                  range="$parent..$HEAD_SHA"
+                fi
+              else
+                # A manually selected non-main ref follows PR policy: compare
+                # its complete branch diff with main and never add macOS just
+                # because microsandbox changed.
+                branch_base="$(git merge-base origin/main "$HEAD_SHA" 2>/dev/null || true)"
+                if [[ -z "$branch_base" ]]; then
+                  linux=true
+                else
+                  range="$branch_base...$HEAD_SHA"
+                fi
+              fi
+
+              if [[ -n "$range" ]]; then
+                while IFS= read -r -d '' file; do
+                  case "$file" in
+                    .github/actions/microsandbox/*|\
+                    .github/workflows/ci.yml|\
+                    app/*|\
+                    bun.lock|\
+                    package.json|\
+                    packages/sandbox/package.json|\
+                    packages/server/bunfig.toml|\
+                    packages/server/package.json|\
+                    packages/shared/package.json|\
+                    packages/web/package.json|\
+                    patches/microsandbox*.patch|\
+                    scripts/bootstrap-microsandbox.sh|\
+                    scripts/build.sh|\
+                    scripts/ci-linux.sh|\
+                    scripts/lib/assemble-msb-runtime.sh|\
+                    scripts/lib/build-msb-native.sh|\
+                    scripts/lib/build-msb.sh|\
+                    scripts/lib/generate-third-party-licenses.ts|\
+                    third_party/microsandbox|\
+                    third_party/microsandbox/*)
+                      linux=true
+                      ;;
+                  esac
+
+                  # Warm the macOS cache after changes to the fork-built
+                  # microsandbox runtime, but only under main policy.
+                  if [[ "$main_changes" == "true" ]]; then
+                    case "$file" in
+                      .github/actions/microsandbox/*|\
+                      scripts/lib/assemble-msb-runtime.sh|\
+                      scripts/lib/build-msb-native.sh|\
+                      scripts/lib/build-msb.sh|\
+                      third_party/microsandbox|\
+                      third_party/microsandbox/*)
+                        macos=true
+                        ;;
+                    esac
+                  fi
+                done < <(git diff --name-only -z "$range")
+              fi
+              ;;
+            validate)
+              validate=true
+              ;;
+            macos)
+              macos=true
+              ;;
+            full)
+              validate=true
+              linux=true
+              macos=true
+              ;;
+            release)
+              validate=true
+              linux=true
+              macos=true
+              upload=true
+              ;;
+            *)
+              echo "::error::Unknown CI target: $target" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+          echo "official=$official" >> "$GITHUB_OUTPUT"
+          echo "validate=$validate" >> "$GITHUB_OUTPUT"
+          echo "linux=$linux" >> "$GITHUB_OUTPUT"
+          echo "macos=$macos" >> "$GITHUB_OUTPUT"
+          echo "upload=$upload" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release metadata
+        id: metadata
+        if: ${{ steps.plan.outputs.official == 'true' }}
+        run: |
+          ./scripts/check-release-metadata.sh "$BUILD_BRANCH"
+          echo "version=${BUILD_BRANCH#release/v}" >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Validate
+    needs: prepare
+    if: ${{ !cancelled() && needs.prepare.outputs.validate == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      # Hosted CI cannot run the microVM-backed suites. Keep them opt-in for
+      # machines with Hypervisor/KVM support.
+      RUN_INTEGRATION: ""
+      ISOLADE_BUILDER_E2E: ""
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          # Release assets come from the reviewed head commit. Normal PRs test
+          # GitHub's synthetic merge commit.
+          ref: ${{ needs.prepare.outputs.official == 'true' && (github.event.pull_request.head.sha || github.sha) || github.sha }}
+
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Format check
+        run: bun run format:check
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Bundle Bun entrypoints
+        run: |
+          rm -rf /tmp/isolade-ci
+          bun build packages/sandbox/src/index.ts packages/server/src/index.ts \
+            --target bun \
+            --outdir /tmp/isolade-ci
+
+      - name: Build web
+        run: bun run --cwd packages/web build
+
+      - name: Test
+        run: bun run test
+
+  linux:
+    name: Linux (${{ matrix.arch }})
+    needs: [prepare, validate]
+    if: >-
+      !cancelled() &&
+      needs.prepare.result == 'success' &&
+      needs.prepare.outputs.linux == 'true' &&
+      (needs.prepare.outputs.validate != 'true' || needs.validate.result == 'success')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-22.04
+            artifact: isolade-linux-amd64
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+            artifact: isolade-linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.official == 'true' && (github.event.pull_request.head.sha || github.sha) || github.sha }}
+          submodules: recursive
+
+      - name: Install Tauri + microsandbox system dependencies
+        run: |
+          sudo grep -rlZ packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null | xargs -0 -r sudo rm -f || true
+          # ARM runner images use Ubuntu Ports over HTTP by default. Prefer
+          # HTTPS, and do the same for the standard Ubuntu mirrors on x64.
+          sudo find /etc/apt -maxdepth 2 -type f \
+            \( -name sources.list -o -name '*.list' -o -name '*.sources' \) \
+            -exec sed -Ei \
+              's#http://(([^./]+\.)?archive\.ubuntu\.com|ports\.ubuntu\.com|security\.ubuntu\.com)/#https://\1/#g' {} +
+
+          apt_options=(-o Acquire::Retries=5)
+          sudo apt-get "${apt_options[@]}" update --error-on=any
+          sudo apt-get "${apt_options[@]}" install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl wget file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libcap-ng-dev
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build (app)
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: app
+
+      - name: Provision microsandbox
+        uses: ./.github/actions/microsandbox
+        with:
+          cache-key-suffix: -${{ matrix.arch }}
+
+      - name: Build & package
+        run: ./scripts/ci-linux.sh
+        env:
+          ISOLADE_OFFICIAL_BUILD: ${{ needs.prepare.outputs.official == 'true' && '1' || '' }}
+          ISOLADE_SKIP_MSB_BUILD: "1"
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*.deb
+          retention-days: 7
+
+  macos:
+    name: macOS
+    needs: [prepare, validate]
+    if: >-
+      !cancelled() &&
+      needs.prepare.result == 'success' &&
+      needs.prepare.outputs.macos == 'true' &&
+      (needs.prepare.outputs.validate != 'true' || needs.validate.result == 'success')
+    environment:
+      name: release
+      # The unified job gets its signing secret from this environment. An
+      # artifact-only run does not register a release deployment.
+      deployment: ${{ needs.prepare.outputs.upload == 'true' }}
+    # Apple Silicon + the Tahoe SDK are both required; see app/src/lib.rs.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.official == 'true' && (github.event.pull_request.head.sha || github.sha) || github.sha }}
+          submodules: recursive
+
+      - name: Require signing certificate
+        if: ${{ needs.prepare.outputs.official == 'true' }}
+        env:
+          ISOLADE_SIGNING_CERT_BASE64: ${{ secrets.ISOLADE_SIGNING_CERT_BASE64 }}
+        run: |
+          if [[ -z "$ISOLADE_SIGNING_CERT_BASE64" ]]; then
+            echo "::error::ISOLADE_SIGNING_CERT_BASE64 is not set — cannot sign the macOS release." >&2
+            echo "Add it as a repo (or environment) secret; see scripts/create-signing-cert.sh." >&2
+            exit 1
+          fi
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build (app)
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: app
+
+      - name: Provision microsandbox
+        uses: ./.github/actions/microsandbox
+
+      - name: Build & package
+        run: ./scripts/ci-macos.sh
+        env:
+          ISOLADE_SIGNING_CERT_BASE64: ${{ secrets.ISOLADE_SIGNING_CERT_BASE64 }}
+          ISOLADE_SKIP_SIGNING: ${{ needs.prepare.outputs.official != 'true' && '1' || '' }}
+          ISOLADE_OFFICIAL_BUILD: ${{ needs.prepare.outputs.official == 'true' && '1' || '' }}
+          ISOLADE_SKIP_MSB_BUILD: "1"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ${{ needs.prepare.outputs.official == 'true' && 'isolade-macos-arm64' || 'isolade-macos-arm64-unsigned' }}
+          path: dist/*.tar.gz
+          retention-days: 7
+
+  finish:
+    name: Finish
+    needs:
+      - prepare
+      - validate
+      - linux
+      - macos
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TARGET: ${{ needs.prepare.outputs.target }}
+      VALIDATE_REQUIRED: ${{ needs.prepare.outputs.validate }}
+      LINUX_REQUIRED: ${{ needs.prepare.outputs.linux }}
+      MACOS_REQUIRED: ${{ needs.prepare.outputs.macos }}
+      RELEASE_UPLOAD_REQUIRED: ${{ needs.prepare.outputs.upload }}
+      PREPARE_RESULT: ${{ needs.prepare.result }}
+      VALIDATE_RESULT: ${{ needs.validate.result }}
+      LINUX_RESULT: ${{ needs.linux.result }}
+      MACOS_RESULT: ${{ needs.macos.result }}
+      BUILD_BRANCH: ${{ github.head_ref || github.ref_name }}
+      BUILD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Check out release source
+        if: >-
+          needs.prepare.outputs.upload == 'true' &&
+          needs.prepare.result == 'success'
+        uses: actions/checkout@v7.0.0
+        with:
+          ref: ${{ env.BUILD_SHA }}
+          persist-credentials: false
+
+      - name: Generate release notes
+        id: metadata
+        if: ${{ needs.prepare.outputs.upload == 'true' && needs.prepare.result == 'success' }}
+        run: ./scripts/check-release-metadata.sh "$BUILD_BRANCH"
+
+      - name: Ensure release exists
+        id: release
+        if: ${{ steps.metadata.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          state="$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null || echo absent)"
+
+          if [[ "$state" == "false" ]]; then
+            tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag}" --jq '.sha')"
+            if [[ "$tag_sha" != "$BUILD_SHA" ]]; then
+              echo "::error::$tag is already published at $tag_sha, not this build's $BUILD_SHA." >&2
+              exit 1
+            fi
+            echo "$tag is already published at this build commit; keeping it for artifact recovery."
+          else
+            if [[ "$state" == "true" ]]; then
+              echo "Overwriting existing draft $tag"
+              gh release delete "$tag" --yes
+            fi
+            gh release create "$tag" --draft --target "$BUILD_SHA" \
+              --title "$tag" --notes-file dist/RELEASE_NOTES.md
+          fi
+
+      - name: Check out third-party source
+        id: source_checkout
+        if: >-
+          steps.release.outcome == 'success' &&
+          needs.linux.result == 'success' &&
+          needs.macos.result == 'success'
+        run: git submodule update --init --recursive third_party/microsandbox
+
+      - name: Download platform artifacts
+        id: download
+        if: >-
+          steps.source_checkout.outcome == 'success'
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: isolade-*
+          path: dist
+          merge-multiple: true
+
+      - name: Build third-party source archive
+        id: source
+        if: ${{ steps.download.outcome == 'success' }}
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          ./scripts/lib/collect-corresponding-source.sh \
+            "dist/isolade-v${VERSION}-third-party-source.tar.gz" "$VERSION"
+
+      - name: Upload release artifacts
+        id: upload
+        if: ${{ steps.source.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release upload "v${VERSION}"
+          dist/*.deb dist/*.tar.gz --clobber
+
+      - name: Require successful CI jobs
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          RELEASE_UPLOAD_RESULT: ${{ steps.upload.outcome }}
+        run: |
+          set -euo pipefail
+          failed=false
+
+          require_success() {
+            local job="$1"
+            local result="$2"
+            if [[ "$result" != "success" ]]; then
+              echo "::error::$job concluded with $result"
+              failed=true
+            fi
+          }
+
+          require_success "Prepare" "$PREPARE_RESULT"
+          if [[ "$VALIDATE_REQUIRED" == "true" ]]; then
+            require_success "Validate" "$VALIDATE_RESULT"
+          fi
+          if [[ "$LINUX_REQUIRED" == "true" ]]; then
+            require_success "Linux" "$LINUX_RESULT"
+          fi
+          if [[ "$MACOS_REQUIRED" == "true" ]]; then
+            require_success "macOS" "$MACOS_RESULT"
+          fi
+          if [[ "$RELEASE_UPLOAD_REQUIRED" == "true" ]]; then
+            require_success "Upload release artifacts" "$RELEASE_UPLOAD_RESULT"
+          fi
+
+          if [[ "$failed" == "true" ]]; then
+            exit 1
+          fi

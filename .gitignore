@@ -1,0 +1,18 @@
+node_modules
+dist
+.env
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+app/binaries/
+# Generated at build time by scripts/lib/generate-third-party-licenses.ts.
+packages/web/public/THIRD-PARTY-LICENSES.txt
+__pycache__/
+.claude/*
+!.claude/CLAUDE.md
+
+# Self-signed code-signing material (scripts/create-signing-cert.sh). Never
+# commit these — they are the private signing identity for release builds.
+*.p12
+*.p12.base64

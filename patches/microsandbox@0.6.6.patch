@@ -1,0 +1,23 @@
+diff --git a/dist/internal/napi.js b/dist/internal/napi.js
+index b25c1230066b1d2e5041b3d555d9ad8e10a02c07..963af53e152d79c1876f354336503e374eea0d67 100644
+--- a/dist/internal/napi.js
++++ b/dist/internal/napi.js
+@@ -6,8 +6,17 @@ import { msbPath } from "./resolve-binary.js";
+ // env-var read here.
+ const resolvedMsbPath = msbPath();
+ const require = createRequire(import.meta.url);
++// Load the native binding. When NAPI_RS_NATIVE_LIBRARY_PATH points at a
++// prebuilt .node, require it directly: the generated loader
++// (native/index.cjs) resolves via a package-relative path, which is
++// unreachable inside a `bun build --compile` binary where this SDK is embedded
++// in a virtual filesystem — an absolute .node path loads fine there. The
++// generated loader would itself just require that same env path, so this is
++// behavior-preserving; we fall back to it when the env var is unset.
+ // eslint-disable-next-line @typescript-eslint/no-require-imports
+-const native = require("../../native/index.cjs");
++const native = (process.env.NAPI_RS_NATIVE_LIBRARY_PATH
++    ? require(process.env.NAPI_RS_NATIVE_LIBRARY_PATH)
++    : require("../../native/index.cjs"));
+ if (resolvedMsbPath)
+     native.setRuntimeMsbPath?.(resolvedMsbPath);
+ export const napi = native;

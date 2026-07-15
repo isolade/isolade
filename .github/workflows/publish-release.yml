@@ -1,0 +1,98 @@
+name: Publish Release
+
+# The publish half of the release flow (ci.yml is the build half). A
+# release/vX.Y.Z branch build stages OFFICIAL artifacts on a DRAFT release
+# vX.Y.Z. This workflow reacts to the release PR closing:
+#
+#   merged   -> publish the draft as-is (NO rebuild). The staged artifacts — the
+#               exact binaries CI built from the PR head commit — become the
+#               release. The git tag is created at publish time, pointed at the
+#               PR head commit that produced those artifacts.
+#   closed   -> the release was abandoned; delete the orphaned draft so it can't
+#               be published later by accident, and free the vX.Y.Z tag name.
+#
+# The build half is ci.yml; scripts/prepare-release.py opens the PR.
+on:
+  pull_request:
+    # GitHub only supports trigger-time filtering on the PR's base branch, not
+    # its head branch. Every generated release PR changes the app version, so
+    # this path filter prevents ordinary closed PRs from creating a workflow
+    # run; the jobs below still enforce the exact release branch provenance.
+    branches: [main]
+    paths:
+      - app/tauri.conf.json
+    types: [closed]
+
+# Only same-repository release PRs targeting main may publish or clean up a
+# draft. A fork can reuse the release/vX.Y.Z branch name, so the name alone is
+# not sufficient provenance for a write-capable workflow.
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Publish
+    if: >-
+      !cancelled() &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release/v')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BRANCH: ${{ github.event.pull_request.head.ref }}
+      TARGET: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Publish the staged draft release
+        run: |
+          set -euo pipefail
+          TAG="v${BRANCH#release/v}"   # release/v0.1.1 -> v0.1.1
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "error: branch '$BRANCH' does not encode a vX.Y.Z tag" >&2
+            exit 1
+          fi
+
+          # The draft must exist and still be a draft — a merged release PR with
+          # no draft means the build never finished, so refuse to "publish"
+          # nothing rather than create an empty release.
+          if [ "$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null)" != "true" ]; then
+            echo "error: no draft release $TAG to publish." >&2
+            exit 1
+          fi
+
+          # We do NOT gate on which platform artifacts are present: a merged PR
+          # means the release must ship. The release build runs as a check on the
+          # PR, so a failed platform build shows up there — don't merge a red PR.
+          echo "staged assets:"; gh release view "$TAG" --json assets --jq '.assets[].name' | sed 's/^/  /'
+
+          echo "Publishing $TAG at $TARGET (PR head commit)"
+          gh release edit "$TAG" --draft=false --target "$TARGET" --latest
+
+  cleanup:
+    name: Cleanup
+    if: >-
+      !cancelled() &&
+      github.event.pull_request.merged == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release/v')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BRANCH: ${{ github.event.pull_request.head.ref }}
+    steps:
+      - name: Delete the abandoned draft release
+        run: |
+          set -euo pipefail
+          TAG="v${BRANCH#release/v}"
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "error: branch '$BRANCH' does not encode a vX.Y.Z tag" >&2
+            exit 1
+          fi
+          if [ "$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null)" = "true" ]; then
+            echo "Deleting abandoned draft $TAG"
+            gh release delete "$TAG" --yes
+          else
+            echo "No draft $TAG to delete (already published, or never staged)."
+          fi

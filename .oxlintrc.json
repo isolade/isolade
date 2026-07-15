@@ -1,0 +1,62 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": [
+    "typescript",
+    "unicorn",
+    "oxc",
+    "react",
+    "react-hooks",
+    "promise",
+    "import",
+    "jsx-a11y"
+  ],
+  "categories": {
+    "correctness": "error"
+  },
+  "env": {
+    "builtin": true,
+    "browser": true,
+    "node": true,
+    "es2024": true
+  },
+  "ignorePatterns": ["**/dist/**", "third_party/**"],
+  "rules": {
+    // The server snapshots collections with `[...set]` before iterating so that
+    // callbacks/close handlers can mutate the original during the loop. That is
+    // a deliberate, load-bearing copy — not a useless spread — and "fixing" it
+    // would reintroduce mutate-while-iterating bugs.
+    "unicorn/no-useless-spread": "off",
+    // Preserve the original error as `cause` when re-throwing, so stack/context
+    // isn't lost.
+    "eslint/preserve-caught-error": "error",
+    // Autofocusing the composer, rename fields, and dialog inputs is deliberate
+    // UX in a focused desktop app — not the web-page footgun this rule guards.
+    "jsx-a11y/no-autofocus": "off",
+    // `role="separator"` on the resize handles is the correct splitter role, and
+    // the custom radio groups can't be bare tags without losing their styling —
+    // this rule's "use a plain HTML tag" advice doesn't fit those widgets.
+    "jsx-a11y/prefer-tag-over-role": "off",
+    // Our checkbox/radio cards wrap the control and put the visible text a few
+    // spans deep; raise the scan depth so that nested text counts as the label.
+    "jsx-a11y/label-has-associated-control": ["error", { "depth": 4 }],
+
+    // Selected bug-class / safety rules promoted above the default
+    // `correctness` tier. Kept deliberately small: each one fires only on real
+    // problems in this codebase, not on correct idioms. (We also evaluated
+    // promise/always-return, promise/no-multiple-resolved,
+    // eslint/no-unmodified-loop-condition and oxc/no-map-spread, but those only
+    // flagged correct code here — terminal .then() handlers, guarded
+    // resolve-once timers, loop flags flipped inside closures, and readable
+    // small-array spreads — so enabling them would add noise, not signal.)
+    //
+    // Shadowing hides bugs and hurts readability; the fixes are pure renames.
+    "eslint/no-shadow": "error",
+    // `Array#sort()` mutates in place. Prefer `toSorted()` so a sort can't
+    // silently reorder an array another caller still holds a reference to.
+    "unicorn/no-array-sort": "error",
+    // We embed untrusted VM content in iframes, so an unsandboxed (or
+    // sandbox-defeating) iframe is a real security hole. The one intentional
+    // exception carries a justified inline disable.
+    "react/iframe-missing-sandbox": "error"
+  }
+}

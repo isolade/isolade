@@ -1,0 +1,69 @@
+name: Provision microsandbox
+description: >-
+  Build and cache the fork's native microsandbox pieces — the NAPI `.node`
+  binding and the `msb` supervisor — from the pinned submodule, keyed on its
+  commit SHA. These carry our patches and aren't published to npm, so every
+  build compiles them the same way. Assumes the submodule is checked out and
+  that Bun (plus a Rust toolchain) are already set up.
+
+inputs:
+  cache-key-suffix:
+    description: Qualifier appended to the cache key, e.g. "-arm64" for a per-arch cache.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # Restore/save are split on purpose: the provision step builds the full
+    # native runtime and we save immediately after it — so a later failure in the
+    # Tauri build never discards the (expensive) microsandbox build, while a
+    # provision failure never saves a partial cache (the job stops before save).
+    - name: Resolve microsandbox build inputs
+      id: key
+      shell: bash
+      run: |
+        echo "source=$(git -C third_party/microsandbox rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        recipe=$(git hash-object \
+          scripts/lib/build-msb-native.sh \
+          scripts/lib/build-msb.sh \
+          | git hash-object --stdin)
+        echo "recipe=$recipe" >> "$GITHUB_OUTPUT"
+
+    - name: Restore microsandbox build cache
+      id: cache
+      uses: actions/cache/restore@v6.1.0
+      with:
+        path: |
+          third_party/microsandbox/target
+          third_party/microsandbox/sdk/node-ts/target
+          third_party/microsandbox/sdk/node-ts/node_modules
+          third_party/microsandbox/sdk/node-ts/native/*.node
+          third_party/microsandbox/build
+        key: msb-v3-${{ runner.os }}${{ inputs.cache-key-suffix }}-${{ steps.key.outputs.source }}-${{ steps.key.outputs.recipe }}
+        # A partial restore leaves cache-hit=false, so the build scripts update
+        # it before the new exact key is saved. Prefer the same source, then any
+        # cache for this OS/architecture.
+        restore-keys: |
+          msb-v3-${{ runner.os }}${{ inputs.cache-key-suffix }}-${{ steps.key.outputs.source }}-
+          msb-v3-${{ runner.os }}${{ inputs.cache-key-suffix }}-
+
+    - name: Build native binding + msb
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        "$GITHUB_WORKSPACE/scripts/lib/build-msb-native.sh"
+        "$GITHUB_WORKSPACE/scripts/lib/build-msb.sh"
+
+    - name: Save microsandbox build cache
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6.1.0
+      with:
+        path: |
+          third_party/microsandbox/target
+          third_party/microsandbox/sdk/node-ts/target
+          third_party/microsandbox/sdk/node-ts/node_modules
+          third_party/microsandbox/sdk/node-ts/native/*.node
+          third_party/microsandbox/build
+        key: msb-v3-${{ runner.os }}${{ inputs.cache-key-suffix }}-${{ steps.key.outputs.source }}-${{ steps.key.outputs.recipe }}

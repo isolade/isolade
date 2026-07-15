@@ -1,0 +1,209 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-label="Isolade">
+  <!--
+    macOS app icon. The artwork sits on a rounded-rectangle "squircle" sized to
+    Apple's Big Sur icon grid: an 824x824 body centred in the 1024 canvas (a
+    100px transparent margin on every side) with a 185.4px corner radius. macOS
+    does not mask app icons, so the shape and inset are baked in here; the system
+    Dock supplies the drop shadow, so none is baked around the squircle.
+
+    The drink itself is authored in a 512-unit space (shared with the About-page
+    art, packages/web/src/assets/lemonade.svg) and scaled by 824/512 into the
+    body, so the composition matches the product mark exactly.
+  -->
+  <defs>
+    <!-- Background: deep, frosty icy gradient. Dark enough that the pale,
+         translucent glass, rim, and ice read clearly against it (a light
+         background let the glass disappear), while the cool blue still says
+         "ice cold" and sets off the warm yellow lemonade. -->
+    <radialGradient id="bgGrad" cx="48%" cy="32%" r="90%">
+      <stop offset="0%" stop-color="#10394f"/>
+      <stop offset="48%" stop-color="#071e2f"/>
+      <stop offset="100%" stop-color="#010a13"/>
+    </radialGradient>
+    <!-- Warm sunny glow behind the glass to make the lemonade feel juicy -->
+    <radialGradient id="warmGlow" cx="50%" cy="56%" r="42%">
+      <stop offset="0%" stop-color="#fff2a8" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#fff2a8" stop-opacity="0"/>
+    </radialGradient>
+    <!-- The lemonade itself: vibrant, sunlit yellow -->
+    <linearGradient id="lemonGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fff58a"/>
+      <stop offset="30%" stop-color="#ffdd3d"/>
+      <stop offset="68%" stop-color="#ffc21c"/>
+      <stop offset="100%" stop-color="#f6a409"/>
+    </linearGradient>
+    <radialGradient id="surfaceGrad" cx="50%" cy="45%" r="65%">
+      <stop offset="0%" stop-color="#fff8c4"/>
+      <stop offset="100%" stop-color="#ffe06a"/>
+    </radialGradient>
+    <radialGradient id="pulpGrad" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#fff6b0"/>
+      <stop offset="100%" stop-color="#ffd33d"/>
+    </radialGradient>
+    <!-- Translucent glass: a touch more opaque than for a light background, so
+         the frosted vessel still reads as glass against the deep blue. -->
+    <linearGradient id="glassGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.62"/>
+      <stop offset="55%" stop-color="#ecf7ff" stop-opacity="0.32"/>
+      <stop offset="100%" stop-color="#d7eefb" stop-opacity="0.52"/>
+    </linearGradient>
+    <!-- Frosty ice -->
+    <linearGradient id="iceGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.95"/>
+      <stop offset="55%" stop-color="#e3f4fd" stop-opacity="0.66"/>
+      <stop offset="100%" stop-color="#bfe6f7" stop-opacity="0.55"/>
+    </linearGradient>
+    <linearGradient id="mintGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#86dd8e"/>
+      <stop offset="100%" stop-color="#2f9c4a"/>
+    </linearGradient>
+    <linearGradient id="highlightGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.5"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+
+    <filter id="shadowBlur" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="8"/>
+    </filter>
+
+    <!-- Reusable: a round lemon slice -->
+    <g id="lemonSlice">
+      <circle r="42" fill="#f3b81e"/>
+      <circle r="37" fill="#fff8de"/>
+      <circle r="32" fill="url(#pulpGrad)"/>
+      <g stroke="#fff8de" stroke-width="3" stroke-linecap="round">
+        <line x1="0" y1="-4" x2="0" y2="-30"/>
+        <line x1="0" y1="-4" x2="0" y2="-30" transform="rotate(45)"/>
+        <line x1="0" y1="-4" x2="0" y2="-30" transform="rotate(90)"/>
+        <line x1="0" y1="-4" x2="0" y2="-30" transform="rotate(135)"/>
+        <line x1="0" y1="-4" x2="0" y2="-30" transform="rotate(180)"/>
+        <line x1="0" y1="-4" x2="0" y2="-30" transform="rotate(225)"/>
+        <line x1="0" y1="-4" x2="0" y2="-30" transform="rotate(270)"/>
+        <line x1="0" y1="-4" x2="0" y2="-30" transform="rotate(315)"/>
+      </g>
+      <circle r="4.5" fill="#fff8de"/>
+      <circle r="42" fill="none" stroke="#e0a40c" stroke-width="1.5" opacity="0.5"/>
+      <path d="M -22 -28 A 36 36 0 0 1 18 -32" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" opacity="0.55"/>
+    </g>
+
+    <!-- Reusable: an ice cube -->
+    <g id="iceCube">
+      <rect x="-28" y="-28" width="56" height="56" rx="13" fill="url(#iceGrad)" stroke="#ffffff" stroke-opacity="0.85" stroke-width="2.5"/>
+      <path d="M -20 -22 L 6 -22 L -6 16 L -20 6 Z" fill="#ffffff" opacity="0.45"/>
+      <rect x="-21" y="-21" width="16" height="13" rx="5" fill="#ffffff" opacity="0.75"/>
+      <path d="M -19 -24 L 17 -24" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" opacity="0.85"/>
+      <circle cx="13" cy="14" r="3" fill="#ffffff" opacity="0.9"/>
+      <circle cx="-15" cy="18" r="1.6" fill="#ffffff" opacity="0.8"/>
+    </g>
+
+    <!-- Reusable: a condensation droplet -->
+    <g id="drop">
+      <path d="M0 -2 C5 5 5 12 0 13 C-5 12 -5 5 0 -2 Z" fill="#ffffff" opacity="0.45"/>
+      <circle cx="-1.5" cy="4" r="1.6" fill="#ffffff" opacity="0.85"/>
+    </g>
+
+    <!-- Reusable: a sparkle -->
+    <g id="sparkle">
+      <path d="M0 -12 C1.6 -3 3 -1.6 12 0 C3 1.6 1.6 3 0 12 C-1.6 3 -3 1.6 -12 0 C-3 -1.6 -1.6 -3 0 -12 Z" fill="#ffffff"/>
+    </g>
+  </defs>
+
+  <!-- The squircle body (Apple Big Sur grid) -->
+  <rect x="100" y="100" width="824" height="824" rx="185.4" fill="url(#bgGrad)"/>
+  <rect x="100" y="100" width="824" height="824" rx="185.4" fill="url(#warmGlow)"/>
+
+  <!-- The drink, authored in 512-space and scaled into the 824 body -->
+  <g transform="translate(100 100) scale(1.609375)">
+    <!-- Soft shadow beneath the glass -->
+    <ellipse cx="256" cy="452" rx="104" ry="17" fill="#2a6f97" opacity="0.18" filter="url(#shadowBlur)"/>
+
+    <!-- Glass body (behind the liquid) -->
+    <path d="M 161 158 L 178 420 Q 256 442 334 420 L 351 158 Q 256 138 161 158 Z" fill="url(#glassGrad)"/>
+
+    <!-- Lemonade -->
+    <path d="M 168 196 Q 256 218 344 196 L 332 415 Q 256 436 180 415 Z" fill="url(#lemonGrad)"/>
+
+    <!-- Liquid surface -->
+    <ellipse cx="256" cy="196" rx="86" ry="18" fill="url(#surfaceGrad)"/>
+    <ellipse cx="256" cy="194" rx="70" ry="11" fill="#ffffff" opacity="0.28"/>
+
+    <!-- Rising bubbles inside the drink -->
+    <g fill="#fff6c8" opacity="0.7">
+      <circle cx="232" cy="300" r="5"/>
+      <circle cx="272" cy="338" r="4"/>
+      <circle cx="226" cy="362" r="3"/>
+      <circle cx="292" cy="306" r="4.5"/>
+      <circle cx="256" cy="392" r="3.5"/>
+      <circle cx="300" cy="360" r="3"/>
+      <circle cx="210" cy="330" r="2.5"/>
+    </g>
+    <g fill="#ffffff" opacity="0.7">
+      <circle cx="230" cy="298" r="1.6"/>
+      <circle cx="270" cy="336" r="1.4"/>
+      <circle cx="290" cy="304" r="1.5"/>
+    </g>
+
+    <!-- A lemon slice bobbing at the surface -->
+    <use href="#lemonSlice" transform="translate(196 222) scale(0.56) rotate(-12)"/>
+
+    <!-- Ice cubes -->
+    <use href="#iceCube" transform="translate(243 207) rotate(-14)"/>
+    <use href="#iceCube" transform="translate(305 213) rotate(12) scale(0.9)"/>
+    <use href="#iceCube" transform="translate(266 258) rotate(-6) scale(0.82)"/>
+
+    <!-- Straw -->
+    <g transform="translate(296 150) rotate(15)">
+      <rect x="-10" y="-120" width="20" height="210" rx="10" fill="#ffffff" stroke="#ffd1d8" stroke-width="1.5"/>
+      <g fill="#ff7a90">
+        <rect x="-10" y="-96" width="20" height="13"/>
+        <rect x="-10" y="-64" width="20" height="13"/>
+        <rect x="-10" y="-32" width="20" height="13"/>
+        <rect x="-10" y="0" width="20" height="13"/>
+        <rect x="-10" y="32" width="20" height="13"/>
+        <rect x="-10" y="64" width="20" height="13"/>
+      </g>
+      <ellipse cx="0" cy="-120" rx="10" ry="3.5" fill="#f0b6c0"/>
+    </g>
+
+    <!-- Mint sprig -->
+    <g transform="translate(186 152) rotate(-16)" fill="url(#mintGrad)">
+      <g transform="rotate(-30)">
+        <path d="M0 0 C10 -14 10 -34 0 -46 C-10 -34 -10 -14 0 0 Z"/>
+        <path d="M0 -3 L0 -42" fill="none" stroke="#2a8a42" stroke-width="1.5"/>
+      </g>
+      <g transform="rotate(8)">
+        <path d="M0 0 C11 -15 11 -38 0 -52 C-11 -38 -11 -15 0 0 Z"/>
+        <path d="M0 -3 L0 -47" fill="none" stroke="#2a8a42" stroke-width="1.5"/>
+      </g>
+      <g transform="rotate(40)">
+        <path d="M0 0 C10 -14 10 -34 0 -46 C-10 -34 -10 -14 0 0 Z"/>
+        <path d="M0 -3 L0 -42" fill="none" stroke="#2a8a42" stroke-width="1.5"/>
+      </g>
+    </g>
+
+    <!-- Glass front: glossy highlights -->
+    <path d="M 184 206 C 175 290 178 360 192 412 L 205 408 C 192 358 190 290 200 211 Z" fill="url(#highlightGrad)"/>
+    <path d="M 340 208 C 348 300 344 372 330 414" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round" opacity="0.5"/>
+
+    <!-- Glass rim -->
+    <ellipse cx="256" cy="158" rx="95" ry="20" fill="none" stroke="#ffffff" stroke-width="3.5" opacity="0.8"/>
+    <ellipse cx="256" cy="158" rx="95" ry="20" fill="none" stroke="#bfe4f6" stroke-width="1" opacity="0.7"/>
+
+    <!-- A bright lemon slice resting on the rim -->
+    <use href="#lemonSlice" transform="translate(338 150) scale(0.92) rotate(16)"/>
+
+    <!-- Condensation droplets on the glass -->
+    <use href="#drop" transform="translate(193 300) scale(1.1)"/>
+    <use href="#drop" transform="translate(185 350) scale(0.8)"/>
+    <use href="#drop" transform="translate(214 404) scale(0.9)"/>
+    <use href="#drop" transform="translate(330 330) scale(1.0)"/>
+    <use href="#drop" transform="translate(305 392) scale(0.8)"/>
+    <use href="#drop" transform="translate(338 384) scale(0.7)"/>
+
+    <!-- Sparkles -->
+    <use href="#sparkle" transform="translate(306 178) scale(0.75)"/>
+    <use href="#sparkle" transform="translate(212 184) scale(0.45)"/>
+    <use href="#sparkle" transform="translate(372 120) scale(0.6)"/>
+    <use href="#sparkle" transform="translate(243 238) scale(0.35)"/>
+  </g>
+</svg>
