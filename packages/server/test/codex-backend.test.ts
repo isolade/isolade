@@ -17,6 +17,9 @@ class FakeCodexConn {
   // When set, `thread/resume` rejects with this error, mimicking codex refusing
   // to reload a thread (e.g. a missing rollout after a home reset).
   resumeError: Error | null = null;
+  // When set, `turn/start` records the request but withholds its response until
+  // this resolves, letting a test abort while the turn id is still pending.
+  turnStartGate: Promise<void> | null = null;
 
   on(method: string, h: (p: unknown) => void) {
     const a = this.handlers.get(method) ?? [];
@@ -43,10 +46,13 @@ class FakeCodexConn {
       return { thread: { id: (params as { threadId: string }).threadId } };
     }
     if (method === "turn/start") {
+      // Hold the response when a test wants to abort before the turn id lands.
+      if (this.turnStartGate) await this.turnStartGate;
       // Fire after the current microtask so all handlers are registered.
       queueMicrotask(() => {
         for (const [m, p] of this.script) this.fire(m, p);
       });
+      return { turn: { id: "turn-1" } };
     }
     return {};
   }
@@ -423,5 +429,67 @@ describe("CodexBackend notification parsing", () => {
       ["turn/completed", { turn: { status: "completed" } }],
     ]);
     expect(events.some((e) => e.type === "raw")).toBe(true);
+  });
+
+  it("interrupts the active Codex turn when aborted", async () => {
+    const { backend, mgr } = backendWith([]);
+    const ac = new AbortController();
+    const sending = backend.sendMessage({
+      vmId: "vm",
+      chatId: "chat",
+      message: "hi",
+      model: "gpt-5-codex",
+      effort: "medium",
+      sessionId: "thread-1",
+      signal: ac.signal,
+      onDelta: () => {},
+    });
+
+    // Let thread/resume and turn/start settle so the backend has the Codex
+    // turn id required by turn/interrupt.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    ac.abort();
+
+    await expect(sending).rejects.toThrow("aborted");
+    expect(mgr.conn.sent).toContainEqual({
+      method: "turn/interrupt",
+      params: { threadId: "thread-1", turnId: "turn-1" },
+    });
+  });
+
+  it("defers the interrupt until the turn id lands for an early Stop", async () => {
+    const { backend, mgr } = backendWith([]);
+    let releaseTurnStart!: () => void;
+    mgr.conn.turnStartGate = new Promise<void>((resolve) => {
+      releaseTurnStart = resolve;
+    });
+    const ac = new AbortController();
+    const sending = backend.sendMessage({
+      vmId: "vm",
+      chatId: "chat",
+      message: "hi",
+      model: "gpt-5-codex",
+      effort: "medium",
+      sessionId: "thread-1",
+      signal: ac.signal,
+      onDelta: () => {},
+    });
+
+    // turn/start has been sent but its response is withheld, so the backend
+    // doesn't yet know the turn id. Aborting now can't interrupt anything.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mgr.conn.sent.some((s) => s.method === "turn/start")).toBe(true);
+    ac.abort();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mgr.conn.sent.some((s) => s.method === "turn/interrupt")).toBe(false);
+
+    // Once turn/start resolves and hands over the turn id, the queued Stop
+    // fires the interrupt before the send rejects.
+    releaseTurnStart();
+    await expect(sending).rejects.toThrow("aborted");
+    expect(mgr.conn.sent).toContainEqual({
+      method: "turn/interrupt",
+      params: { threadId: "thread-1", turnId: "turn-1" },
+    });
   });
 });
