@@ -47,6 +47,7 @@ class FakeCodexConn {
       queueMicrotask(() => {
         for (const [m, p] of this.script) this.fire(m, p);
       });
+      return { turn: { id: "turn-1" } };
     }
     return {};
   }
@@ -423,5 +424,31 @@ describe("CodexBackend notification parsing", () => {
       ["turn/completed", { turn: { status: "completed" } }],
     ]);
     expect(events.some((e) => e.type === "raw")).toBe(true);
+  });
+
+  it("interrupts the active Codex turn when aborted", async () => {
+    const { backend, mgr } = backendWith([]);
+    const ac = new AbortController();
+    const sending = backend.sendMessage({
+      vmId: "vm",
+      chatId: "chat",
+      message: "hi",
+      model: "gpt-5-codex",
+      effort: "medium",
+      sessionId: "thread-1",
+      signal: ac.signal,
+      onDelta: () => {},
+    });
+
+    // Let thread/resume and turn/start settle so the backend has the Codex
+    // turn id required by turn/interrupt.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    ac.abort();
+
+    await expect(sending).rejects.toThrow("aborted");
+    expect(mgr.conn.sent).toContainEqual({
+      method: "turn/interrupt",
+      params: { threadId: "thread-1", turnId: "turn-1" },
+    });
   });
 });

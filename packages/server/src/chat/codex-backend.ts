@@ -145,6 +145,7 @@ export class CodexBackend implements ChatBackend {
     // Register notification handlers before sending the turn so we don't miss early events
     let fullContent = "";
     await new Promise<void>((resolve, reject) => {
+      let turnStartPromise: Promise<{ turn: { id: string } }> | null = null;
       const offDelta = conn.on("item/agentMessage/delta", (params) => {
         const delta = (params as { delta?: string } | null)?.delta ?? "";
         if (delta) {
@@ -370,14 +371,29 @@ export class CodexBackend implements ChatBackend {
         opts.signal?.removeEventListener("abort", onAbort);
       }
 
-      // User-initiated cancel: detach listeners and reject so the SSE
-      // handler can treat it as an abort. Codex doesn't expose a
-      // first-class `turn/cancel`, so the underlying turn keeps running in
-      // the codex process. The user just stops seeing updates and the
-      // chat unblocks. The next `turn/start` will queue behind it.
+      // User-initiated cancel: interrupt the actual Codex turn before
+      // unblocking the chat. `turn/interrupt` needs the turn id returned by
+      // `turn/start`, so an early Stop waits for that response first. Calling
+      // conn.send synchronously queues the interrupt on app-server stdin
+      // before we reject and allow a later turn to start.
       const onAbort = () => {
         cleanup();
-        reject(new DOMException("aborted", "AbortError"));
+        const started = turnStartPromise;
+        if (!started) {
+          reject(new DOMException("aborted", "AbortError"));
+          return;
+        }
+        void started
+          .then(({ turn }) => {
+            void conn
+              .send("turn/interrupt", { threadId, turnId: turn.id })
+              .catch((err: Error) => console.warn("[codex] turn interrupt failed:", err));
+          })
+          // turn/start has its own rejection handler below. Consume it on
+          // this cancellation chain too so an abort racing a failed start
+          // cannot create an unhandled rejection.
+          .catch(() => {})
+          .finally(() => reject(new DOMException("aborted", "AbortError")));
       };
       if (opts.signal) {
         if (opts.signal.aborted) {
@@ -395,26 +411,25 @@ export class CodexBackend implements ChatBackend {
       // `nearest_effort`. Our chat efforts are always drawn from the model's
       // curated menu (see shared/catalog.ts), and codex clamps anything it
       // doesn't support, so pass the chat's effort straight through.
-      conn
-        .send("turn/start", {
-          threadId,
-          model: opts.model,
-          input: [{ type: "text", text: opts.message }],
-          summary: "detailed",
-          // Pin the standard ("default") service tier per turn rather than via
-          // a launch-time `-c service_tier=...` flag. `serviceTier` is a
-          // first-class turn param (it sits next to `effort` in the v2
-          // turn-start struct), so this is exactly the path a future UI "fast
-          // mode" toggle would use to send "priority" for a given chat, with no
-          // app-server restart needed. It also guarantees a workspace image's
-          // baked config.toml can't silently push turns onto a premium tier.
-          serviceTier: "default",
-          effort: opts.effort,
-        })
-        .catch((err: Error) => {
-          cleanup();
-          reject(err);
-        });
+      turnStartPromise = conn.send("turn/start", {
+        threadId,
+        model: opts.model,
+        input: [{ type: "text", text: opts.message }],
+        summary: "detailed",
+        // Pin the standard ("default") service tier per turn rather than via
+        // a launch-time `-c service_tier=...` flag. `serviceTier` is a
+        // first-class turn param (it sits next to `effort` in the v2
+        // turn-start struct), so this is exactly the path a future UI "fast
+        // mode" toggle would use to send "priority" for a given chat, with no
+        // app-server restart needed. It also guarantees a workspace image's
+        // baked config.toml can't silently push turns onto a premium tier.
+        serviceTier: "default",
+        effort: opts.effort,
+      }) as Promise<{ turn: { id: string } }>;
+      turnStartPromise.catch((err: Error) => {
+        cleanup();
+        reject(err);
+      });
     }).catch(async (err) => {
       await this.refreshAuthAfterPossibleStaleState(opts.vmId, err);
       throw err;
