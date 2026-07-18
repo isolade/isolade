@@ -373,9 +373,10 @@ export class CodexBackend implements ChatBackend {
 
       // User-initiated cancel: interrupt the actual Codex turn before
       // unblocking the chat. `turn/interrupt` needs the turn id returned by
-      // `turn/start`, so an early Stop waits for that response first. Calling
-      // conn.send synchronously queues the interrupt on app-server stdin
-      // before we reject and allow a later turn to start.
+      // `turn/start`, so an early Stop waits for that response first. The
+      // interrupt is pushed onto app-server stdin (a synchronous `conn.send`)
+      // before the reject in `.finally` runs, so it is guaranteed to reach the
+      // app-server ahead of any later turn/start.
       const onAbort = () => {
         cleanup();
         const started = turnStartPromise;
@@ -384,9 +385,14 @@ export class CodexBackend implements ChatBackend {
           return;
         }
         void started
-          .then(({ turn }) => {
+          .then((res) => {
+            // Defensive: the turn-start result shape is asserted, not
+            // validated. If codex ever omits the turn id there's nothing to
+            // interrupt, so skip the send rather than throw into the catch.
+            const turnId = res?.turn?.id;
+            if (!turnId) return;
             void conn
-              .send("turn/interrupt", { threadId, turnId: turn.id })
+              .send("turn/interrupt", { threadId, turnId })
               .catch((err: Error) => console.warn("[codex] turn interrupt failed:", err));
           })
           // turn/start has its own rejection handler below. Consume it on
