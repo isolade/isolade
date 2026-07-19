@@ -339,10 +339,9 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     return c.json({ ok: true });
   });
 
-  // Probe live context composition by running `claude -p "/context"`
-  // against the chat's resumed session inside its VM. The probe uses
-  // `--no-session-persistence` so it doesn't append `/context` artifacts to
-  // the JSONL log. Codex chats always answer `{ available: false }`.
+  // Probe live context composition through the provider session. Claude uses
+  // the structured `get_context_usage` control request. Codex chats always
+  // answer `{ available: false }`.
   app.get("/api/instances/:id/chats/:chatId/context", async (c) => {
     const instanceId = c.req.param("id");
     const chatId = c.req.param("chatId");
@@ -356,10 +355,9 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     if (instance.archived) {
       return c.json({ available: false, reason: "chat is archived" });
     }
-    // Don't probe while a turn is streaming: it would spawn a second
-    // `claude -p --resume <sessionId>` against the same session JSONL the
-    // live turn is appending to, racing the reader against the writer. Answer
-    // "unavailable" instead. The gauge already reflects the turn's usage.
+    // Control requests other than interrupt are only sent between turns.
+    // Answer "unavailable" while streaming. The gauge already reflects the
+    // turn's usage.
     if (chatStreamHub.inFlightFor(chatId)) {
       return c.json({
         available: false,
@@ -374,7 +372,9 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     try {
       const breakdown = await backend.probeContext({
         vmId: instance.vmId,
+        chatId,
         model: chat.model,
+        effort: chat.effort,
         sessionId,
       });
       return c.json(breakdown);

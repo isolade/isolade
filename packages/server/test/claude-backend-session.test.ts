@@ -31,7 +31,7 @@ const baseTurn = {
 };
 
 describe("ClaudeBackend session lifecycle", () => {
-  it("reuses one process across turns and starts a fresh one on model switch", async () => {
+  it("reuses one process across turns and changes model and effort live", async () => {
     const { client, procs } = liveClient();
     const backend = new ClaudeBackend(client, fakeChatManager(), {
       idleMs: 60_000,
@@ -62,20 +62,87 @@ describe("ClaudeBackend session lifecycle", () => {
     expect(procs.length).toBe(1);
     expect(proc(procs, 0).userMessages().length).toBe(2);
 
-    // Turn 3: model switch → NEW process, resuming the same conversation.
+    // The context endpoint also uses the same process instead of launching a
+    // separate resumed CLI.
+    const context = backend.probeContext({
+      vmId: "vm",
+      chatId: "c",
+      model: "claude-sonnet-4-6",
+      effort: "high",
+      sessionId: "s",
+    });
+    await tick();
+    proc(procs, 0).succeedControl(proc(procs, 0).controls("get_context_usage")[0], {
+      totalTokens: 20_000,
+      rawMaxTokens: 200_000,
+      percentage: 10,
+      categories: [],
+    });
+    expect(await context).toMatchObject({ available: true, totalTokens: 20_000 });
+    expect(procs.length).toBe(1);
+
+    // Turn 3: model and effort switch through controls on the SAME process.
     const p3 = backend.sendMessage({
+      ...baseTurn,
+      effort: "max",
+      message: "switch",
+      model: "claude-opus-4-8",
+      sessionId: "s",
+    });
+    await tick();
+    const modelControl = proc(procs, 0).controls("set_model")[0];
+    proc(procs, 0).succeedControl(modelControl);
+    await tick();
+    const effortControl = proc(procs, 0).controls("apply_flag_settings")[0];
+    proc(procs, 0).succeedControl(effortControl);
+    await tick();
+    proc(procs, 0).emit({ type: "result", result: "three" });
+    expect((await p3).content).toBe("three");
+    expect(procs.length).toBe(1);
+    expect(modelControl.request).toEqual({
+      subtype: "set_model",
+      model: "claude-opus-4-8",
+    });
+    expect(effortControl.request).toEqual({
+      subtype: "apply_flag_settings",
+      settings: { effortLevel: "max" },
+    });
+    expect(proc(procs, 0).userMessages().length).toBe(3);
+
+    for (const p of procs) p.exit(0);
+    await tick();
+  });
+
+  it("falls back to a resumed process when a live configuration control fails", async () => {
+    const { client, procs } = liveClient();
+    const backend = new ClaudeBackend(client, fakeChatManager(), {
+      idleMs: 60_000,
+    });
+
+    const p1 = backend.sendMessage({
+      ...baseTurn,
+      message: "hi",
+      model: "claude-sonnet-4-6",
+    });
+    proc(procs, 0).emit({ type: "system", subtype: "init", session_id: "s" });
+    proc(procs, 0).emit({ type: "result", result: "one" });
+    await p1;
+
+    const p2 = backend.sendMessage({
       ...baseTurn,
       message: "switch",
       model: "claude-opus-4-8",
       sessionId: "s",
     });
-    proc(procs, 1).emit({ type: "result", result: "three" });
-    expect((await p3).content).toBe("three");
+    await tick();
+    proc(procs, 0).failControl(proc(procs, 0).controls("set_model")[0], "unsupported");
+    await tick();
+    proc(procs, 1).emit({ type: "result", result: "two" });
+
+    expect((await p2).content).toBe("two");
     expect(procs.length).toBe(2);
     expect(proc(procs, 1).command).toContain("--model claude-opus-4-8");
     expect(proc(procs, 1).command).toContain("--resume s");
-
-    // The old process was asked to shut down (stdin closed). Let it exit.
     for (const p of procs) p.exit(0);
     await tick();
   });

@@ -91,10 +91,9 @@ function ShareRow({ label, chatPct }: { label: string; chatPct: number }) {
   );
 }
 
-// Per-category breakdown of context window usage, sourced from
-// `claude -p "/context"` running inside the chat's VM. Anthropic-only;
-// codex chats render the unavailable hint. Each row mirrors a line from the
-// CLI's "Estimated usage by category" table.
+// Per-category breakdown from Claude's structured `get_context_usage`
+// response. Anthropic-only. Codex chats render the unavailable hint. Each row
+// mirrors a category reported by the live CLI process.
 export function ContextBreakdownDetail({
   breakdown,
   loading,

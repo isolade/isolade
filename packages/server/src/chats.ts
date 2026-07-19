@@ -162,8 +162,8 @@ export class ChatManager {
       updates.claudeSessionId = null;
       updates.codexThreadId = null;
     }
-    // Model swap resets the CLI session, so the sticky compacted flag and the
-    // last-known context window no longer describe the active session.
+    // A model swap changes context capacity and compaction semantics, even
+    // when the provider can apply it to the existing live process.
     if (chat.model !== model) {
       updates.compacted = null;
       updates.modelContextWindow = null;

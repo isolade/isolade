@@ -5,6 +5,7 @@
 export class FakeProc {
   command = "";
   stdout: ((b: Buffer) => void) | null = null;
+  stderr: ((b: Buffer) => void) | null = null;
   received: any[] = [];
   killed = false;
   private resolveExit: ((v: { exitCode: number }) => void) | null = null;
@@ -23,6 +24,7 @@ export class FakeProc {
   ): Promise<{ exitCode: number }> => {
     this.command = command;
     this.stdout = opts.stdout;
+    this.stderr = opts.stderr ?? null;
     void (async () => {
       for await (const chunk of opts.stdin) {
         for (const line of chunk.toString("utf8").split("\n")) {
@@ -46,6 +48,16 @@ export class FakeProc {
     this.stdout(Buffer.from(JSON.stringify(obj) + "\n"));
   }
 
+  emitStdout(chunk: Buffer | string): void {
+    if (!this.stdout) throw new Error("process not started yet");
+    this.stdout(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+  }
+
+  emitStderr(chunk: Buffer | string): void {
+    if (!this.stderr) throw new Error("process stderr not started yet");
+    this.stderr(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+  }
+
   exit(code: number): void {
     if (this.exited) return;
     this.exited = true;
@@ -63,9 +75,28 @@ export class FakeProc {
   }
 
   interrupts(): any[] {
+    return this.controls("interrupt");
+  }
+
+  controls(subtype?: string): any[] {
     return this.received.filter(
-      (m) => m?.type === "control_request" && m?.request?.subtype === "interrupt",
+      (m) =>
+        m?.type === "control_request" && (subtype === undefined || m?.request?.subtype === subtype),
     );
+  }
+
+  succeedControl(control: any, response: Record<string, unknown> = {}): void {
+    this.emit({
+      type: "control_response",
+      response: { subtype: "success", request_id: control.request_id, response },
+    });
+  }
+
+  failControl(control: any, error: string): void {
+    this.emit({
+      type: "control_response",
+      response: { subtype: "error", request_id: control.request_id, error },
+    });
   }
 }
 

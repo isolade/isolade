@@ -94,7 +94,9 @@ export interface ChatBackend {
   // the probe isn't applicable (codex backend, missing sessionId).
   probeContext(opts: {
     vmId: string;
+    chatId: string;
     model: string;
+    effort: ChatEffort;
     sessionId?: string;
   }): Promise<ContextBreakdown>;
 

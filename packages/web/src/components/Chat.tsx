@@ -189,8 +189,8 @@ function Chat({
   const appliedModelRef = useRef(model);
   const appliedEffortRef = useRef<ChatEffort>(effort);
   // Tracks the in-flight turn so the Stop button (and unmount) can abort the
-  // SSE fetch. The server treats a client disconnect as a cancel signal and
-  // tears down the underlying CLI process.
+  // SSE fetch. Stop also sends an explicit cancellation request. A plain
+  // disconnect leaves the server turn running during its reconnect grace.
   const abortRef = useRef<AbortController | null>(null);
   const showDebug = useDebugSetting();
   const agentFontFamily = resolveFontFamily(useAgentFontSetting());
@@ -198,12 +198,12 @@ function Chat({
   // Latest token-usage snapshot from the server. Seeded synchronously from
   // the persisted chat row so the composer's cost + context-pressure UI
   // survives a reload. Replaced wholesale by SSE `usage` events during a
-  // turn, and cleared on chat switch and on model change (the underlying CLI
-  // session resets, so previous totals are no longer meaningful).
+  // turn and cleared when switching chats. Model and effort changes keep the
+  // live Claude process and its accumulated usage.
   const [usage, setUsage] = useState<UsageState | null>(() => usageSeedFromChat(chat));
-  // Live `/context` breakdown probed when the model picker opens. Lazy-loaded
-  // (the probe spawns a `claude -p` CLI in the VM) and refreshed on every
-  // open so the table reflects the current session state.
+  // Live context breakdown requested from the persistent Claude process when
+  // the model picker opens. Refreshed on every open so the table reflects the
+  // current session state.
   const [breakdown, setBreakdown] = useState<ContextBreakdown | null>(null);
   const [breakdownLoading, setBreakdownLoading] = useState(false);
   const [breakdownError, setBreakdownError] = useState<string | null>(null);
@@ -508,11 +508,10 @@ function Chat({
 
   const applyModelChange = useCallback(
     async (body: UpdateChatBody) => {
-      // Keep the existing usage/cost snapshot visible across model + effort
-      // changes. A model swap resets the underlying CLI session, but the
-      // accumulated cost is still real and the last context-window reading
-      // remains useful info for the user until the next turn streams fresh
-      // usage events. Effort-only changes don't reset the session at all.
+      // Keep the existing usage/cost snapshot visible across model and effort
+      // changes. Claude applies both to the live process before the next turn,
+      // so the accumulated cost remains valid. The next turn replaces the last
+      // context-window reading with one for the new configuration.
       const updated = await updateChatModel(instanceId, chatId, body).catch((err: unknown) => {
         // PATCH failure leaves the picker showing the user's intended
         // value, but the next turn will use the server's older config.
