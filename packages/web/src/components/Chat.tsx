@@ -1,11 +1,13 @@
-import { ArrowDown } from "lucide-react";
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { ArrowDown, ChevronLeft, ChevronRight, Pencil } from "lucide-react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
   API_BASE,
   getChatContextBreakdown,
   listChatEvents,
   listChatMessages,
+  setChatActiveLeaf,
   updateChatModel,
 } from "../lib/api";
 import {
@@ -14,6 +16,7 @@ import {
   resumeChatTurn,
   runChatTurn,
 } from "../lib/chat-stream";
+import { deriveThread, tipForSibling } from "../lib/chat-tree";
 import type {
   ChatEffort,
   ChatEvent,
@@ -88,26 +91,161 @@ interface ChatProps {
   onTitle?: (title: string) => void;
 }
 
+// In-place editor for a user message. Draft state lives here (not in Chat)
+// so keystrokes don't re-render the whole message list. Enter submits,
+// Escape cancels, and the textarea auto-grows like the main composer.
+function UserMessageEditor({
+  initial,
+  fontFamily,
+  onCancel,
+  onSubmit,
+}: {
+  initial: string;
+  fontFamily: string;
+  onCancel: () => void;
+  onSubmit: (content: string) => void;
+}) {
+  const [draft, setDraft] = useState(initial);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+  }, []);
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    const maxHeight = Math.min(window.innerHeight * 0.5, 480);
+    el.style.height = "0px";
+    el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`;
+  }, [draft]);
+
+  const canSubmit = draft.trim().length > 0;
+  return (
+    <div className="w-full rounded-2xl border border-input bg-secondary px-4 py-2.5">
+      <textarea
+        ref={textareaRef}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            onCancel();
+          } else if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            if (canSubmit) onSubmit(draft);
+          }
+        }}
+        rows={1}
+        className="w-full resize-none bg-transparent text-sm leading-relaxed text-secondary-foreground outline-none"
+        style={{ fontFamily }}
+      />
+      <div className="mt-2 flex justify-end gap-2">
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          className="h-7 rounded-full"
+          onClick={onCancel}
+        >
+          Cancel
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          className="h-7 rounded-full"
+          disabled={!canSubmit}
+          onClick={() => onSubmit(draft)}
+        >
+          Send
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+// `‹ n/m ›` version navigation shown under a message that has sibling
+// versions (i.e. it was edited at least once).
+function VersionPager({
+  index,
+  count,
+  disabled,
+  onNavigate,
+}: {
+  index: number;
+  count: number;
+  disabled: boolean;
+  onNavigate: (dir: 1 | -1) => void;
+}) {
+  return (
+    <div className="flex items-center gap-0.5 text-xs text-muted-foreground">
+      <button
+        type="button"
+        aria-label="Previous version"
+        disabled={disabled || index <= 1}
+        onClick={() => onNavigate(-1)}
+        className="flex h-6 w-6 items-center justify-center rounded transition-colors hover:text-foreground disabled:opacity-40 disabled:hover:text-muted-foreground"
+      >
+        <ChevronLeft className="h-4.5 w-4.5" />
+      </button>
+      <span className="tabular-nums">
+        {index}/{count}
+      </span>
+      <button
+        type="button"
+        aria-label="Next version"
+        disabled={disabled || index >= count}
+        onClick={() => onNavigate(1)}
+        className="flex h-6 w-6 items-center justify-center rounded transition-colors hover:text-foreground disabled:opacity-40 disabled:hover:text-muted-foreground"
+      >
+        <ChevronRight className="h-4.5 w-4.5" />
+      </button>
+    </div>
+  );
+}
+
 // One committed message in the history list. Memoized so a re-render of Chat
 // while a turn is streaming (streamingChunks changes every frame) doesn't
 // reconcile every prior message's bubble/StreamView. Its props are stable per
 // message across those frames — `chunks` is a fixed array reference once
-// committed, and the font families only change on a settings edit — so the
-// memo holds for the whole history and only the live streaming bubble below
-// updates per frame.
+// committed, the font families only change on a settings edit, and the
+// edit/version props only change on a send or an explicit edit action — so
+// the memo holds for the whole history and only the live streaming bubble
+// below updates per frame.
 const MessageRow = memo(function MessageRow({
   msg,
   chunks,
   showDebug,
   userFontFamily,
   agentFontFamily,
+  versionIndex,
+  versionCount,
+  isEditing,
+  actionsDisabled,
+  onStartEdit,
+  onCancelEdit,
+  onSubmitEdit,
+  onNavigateVersion,
 }: {
   msg: ChatMessage;
   chunks: StreamChunk[] | undefined;
   showDebug: boolean;
   userFontFamily: string;
   agentFontFamily: string;
+  // Version info when this message has siblings (it was edited), else 0.
+  versionIndex: number;
+  versionCount: number;
+  isEditing: boolean;
+  // True while a turn is streaming: hides the edit affordance and freezes
+  // version navigation (the server refuses both anyway).
+  actionsDisabled: boolean;
+  onStartEdit: (id: string) => void;
+  onCancelEdit: () => void;
+  onSubmitEdit: (id: string, content: string) => void;
+  onNavigateVersion: (id: string, dir: 1 | -1) => void;
 }) {
+  const hasVersions = versionCount > 1;
   return (
     <div
       data-message-id={msg.id}
@@ -115,10 +253,54 @@ const MessageRow = memo(function MessageRow({
     >
       {msg.role === "user" ? (
         <div
-          className="max-w-[80%] rounded-2xl px-4 py-2.5 text-sm break-words bg-secondary text-secondary-foreground whitespace-pre-wrap"
-          style={{ fontFamily: userFontFamily }}
+          className={cn(
+            "group flex flex-col items-end gap-1",
+            isEditing ? "w-full" : "max-w-[80%]",
+          )}
         >
-          {msg.content}
+          {isEditing ? (
+            <UserMessageEditor
+              initial={msg.content}
+              fontFamily={userFontFamily}
+              onCancel={onCancelEdit}
+              onSubmit={(content) => onSubmitEdit(msg.id, content)}
+            />
+          ) : (
+            <>
+              <div
+                className="rounded-2xl px-4 py-2.5 text-sm break-words bg-secondary text-secondary-foreground whitespace-pre-wrap"
+                style={{ fontFamily: userFontFamily }}
+              >
+                {msg.content}
+              </div>
+              {/* Action row under the bubble: hover-revealed edit pencil,
+                  then the version pager (always visible when the message has
+                  versions). Rendered only when it has something to offer, so
+                  ordinary messages don't reserve dead space mid-stream. */}
+              {(hasVersions || !actionsDisabled) && (
+                <div className="flex h-6 items-center">
+                  {!actionsDisabled && (
+                    <button
+                      type="button"
+                      aria-label="Edit message"
+                      onClick={() => onStartEdit(msg.id)}
+                      className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                  {hasVersions && (
+                    <VersionPager
+                      index={versionIndex}
+                      count={versionCount}
+                      disabled={actionsDisabled}
+                      onNavigate={(dir) => onNavigateVersion(msg.id, dir)}
+                    />
+                  )}
+                </div>
+              )}
+            </>
+          )}
         </div>
       ) : (
         <div
@@ -129,6 +311,14 @@ const MessageRow = memo(function MessageRow({
             <StreamView chunks={chunks} showDebug={showDebug} />
           ) : (
             <Markdown content={msg.content} />
+          )}
+          {hasVersions && (
+            <VersionPager
+              index={versionIndex}
+              count={versionCount}
+              disabled={actionsDisabled}
+              onNavigate={(dir) => onNavigateVersion(msg.id, dir)}
+            />
           )}
         </div>
       )}
@@ -168,6 +358,7 @@ function Chat({
             chatId,
             role: "user",
             content: initialMessage,
+            parentId: null,
             createdAt: new Date(),
           },
         ]
@@ -175,6 +366,22 @@ function Chat({
   );
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(!!initialMessage);
+  // Which branch of the message tree is visible: the id of the path's last
+  // message (or any message on it). Seeded from the persisted chat row,
+  // advanced locally as turns run, and re-pointed by version navigation.
+  // Mirrored into a ref so long-lived closures (drainTurn) read the current
+  // value without re-subscribing.
+  const [activeLeafId, setActiveLeafId] = useState<string | null>(chat.activeLeafId ?? null);
+  const activeLeafRef = useRef<string | null>(chat.activeLeafId ?? null);
+  const setActiveLeaf = useCallback((id: string | null) => {
+    activeLeafRef.current = id;
+    setActiveLeafId(id);
+  }, []);
+  // The user message currently being edited in place, if any.
+  const [editingId, setEditingId] = useState<string | null>(null);
+  // The optimistic user bubble of the in-flight turn, replaced by the
+  // server's `user_message` frame (which carries the real id + parent).
+  const pendingUserIdRef = useRef<string | null>(null);
   const [streamingChunks, setStreamingChunks] = useState<StreamChunk[]>([]);
   // Per-message debug+text chunks captured during streaming. Kept in component
   // state (not persisted server-side) so the user can review tool calls etc.
@@ -209,6 +416,25 @@ function Chat({
   const [breakdownError, setBreakdownError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  // Latest chat prop, for effects/closures that shouldn't re-run when the
+  // parent refreshes the row (only the values are read, lazily).
+  const chatRef = useRef(chat);
+  chatRef.current = chat;
+  // The visible thread: one root-to-tip path through the message tree, plus
+  // version info for messages that have been edited. `messages` holds every
+  // branch, and this projects the active one.
+  const thread = useMemo(() => deriveThread(messages, activeLeafId), [messages, activeLeafId]);
+  // Render-derived tip of the visible branch, for long-lived closures.
+  const tipIdRef = useRef<string | null>(null);
+  tipIdRef.current = thread.tipId;
+  // The user message the in-flight turn replies to: the optimistic id at
+  // send time, then the server id once the user_message frame lands. Null on
+  // resumed turns (whose user message is already the branch tip). Where the
+  // committed assistant message attaches.
+  const turnUserIdRef = useRef<string | null>(null);
+  // Mirror of `streaming` for stable callbacks (edit/navigation guards).
+  const streamingRef = useRef(streaming);
+  streamingRef.current = streaming;
   // Whether the viewport is within SCROLL_PIN_THRESHOLD_PX of the bottom.
   // Written by the container's onScroll, read inside scrollToBottom's rAF
   // callback, a ref (not state) so streaming scrolls never depend on a
@@ -401,10 +627,13 @@ function Chat({
       setBreakdownError(null);
       setMessageChunks({});
       setStreamingChunks([]);
+      setActiveLeaf(chatRef.current.activeLeafId ?? null);
+      setEditingId(null);
+      pendingUserIdRef.current = null;
       isPinnedRef.current = true;
       setShowJump(false);
     }
-  }, [chatId]);
+  }, [chatId, setActiveLeaf]);
 
   // Skip the fetch while pending (chat doesn't exist on the server
   // yet, since its ids are synthetic stand-ins) or when mounted with a
@@ -435,6 +664,15 @@ function Chat({
         ]);
         if (ac.signal.aborted) return;
         setMessages(msgs);
+        // Adopt the server's branch choice when the local leaf isn't among
+        // the fetched messages (first hydration, or a leaf minted by another
+        // window). An unknown/absent leaf falls back to the newest message
+        // inside deriveThread, which is the legacy linear behavior.
+        const localLeaf = activeLeafRef.current;
+        if (!localLeaf || !msgs.some((m) => m.id === localLeaf)) {
+          const serverLeaf = chatRef.current.activeLeafId;
+          setActiveLeaf(serverLeaf && msgs.some((m) => m.id === serverLeaf) ? serverLeaf : null);
+        }
         if (events.length > 0) {
           const grouped: Record<string, ChatEvent[]> = {};
           for (const ev of events) {
@@ -695,6 +933,11 @@ function Chat({
           id,
           chatId,
           role: "assistant",
+          // The assistant message replies to the turn's user message. For a
+          // resumed turn (no turnUserIdRef) that message is the visible
+          // branch's tip: the leaf advanced onto it at turn start and the
+          // tip derivation descends to it even from a stale leaf.
+          parentId: turnUserIdRef.current ?? tipIdRef.current,
           content,
           createdAt: new Date(),
         };
@@ -704,9 +947,25 @@ function Chat({
           if (prev.some((m) => m.id === id)) return prev;
           return [...prev, msg];
         });
+        setActiveLeaf(id);
         setMessageChunks((prev) => ({ ...prev, [id]: chunks }));
         setStreamingChunks([]);
         scrollToBottom();
+      };
+
+      // Append a client-only assistant error bubble at the tip of the
+      // visible branch (and advance the leaf so it stays visible).
+      const appendErrorBubble = (content: string) => {
+        const errMsg: ChatMessage = {
+          id: `err-${crypto.randomUUID()}`,
+          chatId,
+          role: "assistant",
+          parentId: activeLeafRef.current,
+          content,
+          createdAt: new Date(),
+        };
+        setMessages((prev) => [...prev, errMsg]);
+        setActiveLeaf(errMsg.id);
       };
 
       const onEvent = (ev: ChatTurnEvent) => {
@@ -716,6 +975,28 @@ function Chat({
           // Re-key any pre-seeded chunks under the canonical id so a
           // resume that landed before message_id still rendered into
           // the right bubble.
+          return;
+        }
+        if (ev.kind === "user_message") {
+          // The persisted user-message row: swap it in for our optimistic
+          // bubble so the ids the tree navigates by are the server's.
+          const pendingId = pendingUserIdRef.current;
+          pendingUserIdRef.current = null;
+          const serverMsg = ev.message;
+          turnUserIdRef.current = serverMsg.id;
+          setMessages((prev) => {
+            const idx = pendingId ? prev.findIndex((m) => m.id === pendingId) : -1;
+            if (idx >= 0) {
+              const next = [...prev];
+              next[idx] = serverMsg;
+              return next;
+            }
+            if (prev.some((m) => m.id === serverMsg.id)) return prev;
+            return [...prev, serverMsg];
+          });
+          if (activeLeafRef.current === pendingId || activeLeafRef.current === null) {
+            setActiveLeaf(serverMsg.id);
+          }
           return;
         }
         if (ev.kind === "done") {
@@ -753,14 +1034,7 @@ function Chat({
             // get an additional error bubble after the partial so
             // the cause is visible. Cancellations don't, since the
             // partial alone matches the "stopped" semantics.
-            const errMsg: ChatMessage = {
-              id: `err-${crypto.randomUUID()}`,
-              chatId,
-              role: "assistant",
-              content: `Error: ${ev.message}`,
-              createdAt: new Date(),
-            };
-            setMessages((prev) => [...prev, errMsg]);
+            appendErrorBubble(`Error: ${ev.message}`);
             scrollToBottom();
           }
           streamingMessageIdRef.current = null;
@@ -855,14 +1129,7 @@ function Chat({
           }
           return;
         }
-        const errMsg: ChatMessage = {
-          id: `err-${crypto.randomUUID()}`,
-          chatId,
-          role: "assistant",
-          content: `Error: ${err instanceof Error ? err.message : String(err)}`,
-          createdAt: new Date(),
-        };
-        setMessages((prev) => [...prev, errMsg]);
+        appendErrorBubble(`Error: ${err instanceof Error ? err.message : String(err)}`);
         setStreamingChunks([]);
         scrollToBottom();
         return;
@@ -893,23 +1160,17 @@ function Chat({
           console.warn(
             `[chat] runner exited without terminal event (chat=${chatId} msg=${serverMessageId})`,
           );
-          const errMsg: ChatMessage = {
-            id: `err-${crypto.randomUUID()}`,
-            chatId,
-            role: "assistant",
-            content:
-              "Error: stream ended without a completion signal, and " +
+          appendErrorBubble(
+            "Error: stream ended without a completion signal, and " +
               "the server may have dropped the connection. " +
               "Reload to see any partial output that was persisted.",
-            createdAt: new Date(),
-          };
-          setMessages((prev) => [...prev, errMsg]);
+          );
           setStreamingChunks([]);
           scrollToBottom();
         }
       }
     },
-    [chatId, scrollToBottom, onTitle],
+    [chatId, scrollToBottom, onTitle, setActiveLeaf],
   );
 
   const sendMessage = useCallback(
@@ -935,22 +1196,27 @@ function Chat({
         await applyModelChange(body);
       }
 
-      setMessages((prev) => {
-        // If the parent bootstrapped us with this same message as an optimistic
-        // user bubble, don't duplicate it.
-        const last = prev[prev.length - 1];
-        if (last?.role === "user" && last.content === content) return prev;
-        return [
-          ...prev,
-          {
-            id: crypto.randomUUID(),
-            chatId,
-            role: "user",
-            content,
-            createdAt: new Date(),
-          },
-        ];
-      });
+      // Optimistic user bubble at the tip of the visible branch. The server's
+      // `user_message` frame swaps in the real row (id + parent) once the
+      // POST lands. If the parent bootstrapped us with this same message as
+      // an optimistic bubble, reuse it instead of duplicating.
+      const last = messages[messages.length - 1];
+      const reuseBootstrap = last?.role === "user" && last.content === content;
+      const optimisticId = reuseBootstrap ? last.id : crypto.randomUUID();
+      pendingUserIdRef.current = optimisticId;
+      turnUserIdRef.current = optimisticId;
+      if (!reuseBootstrap) {
+        const optimistic: ChatMessage = {
+          id: optimisticId,
+          chatId,
+          role: "user",
+          content,
+          parentId: thread.tipId,
+          createdAt: new Date(),
+        };
+        setMessages((prev) => [...prev, optimistic]);
+      }
+      setActiveLeaf(optimisticId);
       scrollToBottom(true);
 
       const ac = new AbortController();
@@ -976,12 +1242,129 @@ function Chat({
       streaming,
       instanceId,
       chatId,
+      messages,
+      thread.tipId,
       scrollToBottom,
+      setActiveLeaf,
       currentModel,
       currentEffort,
       applyModelChange,
       drainTurn,
     ],
+  );
+
+  // Edit a user message: renders a sibling version optimistically (the path
+  // switches to the new branch immediately) and streams the recomputed
+  // answer through the same drain machinery as a normal send. The server
+  // forks the provider session at the point before the edited message.
+  const sendEdit = useCallback(
+    async (messageId: string, content: string) => {
+      const trimmed = content.trim();
+      if (!trimmed || streamingRef.current) return;
+      const edited = messages.find((m) => m.id === messageId);
+      if (!edited) return;
+
+      setEditingId(null);
+      setStreaming(true);
+      setStreamingChunks([]);
+
+      // Same deferred model/effort flush as a normal send.
+      if (currentModel !== appliedModelRef.current || currentEffort !== appliedEffortRef.current) {
+        const body: UpdateChatBody = {};
+        if (currentModel !== appliedModelRef.current) body.model = currentModel;
+        if (currentEffort !== appliedEffortRef.current) body.effort = currentEffort;
+        await applyModelChange(body);
+      }
+
+      // The optimistic sibling: same parent as the edited message, so the
+      // derived path swaps branches right away. Replaced by the server row
+      // via the user_message frame.
+      const optimisticId = crypto.randomUUID();
+      pendingUserIdRef.current = optimisticId;
+      turnUserIdRef.current = optimisticId;
+      const optimistic: ChatMessage = {
+        id: optimisticId,
+        chatId,
+        role: "user",
+        content: trimmed,
+        parentId: edited.parentId ?? null,
+        createdAt: new Date(),
+      };
+      setMessages((prev) => [...prev, optimistic]);
+      setActiveLeaf(optimisticId);
+      scrollToBottom(true);
+
+      const ac = new AbortController();
+      abortRef.current = ac;
+      try {
+        await drainTurn(ac, null, (onEvent) =>
+          runChatTurn({
+            apiBase: API_BASE,
+            instanceId,
+            chatId,
+            content: trimmed,
+            editMessageId: messageId,
+            onEvent,
+            signal: ac.signal,
+          }),
+        );
+      } finally {
+        if (abortRef.current === ac) abortRef.current = null;
+        setStreaming(false);
+      }
+    },
+    [
+      messages,
+      instanceId,
+      chatId,
+      scrollToBottom,
+      setActiveLeaf,
+      currentModel,
+      currentEffort,
+      applyModelChange,
+      drainTurn,
+    ],
+  );
+
+  const handleStartEdit = useCallback((id: string) => {
+    if (streamingRef.current) return;
+    setEditingId(id);
+  }, []);
+  const handleCancelEdit = useCallback(() => setEditingId(null), []);
+  const handleSubmitEdit = useCallback(
+    (id: string, content: string) => {
+      void sendEdit(id, content);
+    },
+    [sendEdit],
+  );
+
+  // Switch to a neighboring version of an edited message: activate that
+  // sibling's branch (its newest tip) locally for an instant swap, then
+  // persist the choice. The server resolves the tip itself and re-points the
+  // provider session at the branch, and its answer wins over our local
+  // guess (they only differ if another window raced us).
+  const handleNavigateVersion = useCallback(
+    (messageId: string, dir: 1 | -1) => {
+      if (streamingRef.current) return;
+      const info = thread.versions.get(messageId);
+      if (!info) return;
+      const targetId = info.siblingIds[info.index - 1 + dir];
+      if (!targetId) return;
+      const previousLeaf = activeLeafRef.current;
+      setActiveLeaf(tipForSibling(messages, targetId));
+      setChatActiveLeaf(instanceId, chatId, targetId)
+        .then((updated) => {
+          if (updated.activeLeafId) setActiveLeaf(updated.activeLeafId);
+        })
+        .catch((err: unknown) => {
+          // The server refused (e.g. a turn raced us from another window).
+          // Snap back so the visible branch matches the session the next
+          // turn will actually run in.
+          console.warn(`[chat] branch switch failed (chat=${chatId}):`, err);
+          setActiveLeaf(previousLeaf);
+        });
+    },
+    [thread, messages, instanceId, chatId, setActiveLeaf],
   );
 
   // Attach to an in-flight turn discovered during mount-time
@@ -998,6 +1381,10 @@ function Chat({
       const ac = new AbortController();
       abortRef.current = ac;
       streamingMessageIdRef.current = messageId;
+      // A resumed turn's user message is already persisted and hydrated: the
+      // commit path resolves it as the visible branch's tip instead.
+      pendingUserIdRef.current = null;
+      turnUserIdRef.current = null;
       void (async () => {
         try {
           await drainTurn(ac, seedChunks, (onEvent) => {
@@ -1048,17 +1435,17 @@ function Chat({
     if (creationErrorFiredRef.current === creationError) return;
     creationErrorFiredRef.current = creationError;
     setStreaming(false);
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `creation-error-${crypto.randomUUID()}`,
-        chatId,
-        role: "assistant",
-        content: `Error: ${creationError}`,
-        createdAt: new Date(),
-      },
-    ]);
-  }, [creationError, chatId]);
+    const errMsg: ChatMessage = {
+      id: `creation-error-${crypto.randomUUID()}`,
+      chatId,
+      role: "assistant",
+      parentId: activeLeafRef.current,
+      content: `Error: ${creationError}`,
+      createdAt: new Date(),
+    };
+    setMessages((prev) => [...prev, errMsg]);
+    setActiveLeaf(errMsg.id);
+  }, [creationError, chatId, setActiveLeaf]);
 
   // Block cross-provider model swaps: the picker only offers models that
   // match the current chat's provider. To switch providers, the user opens
@@ -1079,16 +1466,36 @@ function Chat({
           className="w-full max-w-3xl px-4 flex flex-col gap-4"
           style={{ paddingBottom: composerHeight + 16 }}
         >
-          {messages.map((msg) => (
-            <MessageRow
-              key={msg.id}
-              msg={msg}
-              chunks={messageChunks[msg.id]}
-              showDebug={showDebug}
-              userFontFamily={userFontFamily}
-              agentFontFamily={agentFontFamily}
-            />
-          ))}
+          {thread.path.map((msg, i) => {
+            const version = thread.versions.get(msg.id);
+            // User rows are keyed by PATH POSITION, not message id: pressing
+            // ‹/› swaps in a sibling version at the same position, and an
+            // id key would remount the row, re-running the pencil's
+            // hover-reveal fade (a visible flicker) and dropping the pager
+            // button's focus/hover state on every press. Position keys keep
+            // the DOM node alive across the swap. The path never reorders
+            // (it only grows or swaps a suffix), so positions are stable.
+            // Assistant rows keep id keys so their tool-call cards remount
+            // with fresh collapse state when the branch switches.
+            return (
+              <MessageRow
+                key={msg.role === "user" ? `user-pos-${i}` : msg.id}
+                msg={msg}
+                chunks={messageChunks[msg.id]}
+                showDebug={showDebug}
+                userFontFamily={userFontFamily}
+                agentFontFamily={agentFontFamily}
+                versionIndex={version?.index ?? 0}
+                versionCount={version?.count ?? 0}
+                isEditing={editingId === msg.id}
+                actionsDisabled={streaming}
+                onStartEdit={handleStartEdit}
+                onCancelEdit={handleCancelEdit}
+                onSubmitEdit={handleSubmitEdit}
+                onNavigateVersion={handleNavigateVersion}
+              />
+            );
+          })}
           {streamingChunks.length > 0 && (
             <div className="flex justify-start">
               <div

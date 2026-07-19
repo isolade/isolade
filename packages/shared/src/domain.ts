@@ -170,6 +170,11 @@ export const chatSchema = z.object({
   // Whether the underlying CLI session has been auto-compacted. Sticky
   // until the model/provider changes.
   compacted: z.boolean().nullable(),
+  // Tip of the branch the chat currently shows. Messages form a tree once a
+  // message has been edited (see chatMessageSchema.parentId), and this picks
+  // the visible path. Null on legacy rows and fresh chats: resolve to the
+  // newest message. Optional so producers that predate it (mocks) still parse.
+  activeLeafId: z.string().nullable().optional(),
   // Server-computed (not stored): derived from the cumulative totals + the
   // resolved rate plan at GET time. Omitted when we can't make an estimate.
   subscriptionShare: subscriptionShareSchema.optional(),
@@ -206,6 +211,11 @@ export const chatMessageSchema = z.object({
   chatId: z.string(),
   role: chatMessageRoleSchema,
   content: z.string(),
+  // Tree link: the message this one replies to, null for the chat's first
+  // message. Editing a user message adds a *sibling* (same parentId), so a
+  // message's versions are its parentId group in list order. Optional so
+  // producers that predate the tree (mocks, old servers) still parse.
+  parentId: z.string().nullable().optional(),
   createdAt: dateLikeSchema,
 });
 export const chatMessageArraySchema = z.array(chatMessageSchema);

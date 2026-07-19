@@ -75,6 +75,22 @@ export type ChatEvent =
     }
   | { type: "raw"; source: "claude" | "codex"; payload: unknown };
 
+// Provider-session facts a backend learns while a turn runs, reported through
+// `onMeta` as soon as they're known (not just on success) so the turn service
+// can stamp them onto the assistant message row even when the turn is later
+// aborted. Together they pinpoint "the conversation right after this turn"
+// for a future fork:
+//   - sessionId: Claude session id / codex thread id the turn ran in. Changes
+//     mid-chat on a fork (Claude mints a new session id, codex a new thread).
+//   - anchorId: the turn's end position inside that session. Claude: the
+//     transcript uuid of the turn's last assistant message (consumed by
+//     `--resume-session-at`). Codex: the turn id (consumed by thread/fork's
+//     lastTurnId).
+export interface TurnMeta {
+  sessionId?: string;
+  anchorId?: string;
+}
+
 export interface ChatBackend {
   sendMessage(opts: {
     vmId: string;
@@ -83,9 +99,20 @@ export interface ChatBackend {
     model: string;
     effort: ChatEffort;
     sessionId?: string;
+    // Fork the resumed session instead of continuing its tail: replay
+    // `sessionId` only up to and including `anchorId`, mint a new
+    // session/thread from that prefix, and run the turn there. The original
+    // session stays intact, so its branch remains continuable. Requires
+    // `sessionId`. This is how an edited message recomputes "from that
+    // point". (Editing before any anchored turn just omits `sessionId`,
+    // which is a fresh session and needs no fork.)
+    fork?: { anchorId: string };
     signal?: AbortSignal;
     onDelta: (text: string) => void;
     onEvent?: (event: ChatEvent) => void;
+    // Fired whenever a TurnMeta field becomes known, possibly several times
+    // per turn (later values supersede earlier ones). See TurnMeta.
+    onMeta?: (meta: TurnMeta) => void;
   }): Promise<{ content: string; sessionId?: string }>;
 
   // Snapshot the CLI's view of context composition. Anthropic only. codex

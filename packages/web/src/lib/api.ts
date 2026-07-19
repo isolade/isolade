@@ -68,6 +68,7 @@ import {
   type SetGitIdentityBody,
   type SetSigningConfigBody,
   type SigningKeysResult,
+  setActiveLeafBodySchema,
   setDockerfileBodySchema,
   setGitIdentityBodySchema,
   setProfileConfigFormBodySchema,
@@ -884,6 +885,25 @@ export async function updateChatModel(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(updateChatBodySchema.parse(body)),
+    }),
+    chatSchema,
+  );
+}
+
+// Switch the chat's visible branch (version navigation on an edited
+// message). `leafId` may be any message on the target branch, and the server
+// descends to that branch's tip and re-points the provider session. Returns
+// the updated chat row (its activeLeafId is the resolved tip).
+export async function setChatActiveLeaf(
+  instanceId: string,
+  chatId: string,
+  leafId: string,
+): Promise<Chat> {
+  return parseResponse(
+    await apiFetch(`${API_BASE}/api/instances/${instanceId}/chats/${chatId}/active-leaf`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(setActiveLeafBodySchema.parse({ leafId })),
     }),
     chatSchema,
   );

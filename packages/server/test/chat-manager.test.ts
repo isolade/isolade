@@ -461,4 +461,139 @@ describe("ChatManager", () => {
       expect(cm.get(chat.id)?.claudeSessionId).toBeNull();
     });
   });
+
+  describe("message tree", () => {
+    // A linear two-turn chat with session snapshots, the shape every branchy
+    // structure below grows out of: u1 → a1 → u2 → a2.
+    function seedLinearChat() {
+      const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
+      const u1 = cm.addMessage(chat.id, "user", "first question");
+      const a1 = cm.addMessage(chat.id, "assistant", "first answer", {
+        parentId: u1.id,
+        sessionId: "sess-1",
+        anchorId: "anchor-1",
+      });
+      const u2 = cm.addMessage(chat.id, "user", "second question", { parentId: a1.id });
+      const a2 = cm.addMessage(chat.id, "assistant", "second answer", {
+        parentId: u2.id,
+        sessionId: "sess-1",
+        anchorId: "anchor-2",
+      });
+      cm.setActiveLeaf(chat.id, a2.id);
+      return { chat, u1, a1, u2, a2 };
+    }
+
+    it("addMessage persists parent and session metadata", () => {
+      const { chat, u1, a1 } = seedLinearChat();
+      const msgs = cm.getMessages(chat.id);
+      expect(msgs[0]?.parentId).toBeNull();
+      expect(msgs[1]?.parentId).toBe(u1.id);
+      expect(msgs[1]?.sessionId).toBe("sess-1");
+      expect(msgs[1]?.anchorId).toBe("anchor-1");
+      expect(msgs[2]?.parentId).toBe(a1.id);
+    });
+
+    it("setMessageTurnMeta stamps snapshots onto an existing row", () => {
+      const { chat, u2 } = seedLinearChat();
+      const a = cm.addMessage(chat.id, "assistant", "partial", { parentId: u2.id });
+      cm.setMessageTurnMeta(a.id, { sessionId: "sess-9", anchorId: "anchor-9" });
+      const row = cm.getMessage(a.id);
+      expect(row?.sessionId).toBe("sess-9");
+      expect(row?.anchorId).toBe("anchor-9");
+    });
+
+    it("resolveTip follows the active leaf", () => {
+      const { chat, a2 } = seedLinearChat();
+      expect(cm.resolveTip(chat.id)?.id).toBe(a2.id);
+    });
+
+    it("resolveTip descends from a stale mid-branch leaf to the branch end", () => {
+      const { chat, u2, a2 } = seedLinearChat();
+      cm.setActiveLeaf(chat.id, u2.id);
+      expect(cm.resolveTip(chat.id)?.id).toBe(a2.id);
+    });
+
+    it("resolveTip falls back to the newest message for legacy rows (null leaf)", () => {
+      const { chat, a2 } = seedLinearChat();
+      cm.setActiveLeaf(chat.id, null);
+      expect(cm.resolveTip(chat.id)?.id).toBe(a2.id);
+    });
+
+    it("resolveTip prefers the newest sibling branch when descending", () => {
+      const { chat, u1, a1 } = seedLinearChat();
+      // Edit of u2: a sibling under a1, whose branch is newer than a2's.
+      const u2b = cm.addMessage(chat.id, "user", "second question, edited", { parentId: a1.id });
+      cm.setActiveLeaf(chat.id, u1.id);
+      expect(cm.resolveTip(chat.id)?.id).toBe(u2b.id);
+    });
+
+    it("resolveTip is undefined for an empty chat", () => {
+      const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
+      expect(cm.resolveTip(chat.id)).toBeUndefined();
+    });
+
+    it("resolveForkPoint finds the nearest anchored assistant ancestor", () => {
+      const { u2, a2 } = seedLinearChat();
+      // Editing a2's follow-up would fork at a2 itself…
+      expect(cm.resolveForkPoint(a2.id)).toEqual({ sessionId: "sess-1", anchorId: "anchor-2" });
+      // …and editing u2 forks at a1 (u2's parent path starts at a1).
+      const editedParent = cm.getMessage(u2.id)?.parentId ?? null;
+      expect(cm.resolveForkPoint(editedParent)).toEqual({
+        sessionId: "sess-1",
+        anchorId: "anchor-1",
+      });
+    });
+
+    it("resolveForkPoint skips assistant rows without snapshots", () => {
+      const { chat, a2 } = seedLinearChat();
+      const u3 = cm.addMessage(chat.id, "user", "third", { parentId: a2.id });
+      // An interrupted turn that never reported its anchor.
+      const a3 = cm.addMessage(chat.id, "assistant", "partial", {
+        parentId: u3.id,
+        sessionId: "sess-1",
+      });
+      expect(cm.resolveForkPoint(a3.id)).toEqual({ sessionId: "sess-1", anchorId: "anchor-2" });
+    });
+
+    it("resolveForkPoint is null at the root and for legacy chains", () => {
+      const { u1 } = seedLinearChat();
+      expect(cm.resolveForkPoint(null)).toBeNull();
+      expect(cm.resolveForkPoint(cm.getMessage(u1.id)?.parentId ?? null)).toBeNull();
+      const legacyChat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
+      const lu = cm.addMessage(legacyChat.id, "user", "old");
+      const la = cm.addMessage(legacyChat.id, "assistant", "old answer", { parentId: lu.id });
+      expect(cm.resolveForkPoint(la.id)).toBeNull();
+    });
+
+    it("a provider swap clears per-message session snapshots (stale fork anchors)", () => {
+      const { chat, a1, a2 } = seedLinearChat();
+      cm.updateModel(chat.id, "gpt-5.4", "openai", "high");
+      // The old provider's session ids would be garbage to the new provider's
+      // fork mechanism, so edits must fall back to a fresh session.
+      expect(cm.getMessage(a1.id)?.sessionId).toBeNull();
+      expect(cm.getMessage(a2.id)?.anchorId).toBeNull();
+      expect(cm.resolveForkPoint(a2.id)).toBeNull();
+    });
+
+    it("a same-provider model swap keeps per-message session snapshots", () => {
+      const { chat, a2 } = seedLinearChat();
+      cm.updateModel(chat.id, "claude-opus-4-8", "anthropic", "high");
+      expect(cm.resolveForkPoint(a2.id)).toEqual({ sessionId: "sess-1", anchorId: "anchor-2" });
+    });
+
+    it("resolveBranchSession returns the branch's nearest recorded session", () => {
+      const { chat, a1, a2 } = seedLinearChat();
+      expect(cm.resolveBranchSession(a2.id)).toBe("sess-1");
+      // A forked branch records its own session on its assistant turn.
+      const u2b = cm.addMessage(chat.id, "user", "edited", { parentId: a1.id });
+      const a2b = cm.addMessage(chat.id, "assistant", "forked answer", {
+        parentId: u2b.id,
+        sessionId: "sess-2",
+        anchorId: "anchor-2b",
+      });
+      expect(cm.resolveBranchSession(a2b.id)).toBe("sess-2");
+      // Before the forked turn lands, the branch still reads the prefix session.
+      expect(cm.resolveBranchSession(u2b.id)).toBe("sess-1");
+    });
+  });
 });

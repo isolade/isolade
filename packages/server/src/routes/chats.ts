@@ -9,9 +9,12 @@ import {
   clampEffortToModel,
   createChatBodySchema,
   createChatMessageBodySchema,
+  editChatMessageBodySchema,
   findChatModel,
+  setActiveLeafBodySchema,
   updateChatBodySchema,
 } from "../contracts";
+import type { ChatMessage } from "../db/schema";
 import type { RouteContext } from "./context";
 
 // ---- Chats: models, CRUD, transcript/events, and the streaming turn ----
@@ -81,6 +84,12 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     chatId: string,
     messageId: string,
     afterSeq: number,
+    // The user message row this turn replies to. Present only on the two
+    // POST paths that just created it (send, edit): the client gets the
+    // server-assigned id and tree position as the stream's first frame, so
+    // it can reconcile its optimistic bubble without a refetch. Resume GETs
+    // omit it (the row is already in the client's hydrated history).
+    userMessage?: ChatMessage,
   ): Promise<Response> {
     return streamSSE(c, async (stream) => {
       let aborted = false;
@@ -101,6 +110,9 @@ export function createChatsRouter(ctx: RouteContext): Hono {
         }
       };
 
+      if (userMessage) {
+        await safeWrite({ event: "user_message", data: JSON.stringify(userMessage) });
+      }
       await safeWrite({ event: "message_id", data: JSON.stringify(messageId) });
 
       type Outboxed =
@@ -173,7 +185,15 @@ export function createChatsRouter(ctx: RouteContext): Hono {
             }
           }
           try {
-            chatManager.addMessageWithId(chatId, messageId, "assistant", recovered);
+            // The dead turn's user message is the active branch's tip (the
+            // leaf advanced onto it at turn start, and the assistant row
+            // never landed to advance it further), so hang the recovered
+            // row there. If the tip is somehow an assistant row, leave the
+            // recovered message parentless rather than fork a bogus branch.
+            const tip = chatManager.resolveTip(chatId);
+            const parentId = tip?.role === "user" ? tip.id : null;
+            chatManager.addMessageWithId(chatId, messageId, "assistant", recovered, { parentId });
+            if (parentId) chatManager.setActiveLeaf(chatId, messageId);
           } catch (e) {
             console.warn(
               `[chat] failed to backfill recovered message (chat=${chatId} msg=${messageId}):`,
@@ -440,13 +460,112 @@ export function createChatsRouter(ctx: RouteContext): Hono {
 
     // Persist the user message and start the assistant turn (titling, prelude
     // injection, usage persistence, abort semantics all live in the service).
-    const assistantMessageId = chatTurnService.start({
+    const { assistantMessageId, userMessage } = chatTurnService.start({
       instance,
       chat,
       content,
     });
 
-    return pumpHub(c, chatId, assistantMessageId, -1);
+    return pumpHub(c, chatId, assistantMessageId, -1, userMessage);
+  });
+
+  // Edit a user message: insert a sibling version under the same parent and
+  // recompute the assistant answer from that point. The provider session is
+  // forked at the nearest anchored turn before the edited message (see
+  // ChatTurnService.start), so the model sees exactly the context that
+  // preceded it, and the original branch stays intact and navigable. The
+  // response is the same SSE turn stream as a normal send.
+  //
+  // Note what this deliberately does NOT rewind: the VM. Files the agent
+  // already changed stay changed on every branch.
+  app.post("/api/instances/:id/chats/:chatId/messages/:messageId/edit", async (c) => {
+    const instanceId = c.req.param("id");
+    const chatId = c.req.param("chatId");
+    const instance = instances.get(instanceId);
+    if (!instance) return c.json({ error: "instance not found" }, 404);
+    if (instance.archived) return archivedError(c);
+    const chat = chatManager.get(chatId);
+    if (!chat) return c.json({ error: "chat not found" }, 404);
+    const edited = chatManager.getMessage(c.req.param("messageId"));
+    if (!edited || edited.chatId !== chatId) return c.json({ error: "message not found" }, 404);
+    if (edited.role !== "user") return c.json({ error: "only user messages can be edited" }, 400);
+    const { content } = editChatMessageBodySchema.parse(await c.req.json());
+
+    // Same readiness gates as a normal send: wait out initialization,
+    // refuse on a failed environment, and never run two turns at once.
+    if (instance.status === "initializing") {
+      await instances.awaitInit(instanceId);
+    }
+    const ready = instances.get(instanceId);
+    if (ready?.status === "error") {
+      return c.json(
+        {
+          error: `environment initialization failed: ${ready.lastError ?? "unknown error"}`,
+        },
+        409,
+      );
+    }
+    if (chatStreamHub.inFlightFor(chatId)) {
+      return c.json({ error: "another turn is in flight for this chat" }, 409);
+    }
+
+    // The fork resumes a session the chat's live CLI process (if any) is not
+    // positioned at, so that process can't serve this turn. Retire it up
+    // front. Its background tasks die with it, exactly as on chat delete.
+    realClaudeBackend.disposeChat(chatId);
+
+    const { assistantMessageId, userMessage } = chatTurnService.start({
+      instance,
+      chat,
+      content,
+      edit: edited,
+    });
+
+    return pumpHub(c, chatId, assistantMessageId, -1, userMessage);
+  });
+
+  // Switch the chat's visible branch (version navigation on an edited
+  // message). `leafId` may be any message on the target branch, and we
+  // descend to the branch's tip. Also re-points the chat's provider-session
+  // column at the branch's session so the next turn (and the /context probe)
+  // continue the right conversation.
+  app.post("/api/instances/:id/chats/:chatId/active-leaf", async (c) => {
+    const instanceId = c.req.param("id");
+    const chatId = c.req.param("chatId");
+    if (!instances.get(instanceId)) return c.json({ error: "instance not found" }, 404);
+    const chat = chatManager.get(chatId);
+    if (!chat) return c.json({ error: "chat not found" }, 404);
+    const { leafId } = setActiveLeafBodySchema.parse(await c.req.json());
+    const target = chatManager.getMessage(leafId);
+    if (!target || target.chatId !== chatId) return c.json({ error: "message not found" }, 404);
+    // A streaming turn belongs to the branch it started on. Re-pointing the
+    // session out from under it would corrupt both branches, so block the
+    // switch until it settles (the client disables navigation while
+    // streaming, this is the server-side guarantee).
+    if (chatStreamHub.inFlightFor(chatId)) {
+      return c.json({ error: "another turn is in flight for this chat" }, 409);
+    }
+
+    const tip = chatManager.descendToTip(chatId, target);
+    chatManager.setActiveLeaf(chatId, tip.id);
+
+    // Re-point the chat's session at the branch's own session. Null when the
+    // branch never recorded one (its turns all failed early): the next send
+    // then starts fresh rather than silently resuming another branch's
+    // session. The live CLI process (if any) is positioned at the OLD
+    // branch's session, so retire it whenever the session actually changes.
+    const branchSession = chatManager.resolveBranchSession(tip.id);
+    if (chat.provider === "anthropic") {
+      if ((chat.claudeSessionId ?? null) !== branchSession) {
+        chatManager.updateSessionId(chatId, branchSession);
+        realClaudeBackend.disposeChat(chatId);
+      }
+    } else if ((chat.codexThreadId ?? null) !== branchSession) {
+      chatManager.updateSessionId(chatId, undefined, branchSession);
+    }
+
+    const updated = chatManager.get(chatId);
+    return c.json(updated ? await enrichChat(updated) : updated);
   });
 
   // Resume an in-flight turn after a network drop, or replay a

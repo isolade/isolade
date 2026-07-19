@@ -209,6 +209,13 @@ export const chats = sqliteTable("chats", {
   // total_cost_usd reported by the CLI. For codex we derive it from the
   // catalog pricing × token totals.
   costUsd: real("cost_usd"),
+  // Tip of the active branch: the id of the chat_messages row the UI's
+  // visible thread currently ends at. Messages form a tree (see
+  // chat_messages.parentId), and editing a message forks a sibling branch.
+  // This column picks which branch the chat shows (and which provider
+  // session the next turn continues). Null on legacy rows, resolved to the
+  // newest message at read time, which reproduces the old linear behavior.
+  activeLeafId: text("active_leaf_id"),
   createdAt: integer("created_at", { mode: "timestamp" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -219,6 +226,26 @@ export const chatMessages = sqliteTable("chat_messages", {
   chatId: text("chat_id").notNull(),
   role: text("role", { enum: ["user", "assistant"] }).notNull(),
   content: text("content").notNull(),
+  // Tree link: the message this one replies to (assistant → its user
+  // message, user → the previous assistant message). Null for a root (the
+  // first message of a chat). Editing a user message inserts a *sibling*
+  // (same parentId), so versions of a message are exactly its parentId
+  // group, ordered by insertion (rowid).
+  parentId: text("parent_id"),
+  // Provider-session snapshot for assistant rows, the ingredients needed to
+  // recompute the conversation from just before any later message:
+  //   - sessionId: the Claude session id / codex thread id this turn ran in.
+  //     Branches diverge into different sessions, so the chat-level column
+  //     only tracks the ACTIVE branch and this records each turn's own.
+  //   - anchorId: where this turn ended inside that session. For Claude the
+  //     transcript uuid of the turn's last assistant message (fed to
+  //     `--resume-session-at`), for codex the turn id (fed to thread/fork's
+  //     lastTurnId).
+  // Null on user rows, on legacy rows that predate the columns, and on
+  // turns that died before the backend reported them. Forking falls back to
+  // the nearest ancestor that has both.
+  sessionId: text("session_id"),
+  anchorId: text("anchor_id"),
   createdAt: integer("created_at", { mode: "timestamp" })
     .notNull()
     .$defaultFn(() => new Date()),

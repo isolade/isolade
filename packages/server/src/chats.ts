@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { and, asc, eq, gt } from "drizzle-orm";
+import { and, asc, desc, eq, gt, sql } from "drizzle-orm";
 import { effectiveInputTokens, pricingFor } from "./chat/subscription-share";
 import type {
   AggregateTotals,
@@ -11,7 +11,17 @@ import type {
 import { localDay, resolveEffort } from "./contracts";
 import type { Db } from "./db";
 import { schema } from "./db";
-import type { Chat as ChatRow } from "./db/schema";
+import type { ChatMessage, Chat as ChatRow } from "./db/schema";
+
+// Optional tree/session metadata for a message insert. `parentId` links the
+// message into the tree (null = chat root). `sessionId`/`anchorId` snapshot
+// the provider session an assistant turn ran in and where it ended, so a
+// later edit can fork the session at that point (see db/schema.ts).
+export interface MessageMeta {
+  parentId?: string | null;
+  sessionId?: string | null;
+  anchorId?: string | null;
+}
 
 // Row shape returned from manager methods. Effort is always non-null at this
 // layer. Legacy rows (effort=null in the DB) resolve to the model's catalog
@@ -66,24 +76,165 @@ export class ChatManager {
     }
   }
 
-  addMessage(chatId: string, role: "user" | "assistant", content: string) {
-    return this.addMessageWithId(chatId, randomUUID(), role, content);
+  addMessage(chatId: string, role: "user" | "assistant", content: string, meta: MessageMeta = {}) {
+    return this.addMessageWithId(chatId, randomUUID(), role, content, meta);
   }
 
   // Insert with an explicit id. The SSE message handler reserves the
   // assistant id at turn start (so chat_events can link to it before the
   // row exists) and then calls this on `done`.
-  addMessageWithId(chatId: string, id: string, role: "user" | "assistant", content: string) {
-    this.db.insert(schema.chatMessages).values({ id, chatId, role, content }).run();
+  addMessageWithId(
+    chatId: string,
+    id: string,
+    role: "user" | "assistant",
+    content: string,
+    meta: MessageMeta = {},
+  ) {
+    this.db
+      .insert(schema.chatMessages)
+      .values({
+        id,
+        chatId,
+        role,
+        content,
+        parentId: meta.parentId ?? null,
+        sessionId: meta.sessionId ?? null,
+        anchorId: meta.anchorId ?? null,
+      })
+      .run();
     return this.db.select().from(schema.chatMessages).where(eq(schema.chatMessages.id, id)).get()!;
   }
 
+  getMessage(id: string): ChatMessage | undefined {
+    return this.db.select().from(schema.chatMessages).where(eq(schema.chatMessages.id, id)).get();
+  }
+
+  // Insertion order (rowid), NOT created_at: the column has second precision,
+  // so a turn's user and assistant rows routinely tie. Sibling versions of an
+  // edited message rely on this order too (version 1, 2, … = insert order).
   getMessages(chatId: string) {
     return this.db
       .select()
       .from(schema.chatMessages)
       .where(eq(schema.chatMessages.chatId, chatId))
+      .orderBy(asc(sql`rowid`))
       .all();
+  }
+
+  // Stamp the provider-session snapshot onto an assistant row after (or
+  // while) its turn runs, so a later edit can fork the session at this turn.
+  setMessageTurnMeta(messageId: string, meta: { sessionId?: string; anchorId?: string }) {
+    const updates: Partial<{ sessionId: string; anchorId: string }> = {};
+    if (meta.sessionId !== undefined) updates.sessionId = meta.sessionId;
+    if (meta.anchorId !== undefined) updates.anchorId = meta.anchorId;
+    if (Object.keys(updates).length === 0) return;
+    this.db
+      .update(schema.chatMessages)
+      .set(updates)
+      .where(eq(schema.chatMessages.id, messageId))
+      .run();
+  }
+
+  setActiveLeaf(chatId: string, messageId: string | null) {
+    this.db
+      .update(schema.chats)
+      .set({ activeLeafId: messageId })
+      .where(eq(schema.chats.id, chatId))
+      .run();
+  }
+
+  // The tip of the chat's active branch: where the next (non-edit) turn
+  // attaches. Starts from activeLeafId (falling back to the newest message,
+  // which is what legacy pre-tree rows mean) and descends to the branch's
+  // end by newest child, so a stale leaf (e.g. a crash before the leaf
+  // advanced past a finished assistant turn) still lands on the real tip.
+  // Undefined only for an empty chat.
+  resolveTip(chatId: string): ChatMessage | undefined {
+    const chat = this.get(chatId);
+    if (!chat) return undefined;
+    let current = (chat.activeLeafId ? this.getMessage(chat.activeLeafId) : undefined) ?? undefined;
+    if (current && current.chatId !== chatId) current = undefined;
+    if (!current) {
+      current = this.db
+        .select()
+        .from(schema.chatMessages)
+        .where(eq(schema.chatMessages.chatId, chatId))
+        .orderBy(desc(sql`rowid`))
+        .limit(1)
+        .get();
+    }
+    if (!current) return undefined;
+    return this.descendToTip(chatId, current);
+  }
+
+  // Follow newest-child links from `from` down to the end of its branch.
+  // Selecting a message version means "show the newest continuation under
+  // it", and this resolves that continuation. Returns `from` itself when it
+  // has no children.
+  descendToTip(chatId: string, from: ChatMessage): ChatMessage {
+    let current = from;
+    // Bounded like walkToRoot, so a corrupt cycle can't hang the server.
+    for (let i = 0; i < 100_000; i++) {
+      const child = this.newestChild(chatId, current.id);
+      if (!child) return current;
+      current = child;
+    }
+    return current;
+  }
+
+  // The provider-session fork point for a turn that replies to `parentId`:
+  // the nearest message on the path from `parentId` (inclusive) to the root
+  // that has both a session snapshot and an anchor. Null means "no usable
+  // snapshot" (chat root, or legacy rows that predate the columns), and the
+  // caller starts a fresh provider session instead.
+  resolveForkPoint(parentId: string | null): { sessionId: string; anchorId: string } | null {
+    for (const msg of this.walkToRoot(parentId)) {
+      if (msg.role === "assistant" && msg.sessionId && msg.anchorId) {
+        return { sessionId: msg.sessionId, anchorId: msg.anchorId };
+      }
+    }
+    return null;
+  }
+
+  // The provider session the branch ending at `leafId` runs in: the nearest
+  // assistant message on the root path that recorded one. Null for branches
+  // with no session snapshot (legacy rows, turns that died early). Used to
+  // re-point the chat's session columns when the user switches branches.
+  resolveBranchSession(leafId: string | null): string | null {
+    for (const msg of this.walkToRoot(leafId)) {
+      if (msg.role === "assistant" && msg.sessionId) return msg.sessionId;
+    }
+    return null;
+  }
+
+  // The path from `fromId` up to the chat's root, starting at `fromId`
+  // itself. Yields nothing for null/unknown ids.
+  pathToRoot(fromId: string | null): Generator<ChatMessage> {
+    return this.walkToRoot(fromId);
+  }
+
+  private *walkToRoot(fromId: string | null): Generator<ChatMessage> {
+    // Bounded so a corrupt parent cycle can't hang the server. Any real path
+    // is far shorter.
+    let currentId = fromId;
+    for (let i = 0; currentId && i < 100_000; i++) {
+      const msg = this.getMessage(currentId);
+      if (!msg) return;
+      yield msg;
+      currentId = msg.parentId;
+    }
+  }
+
+  private newestChild(chatId: string, parentId: string): ChatMessage | undefined {
+    return this.db
+      .select()
+      .from(schema.chatMessages)
+      .where(
+        and(eq(schema.chatMessages.chatId, chatId), eq(schema.chatMessages.parentId, parentId)),
+      )
+      .orderBy(desc(sql`rowid`))
+      .limit(1)
+      .get();
   }
 
   // Append a structured SSE event. Callers supply the per-message seq (a
@@ -136,8 +287,10 @@ export class ChatManager {
       .all();
   }
 
-  updateSessionId(chatId: string, claudeSessionId?: string, codexThreadId?: string) {
-    const updates: Partial<{ claudeSessionId: string; codexThreadId: string }> = {};
+  // `null` clears a session id (the active branch has no known session yet,
+  // e.g. an edit just started forking), `undefined` leaves it untouched.
+  updateSessionId(chatId: string, claudeSessionId?: string | null, codexThreadId?: string | null) {
+    const updates: Partial<{ claudeSessionId: string | null; codexThreadId: string | null }> = {};
     if (claudeSessionId !== undefined) updates.claudeSessionId = claudeSessionId;
     if (codexThreadId !== undefined) updates.codexThreadId = codexThreadId;
     if (Object.keys(updates).length === 0) return;
@@ -161,6 +314,16 @@ export class ChatManager {
     if (chat.provider !== provider) {
       updates.claudeSessionId = null;
       updates.codexThreadId = null;
+      // The per-message session snapshots (fork anchors for message editing)
+      // are the old provider's too. Left in place, a later edit would hand
+      // e.g. a Claude session id to codex's thread/fork. Clear them so edits
+      // recompute with a fresh session, consistent with the context already
+      // being lost by the swap.
+      this.db
+        .update(schema.chatMessages)
+        .set({ sessionId: null, anchorId: null })
+        .where(eq(schema.chatMessages.chatId, chatId))
+        .run();
     }
     // A model swap changes context capacity and compaction semantics, even
     // when the provider can apply it to the existing live process.

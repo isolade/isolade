@@ -8,6 +8,11 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Added
 
+- Chat messages can now be edited. Hover a message, hit the pencil, and the
+  assistant recomputes its answer from that point with exactly the context
+  that preceded the message (the underlying Claude session or Codex thread is
+  forked, not replayed). Every version stays around: a `‹ 1/2 ›` pager under
+  edited messages switches between the branches.
 - Claude chats now switch model and effort without restarting their live agent
   process, preserving background work. Context breakdowns also query that live
   process directly instead of launching a second Claude instance.

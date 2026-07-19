@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Chat, ChatManager } from "../chats";
 import type { UsageStats } from "../contracts";
+import type { ChatMessage } from "../db/schema";
 import type { DiffStatsPoller } from "../diff-stats";
 import type { InstanceManager } from "../instances";
 import type { ProfileManager } from "../profiles";
@@ -38,10 +39,21 @@ export class ChatTurnService {
   constructor(private readonly deps: ChatTurnDeps) {}
 
   // Persist the user message and kick off the assistant turn on the stream hub.
-  // Returns the reserved assistant messageId so the caller can pump the SSE
-  // response for it. The producer runs asynchronously on the hub, and this returns
-  // as soon as the turn is registered.
-  start(opts: { instance: InstanceRecord; chat: Chat; content: string }): string {
+  // Returns the reserved assistant messageId (so the caller can pump the SSE
+  // response for it) and the persisted user message row (so the client learns
+  // its id and tree position). The producer runs asynchronously on the hub, and
+  // this returns as soon as the turn is registered.
+  //
+  // `edit` recomputes the conversation from an earlier point: instead of
+  // appending to the active branch's tip, the new user message is inserted as
+  // a *sibling* of the edited message (same parent), and the provider session
+  // is forked at the nearest anchored turn before it, so the model answers
+  // with exactly the context that preceded the edited message. The original
+  // branch (messages and session) stays intact and navigable.
+  start(opts: { instance: InstanceRecord; chat: Chat; content: string; edit?: ChatMessage }): {
+    assistantMessageId: string;
+    userMessage: ChatMessage;
+  } {
     const {
       chatManager,
       instances,
@@ -53,11 +65,57 @@ export class ChatTurnService {
       codexBackend,
       profileUsageStats,
     } = this.deps;
-    const { instance, chat, content } = opts;
+    const { instance, chat, content, edit } = opts;
     const instanceId = instance.id;
     const chatId = chat.id;
 
-    chatManager.addMessage(chatId, "user", content);
+    // Where this turn attaches and which provider session it runs in.
+    // Normal send: the active branch's tip, resuming the chat's current
+    // session. Edit: the edited message's parent, forking (or freshly
+    // starting) the session as of that point.
+    let parentId: string | null;
+    let sessionId: string | undefined;
+    let fork: { anchorId: string } | undefined;
+    if (edit) {
+      // Legacy turns predate per-message session snapshots, but the chat
+      // column knows the ACTIVE branch's session. Stamp it onto the branch's
+      // nearest un-snapshotted assistant tip now, before the fork overwrites
+      // the column, so switching back to this branch later can still resume
+      // its session.
+      const currentSession =
+        chat.provider === "anthropic" ? chat.claudeSessionId : chat.codexThreadId;
+      const tip = chatManager.resolveTip(chatId);
+      if (currentSession && tip) {
+        for (const msg of chatManager.pathToRoot(tip.id)) {
+          if (msg.role !== "assistant") continue;
+          if (!msg.sessionId) chatManager.setMessageTurnMeta(msg.id, { sessionId: currentSession });
+          break;
+        }
+      }
+
+      parentId = edit.parentId;
+      const forkPoint = chatManager.resolveForkPoint(parentId);
+      if (forkPoint) {
+        sessionId = forkPoint.sessionId;
+        fork = { anchorId: forkPoint.anchorId };
+      }
+      // The new branch's session doesn't exist until the backend forks (or
+      // freshly starts) one. Clear the column so a failed fork can't leave
+      // the next turn resuming the OLD branch's session against this
+      // branch's messages. The backend re-fills it as soon as the new
+      // session is established.
+      if (chat.provider === "anthropic") chatManager.updateSessionId(chatId, null);
+      else chatManager.updateSessionId(chatId, undefined, null);
+    } else {
+      parentId = chatManager.resolveTip(chatId)?.id ?? null;
+      sessionId =
+        chat.provider === "anthropic"
+          ? (chat.claudeSessionId ?? undefined)
+          : (chat.codexThreadId ?? undefined);
+    }
+
+    const userMessage = chatManager.addMessage(chatId, "user", content, { parentId });
+    chatManager.setActiveLeaf(chatId, userMessage.id);
     instances.touch(instanceId);
 
     // Reserve the assistant message id up front so every chat_events
@@ -112,17 +170,20 @@ export class ChatTurnService {
         }
 
         let assistantContent = "";
+        // Provider-session snapshot for this turn, reported by the backend
+        // as facts become known and stamped onto the assistant row on both
+        // the success and abort paths, so even an interrupted turn stays
+        // forkable later.
+        const turnMeta: { sessionId?: string; anchorId?: string } = {};
         try {
-          const sessionId =
-            chat.provider === "anthropic"
-              ? (chat.claudeSessionId ?? undefined)
-              : (chat.codexThreadId ?? undefined);
           // Environment-level prelude: prepended to the first user
           // message of a new chat (no provider session yet) and sent
           // to the backend only. The DB still holds the user's
           // original `content`, so the prelude is invisible in the
           // UI's message list. Wrapped in <prelude> tags so the model
-          // can tell it apart from the user's own text.
+          // can tell it apart from the user's own text. (An edit of the
+          // first message also lands here: its recomputed session is just
+          // as fresh, so it needs the prelude again.)
           const prelude =
             sessionId || !instance.profileId ? null : profiles.getPrelude(instance.profileId);
           const outgoingMessage = prelude
@@ -135,10 +196,15 @@ export class ChatTurnService {
             model: chat.model,
             effort: chat.effort,
             sessionId,
+            fork,
             signal: api.signal,
             onDelta: (text) => {
               assistantContent += text;
               api.publish("delta", text);
+            },
+            onMeta: (meta) => {
+              if (meta.sessionId !== undefined) turnMeta.sessionId = meta.sessionId;
+              if (meta.anchorId !== undefined) turnMeta.anchorId = meta.anchorId;
             },
             onEvent: async (event) => {
               // Persist the full usage snapshot onto the chat row so
@@ -171,7 +237,12 @@ export class ChatTurnService {
             },
           });
           assistantContent = result.content || assistantContent;
-          chatManager.addMessageWithId(chatId, assistantMessageId, "assistant", assistantContent);
+          chatManager.addMessageWithId(chatId, assistantMessageId, "assistant", assistantContent, {
+            parentId: userMessage.id,
+            sessionId: turnMeta.sessionId ?? result.sessionId ?? null,
+            anchorId: turnMeta.anchorId ?? null,
+          });
+          chatManager.setActiveLeaf(chatId, assistantMessageId);
           // Turn finished: float the instance up and flag it unread. The client
           // clears the flag immediately if the user is viewing this instance, so
           // it only sticks for turns that complete in the background.
@@ -195,7 +266,13 @@ export class ChatTurnService {
                   assistantMessageId,
                   "assistant",
                   assistantContent,
+                  {
+                    parentId: userMessage.id,
+                    sessionId: turnMeta.sessionId ?? null,
+                    anchorId: turnMeta.anchorId ?? null,
+                  },
                 );
+                chatManager.setActiveLeaf(chatId, assistantMessageId);
               } catch (e) {
                 console.warn("[chat] failed to persist aborted assistant message", e);
               }
@@ -208,6 +285,6 @@ export class ChatTurnService {
       },
     });
 
-    return assistantMessageId;
+    return { assistantMessageId, userMessage };
   }
 }

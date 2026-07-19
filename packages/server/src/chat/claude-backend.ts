@@ -2,7 +2,13 @@ import type { ChatManager } from "../chats";
 import { type ChatEffort, type ContextBreakdown, findChatModel } from "../contracts";
 import { KeyedQueue } from "../keyed-queue";
 import type { SandboxApi } from "../sandbox-client";
-import { type ChatBackend, type ChatEvent, emptyUsage, type TokenUsage } from "./backend";
+import {
+  type ChatBackend,
+  type ChatEvent,
+  emptyUsage,
+  type TokenUsage,
+  type TurnMeta,
+} from "./backend";
 import { ClaudeSession, type TurnHooks } from "./claude-session";
 import {
   buildTitleCommand,
@@ -137,17 +143,27 @@ export class ClaudeBackend implements ChatBackend {
     model: string;
     effort: ChatEffort;
     sessionId?: string;
+    fork?: { anchorId: string }; // anchorId = transcript uuid to resume at
     signal?: AbortSignal;
     onDelta: (text: string) => void;
     onEvent?: (event: ChatEvent) => void;
+    onMeta?: (meta: TurnMeta) => void;
   }): Promise<{ content: string; sessionId?: string }> {
     // Claude CLI accepts: low | medium | high | xhigh | max. Other values
     // from the union (none/minimal, which are codex-only) are dropped. The model
     // falls back to its own default.
     const claudeEffort = CLAUDE_EFFORTS.has(opts.effort) ? opts.effort : undefined;
+    // Forking only means anything against a resumable session. (The turn
+    // service never sends one without the other, so this is just a guard.)
+    const fork = opts.sessionId ? opts.fork : undefined;
 
     let session = this.sessions.get(opts.chatId);
-    if (session && (session.isDead() || session.vmId !== opts.vmId)) {
+    if (session && (fork !== undefined || session.isDead() || session.vmId !== opts.vmId)) {
+      // A dead or wrong-VM session can't be reused. A fork turn also always
+      // retires the live process: there is no control request to rewind a
+      // live conversation, so it's positioned at the old branch's tail, and
+      // the resume-at/fork flags only exist at launch. (Model/effort changes,
+      // by contrast, apply to the live process via reconfigure below.)
       this.sessions.delete(opts.chatId);
       this.clearIdle(opts.chatId);
       if (!session.isDead()) void session.shutdown();
@@ -184,6 +200,7 @@ export class ClaudeBackend implements ChatBackend {
         opts.model,
         claudeEffort,
         opts.sessionId,
+        fork,
       );
       this.sessions.set(opts.chatId, created);
       session = created;
@@ -218,6 +235,7 @@ export class ClaudeBackend implements ChatBackend {
     model: string,
     effort: string | undefined,
     resumeSessionId: string | undefined,
+    fork?: { anchorId: string },
   ): string {
     const args = [
       "claude",
@@ -284,6 +302,15 @@ export class ClaudeBackend implements ChatBackend {
     if (resumeSessionId) {
       args.push("--resume", resumeSessionId);
     }
+    if (resumeSessionId && fork) {
+      // Recompute from an earlier point (an edited message): resume the
+      // session only up to and including the anchored assistant message,
+      // and fork that prefix into a NEW session id instead of appending.
+      // The source session's file stays intact, which is what keeps the
+      // original branch continuable. The CLI reports the forked id in its
+      // `system/init` event, and the turn hooks below pick it up from there.
+      args.push("--resume-session-at", fork.anchorId, "--fork-session");
+    }
     return args.join(" ");
   }
 
@@ -293,11 +320,12 @@ export class ClaudeBackend implements ChatBackend {
     model: string,
     effort: string | undefined,
     sessionId: string | undefined,
+    fork?: { anchorId: string },
   ): ClaudeSession {
     const created = new ClaudeSession({
       sandboxClient: this.sandboxClient,
       vmId,
-      command: this.buildCommand(model, effort, sessionId),
+      command: this.buildCommand(model, effort, sessionId, fork),
       model,
       effort,
       onExit: () => {
@@ -342,6 +370,7 @@ export class ClaudeBackend implements ChatBackend {
     model: string;
     onDelta: (text: string) => void;
     onEvent?: (event: ChatEvent) => void;
+    onMeta?: (meta: TurnMeta) => void;
   }): TurnHooks {
     let fullContent = "";
     // Per-turn state for assembling streaming content blocks. Anthropic
@@ -468,6 +497,10 @@ export class ClaudeBackend implements ChatBackend {
 
       if (event.type === "system" && event.subtype === "init" && event.session_id) {
         this.chatManager.updateSessionId(opts.chatId, event.session_id);
+        // Session-level fact for the turn's message row: on a fork this is
+        // the freshly minted session id, and reporting it here (not just on
+        // success) keeps even interrupted turns forkable later.
+        opts.onMeta?.({ sessionId: event.session_id });
         handled = true;
       }
 
@@ -605,9 +638,16 @@ export class ClaudeBackend implements ChatBackend {
       }
 
       // Top-level `assistant` events echo the final assembled message.
-      // We already streamed it via deltas. Drop them rather than
-      // surface as raw.
+      // We already streamed it via deltas, so they produce no UI event. But
+      // their transcript `uuid` is this turn's fork anchor: the LAST
+      // assistant message's uuid is exactly what `--resume-session-at`
+      // needs to replay the session "through this turn". Later events
+      // overwrite earlier ones (a turn with tool use echoes one assistant
+      // message per roundtrip), so what sticks is the turn's end.
       if (event.type === "assistant") {
+        if (typeof event.uuid === "string" && event.uuid.length > 0) {
+          opts.onMeta?.({ anchorId: event.uuid });
+        }
         handled = true;
       }
 

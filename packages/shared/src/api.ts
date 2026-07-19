@@ -144,6 +144,20 @@ export const createChatMessageBodySchema = z.object({
   content: z.string().min(1),
 });
 
+// Edit a user message: inserts a sibling version and recomputes the assistant
+// answer from that point (the response is the same SSE turn stream as a
+// normal send). The original branch stays navigable.
+export const editChatMessageBodySchema = z.object({
+  content: z.string().min(1),
+});
+
+// Switch the chat's visible branch. `leafId` may be any message on the target
+// branch (typically a version of an edited message), and the server descends
+// to that branch's tip and re-points the provider session accordingly.
+export const setActiveLeafBodySchema = z.object({
+  leafId: z.string().min(1),
+});
+
 export const setProfileSecretBodySchema = z.object({
   value: z.string().min(1),
 });
@@ -447,6 +461,8 @@ export type PrRefBody = z.infer<typeof prRefBodySchema>;
 export type CreateChatBody = z.infer<typeof createChatBodySchema>;
 export type UpdateChatBody = z.infer<typeof updateChatBodySchema>;
 export type CreateChatMessageBody = z.infer<typeof createChatMessageBodySchema>;
+export type EditChatMessageBody = z.infer<typeof editChatMessageBodySchema>;
+export type SetActiveLeafBody = z.infer<typeof setActiveLeafBodySchema>;
 export type SetProfileSecretBody = z.infer<typeof setProfileSecretBodySchema>;
 export type ErrorResponse = z.infer<typeof errorResponseSchema>;
 export type OkResponse = z.infer<typeof okResponseSchema>;
