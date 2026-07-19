@@ -1,12 +1,16 @@
 import { parseSse, type SseEvent } from "@isolade/shared";
 import { apiFetch } from "./api";
-import { errorResponseSchema } from "./contracts";
+import { type ChatMessage, chatMessageSchema, errorResponseSchema } from "./contracts";
 
 // Logical events the chat client cares about, decoded from the raw SSE
 // frames. `done`/`error` are terminal. Once one fires, the caller's
-// onEvent will not be called again.
+// onEvent will not be called again. `user_message` is the persisted user
+// message row this turn replies to, sent as the first frame of the two POST
+// paths (send, edit) so the caller can reconcile its optimistic bubble with
+// the server-assigned id and tree position.
 export type ChatTurnEvent =
   | { kind: "message_id"; messageId: string }
+  | { kind: "user_message"; message: ChatMessage }
   | { kind: "event"; type: string; payload: unknown; seq: number }
   | { kind: "done" }
   | { kind: "error"; message: string };
@@ -16,6 +20,10 @@ export interface RunChatTurnOptions {
   instanceId: string;
   chatId: string;
   content: string;
+  // When set, the turn is an *edit* of this user message: the server inserts
+  // the content as a sibling version and recomputes the answer from that
+  // point (same SSE stream shape as a normal send).
+  editMessageId?: string;
   // Caller-visible hook fired once per logical event. `seq` is the
   // server-assigned monotonic number. The caller should ignore events
   // with seq <= the last applied one (the reconnect path passes
@@ -108,6 +116,10 @@ async function streamFromResponse(
       onEvent(decoded);
       continue;
     }
+    if (decoded.kind === "user_message") {
+      onEvent(decoded);
+      continue;
+    }
     if (decoded.kind === "event") {
       if (decoded.seq > lastSeq) lastSeq = decoded.seq;
       onEvent(decoded);
@@ -141,6 +153,17 @@ function decodeSseEvent(ev: SseEvent): ChatTurnEvent | null {
       messageId = ev.data;
     }
     return { kind: "message_id", messageId };
+  }
+  if (ev.event === "user_message") {
+    // The persisted user-message row. Parse defensively: a malformed frame
+    // (version skew) just means the caller keeps its optimistic bubble, and
+    // the next hydration reconciles ids anyway.
+    try {
+      return { kind: "user_message", message: chatMessageSchema.parse(JSON.parse(ev.data)) };
+    } catch (err) {
+      console.warn("[chat] unparseable user_message frame, ignoring:", err);
+      return null;
+    }
   }
   if (ev.event === "done") return { kind: "done" };
   if (ev.event === "error") return { kind: "error", message: ev.data };
@@ -180,15 +203,14 @@ export async function runChatTurn(opts: RunChatTurnOptions): Promise<void> {
   // surface fatal early errors (chat doesn't exist, etc) by throwing,
   // since those aren't recoverable so we don't waste retries.
   const post = async (): Promise<Response> => {
-    const resp = await apiFetch(
-      `${opts.apiBase}/api/instances/${opts.instanceId}/chats/${opts.chatId}/messages`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: opts.content }),
-        signal: opts.signal,
-      },
-    );
+    const base = `${opts.apiBase}/api/instances/${opts.instanceId}/chats/${opts.chatId}/messages`;
+    const url = opts.editMessageId ? `${base}/${opts.editMessageId}/edit` : base;
+    const resp = await apiFetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: opts.content }),
+      signal: opts.signal,
+    });
     if (!resp.ok) {
       const msg = await extractErrorMessage(resp);
       throw new Error(msg);

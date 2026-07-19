@@ -17,6 +17,9 @@ class FakeCodexConn {
   // When set, `thread/resume` rejects with this error, mimicking codex refusing
   // to reload a thread (e.g. a missing rollout after a home reset).
   resumeError: Error | null = null;
+  // When set, `thread/fork` rejects with this error (e.g. an old app-server
+  // without the method, or a missing rollout).
+  forkError: Error | null = null;
   // When set, `turn/start` records the request but withholds its response until
   // this resolves, letting a test abort while the turn id is still pending.
   turnStartGate: Promise<void> | null = null;
@@ -44,6 +47,10 @@ class FakeCodexConn {
     if (method === "thread/resume") {
       if (this.resumeError) throw this.resumeError;
       return { thread: { id: (params as { threadId: string }).threadId } };
+    }
+    if (method === "thread/fork") {
+      if (this.forkError) throw this.forkError;
+      return { thread: { id: "thread-forked" } };
     }
     if (method === "turn/start") {
       // Hold the response when a test wants to abort before the turn id lands.
@@ -491,5 +498,86 @@ describe("CodexBackend notification parsing", () => {
       method: "turn/interrupt",
       params: { threadId: "thread-1", turnId: "turn-1" },
     });
+  });
+
+  it("reports thread and turn ids through onMeta", async () => {
+    const { backend } = backendWith([["turn/completed", { turn: { status: "completed" } }]]);
+    const metas: Array<{ sessionId?: string; anchorId?: string }> = [];
+    await backend.sendMessage({
+      vmId: "vm",
+      chatId: "chat",
+      message: "hi",
+      model: "gpt-5-codex",
+      effort: "medium",
+      sessionId: "thread-1",
+      onDelta: () => {},
+      onMeta: (m) => metas.push(m),
+    });
+    expect(metas).toContainEqual({ sessionId: "thread-1" });
+    expect(metas).toContainEqual({ anchorId: "turn-1" });
+  });
+
+  it("forks the thread at the anchor turn and runs the turn on the fork", async () => {
+    const mgr = new FakeCodexManager();
+    mgr.conn.script = [["turn/completed", { turn: { status: "completed" } }]];
+    const updated: Array<{ chatId: string; codexThreadId?: string }> = [];
+    const chatManager = {
+      updateSessionId: (chatId: string, _claudeSessionId?: string, codexThreadId?: string) => {
+        updated.push({ chatId, codexThreadId });
+      },
+    } as unknown as ChatManager;
+    const backend = new CodexBackend(
+      {} as unknown as SandboxClient,
+      chatManager,
+      mgr as unknown as CodexManager,
+    );
+
+    const metas: Array<{ sessionId?: string; anchorId?: string }> = [];
+    await backend.sendMessage({
+      vmId: "vm",
+      chatId: "chat-1",
+      message: "edited question",
+      model: "gpt-5-codex",
+      effort: "medium",
+      sessionId: "thread-1",
+      fork: { anchorId: "turn-7" },
+      onDelta: () => {},
+      onMeta: (m) => metas.push(m),
+    });
+
+    expect(mgr.conn.sent).toContainEqual({
+      method: "thread/fork",
+      params: { threadId: "thread-1", lastTurnId: "turn-7", ephemeral: false },
+    });
+    // No resume of the source thread: thread/fork loads the rollout itself.
+    expect(mgr.conn.sent.some((s) => s.method === "thread/resume")).toBe(false);
+    const turnStart = mgr.conn.sent.find((s) => s.method === "turn/start");
+    expect((turnStart!.params as { threadId: string }).threadId).toBe("thread-forked");
+    // The chat's session column follows the forked thread immediately.
+    expect(updated).toContainEqual({ chatId: "chat-1", codexThreadId: "thread-forked" });
+    expect(metas).toContainEqual({ sessionId: "thread-forked" });
+  });
+
+  it("propagates a failed fork instead of degrading to a fresh thread", async () => {
+    const mgr = new FakeCodexManager();
+    mgr.conn.forkError = new Error("no rollout found for thread id thread-1");
+    const backend = new CodexBackend(
+      {} as unknown as SandboxClient,
+      noopChatManager,
+      mgr as unknown as CodexManager,
+    );
+    await expect(
+      backend.sendMessage({
+        vmId: "vm",
+        chatId: "chat-1",
+        message: "edited question",
+        model: "gpt-5-codex",
+        effort: "medium",
+        sessionId: "thread-1",
+        fork: { anchorId: "turn-7" },
+        onDelta: () => {},
+      }),
+    ).rejects.toThrow("no rollout found");
+    expect(mgr.conn.sent.some((s) => s.method === "thread/start")).toBe(false);
   });
 });

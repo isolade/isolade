@@ -7,7 +7,7 @@ import {
 } from "../contracts";
 import { KeyedQueue } from "../keyed-queue";
 import type { SandboxApi } from "../sandbox-client";
-import type { ChatBackend, ChatEvent, TokenUsage } from "./backend";
+import type { ChatBackend, ChatEvent, TokenUsage, TurnMeta } from "./backend";
 import { type CodexConnection, CodexManager } from "./codex-manager";
 import { buildTitlePrompt, CODEX_TITLE_MODEL, cleanTitle } from "./title-generator";
 
@@ -84,6 +84,30 @@ export class CodexBackend implements ChatBackend {
     return threadId;
   }
 
+  // Fork `threadId` through `lastTurnId` (inclusive): codex copies the thread
+  // up to that turn into a NEW thread and returns its id. This is how an
+  // edited message recomputes from an earlier point: the fork carries exactly
+  // the context that preceded the edited message, and the source thread stays
+  // intact so its branch remains continuable. The source thread only needs to
+  // exist on disk (thread/fork loads the rollout itself), no resume required.
+  private async forkThread(
+    conn: CodexConnection,
+    chatId: string,
+    threadId: string,
+    lastTurnId: string,
+  ): Promise<string> {
+    const result = (await conn.send("thread/fork", {
+      threadId,
+      lastTurnId,
+      ephemeral: false,
+    })) as { thread: { id: string } };
+    const forkedId = result.thread.id;
+    // The fork is live in this app-server's memory, same as a fresh start.
+    this.livenessMap(conn).set(forkedId, Promise.resolve());
+    this.chatManager.updateSessionId(chatId, undefined, forkedId);
+    return forkedId;
+  }
+
   // Ensure the app-server behind `conn` has `threadId` loaded in memory. A
   // thread started by a previous app-server process (e.g. before a VM restart)
   // survives only as a persisted rollout on disk. codex needs an explicit
@@ -122,25 +146,37 @@ export class CodexBackend implements ChatBackend {
     model: string;
     effort: ChatEffort;
     sessionId?: string; // codexThreadId
+    fork?: { anchorId: string }; // anchorId = the turn id to fork through
     signal?: AbortSignal;
     onDelta: (text: string) => void;
     onEvent?: (event: ChatEvent) => void;
+    onMeta?: (meta: TurnMeta) => void;
   }): Promise<{ content: string; sessionId?: string }> {
     const conn = await this.manager.getOrCreate(opts.vmId);
 
     // Resolve the codex thread this turn runs against. A brand-new chat starts
     // a fresh persistent thread. An existing chat resumes its thread onto this
     // connection so a turn after a VM restart (which spawns a fresh app-server)
-    // doesn't fail with "thread not found". See resolveThread. Route failures
-    // here through the same auth refresh as turn failures, since a token that
-    // went stale across the restart may just need a refresh.
+    // doesn't fail with "thread not found". See resolveThread. An edit forks
+    // the source thread at the anchored turn instead, and unlike a missing
+    // rollout on resume, a failed fork propagates rather than degrading to a
+    // fresh thread: silently answering an edit without its context would be
+    // worse than surfacing the error. Route failures here through the same
+    // auth refresh as turn failures, since a token that went stale across
+    // the restart may just need a refresh.
     let threadId: string;
     try {
-      threadId = await this.resolveThread(conn, opts.chatId, opts.sessionId);
+      threadId =
+        opts.fork && opts.sessionId
+          ? await this.forkThread(conn, opts.chatId, opts.sessionId, opts.fork.anchorId)
+          : await this.resolveThread(conn, opts.chatId, opts.sessionId);
     } catch (err) {
       await this.refreshAuthAfterPossibleStaleState(opts.vmId, err);
       throw err;
     }
+    // The thread is a session-level fact: report it now so even a turn that
+    // dies mid-stream records which thread its partial answer lives in.
+    opts.onMeta?.({ sessionId: threadId });
 
     // Register notification handlers before sending the turn so we don't miss early events
     let fullContent = "";
@@ -422,6 +458,8 @@ export class CodexBackend implements ChatBackend {
         model: opts.model,
         input: [{ type: "text", text: opts.message }],
         summary: "detailed",
+        // (The turn id this resolves to is reported through onMeta below: it
+        // is the anchor a future edit forks this thread at.)
         // Pin the standard ("default") service tier per turn rather than via
         // a launch-time `-c service_tier=...` flag. `serviceTier` is a
         // first-class turn param (it sits next to `effort` in the v2
@@ -436,6 +474,16 @@ export class CodexBackend implements ChatBackend {
         cleanup();
         reject(err);
       });
+      // Report the turn id as this turn's fork anchor. On a separate consumer
+      // (rejections are owned by the .catch above) so meta reporting can't
+      // interfere with turn-failure handling.
+      void turnStartPromise.then(
+        (res) => {
+          const turnId = res?.turn?.id;
+          if (turnId) opts.onMeta?.({ anchorId: turnId });
+        },
+        () => {},
+      );
     }).catch(async (err) => {
       await this.refreshAuthAfterPossibleStaleState(opts.vmId, err);
       throw err;

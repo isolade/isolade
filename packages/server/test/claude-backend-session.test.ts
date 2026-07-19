@@ -212,6 +212,89 @@ describe("ClaudeBackend session lifecycle", () => {
     proc(procs, 1).exit(0);
     await tick();
   });
+
+  it("reports the session id and assistant-message anchors through onMeta", async () => {
+    const { client, procs } = liveClient();
+    const backend = new ClaudeBackend(client, fakeChatManager(), {
+      idleMs: 60_000,
+    });
+
+    const metas: Array<{ sessionId?: string; anchorId?: string }> = [];
+    const p1 = backend.sendMessage({
+      ...baseTurn,
+      message: "hi",
+      model: "claude-sonnet-4-6",
+      onMeta: (m) => metas.push(m),
+    });
+    proc(procs, 0).emit({ type: "system", subtype: "init", session_id: "s" });
+    // One assistant echo per tool roundtrip: the LAST uuid is the turn's
+    // anchor (the turn service keeps the latest).
+    proc(procs, 0).emit({ type: "assistant", uuid: "uuid-mid", message: {} });
+    proc(procs, 0).emit({ type: "assistant", uuid: "uuid-final", message: {} });
+    proc(procs, 0).emit({ type: "result", result: "done" });
+    await p1;
+
+    expect(metas).toContainEqual({ sessionId: "s" });
+    expect(metas.filter((m) => m.anchorId).map((m) => m.anchorId)).toEqual([
+      "uuid-mid",
+      "uuid-final",
+    ]);
+    proc(procs, 0).exit(0);
+    await tick();
+  });
+
+  it("fork turns retire the live process and launch with resume-at + fork flags", async () => {
+    const { client, procs } = liveClient();
+    const backend = new ClaudeBackend(client, fakeChatManager(), {
+      idleMs: 60_000,
+    });
+
+    // Establish a warm process on session s1.
+    const p1 = backend.sendMessage({
+      ...baseTurn,
+      message: "hi",
+      model: "claude-sonnet-4-6",
+    });
+    proc(procs, 0).emit({ type: "system", subtype: "init", session_id: "s1" });
+    proc(procs, 0).emit({ type: "result", result: "one" });
+    await p1;
+
+    // An edit turn: fork s1 at an anchored assistant message. The warm
+    // process is positioned at s1's tail, so it must NOT be reused.
+    const metas: Array<{ sessionId?: string; anchorId?: string }> = [];
+    const p2 = backend.sendMessage({
+      ...baseTurn,
+      message: "edited",
+      model: "claude-sonnet-4-6",
+      sessionId: "s1",
+      fork: { anchorId: "uuid-anchor" },
+      onMeta: (m) => metas.push(m),
+    });
+    expect(procs.length).toBe(2);
+    expect(proc(procs, 1).command).toContain("--resume s1");
+    expect(proc(procs, 1).command).toContain("--resume-session-at uuid-anchor");
+    expect(proc(procs, 1).command).toContain("--fork-session");
+    // The CLI mints a new session id for the fork and reports it on init.
+    proc(procs, 1).emit({ type: "system", subtype: "init", session_id: "s2" });
+    proc(procs, 1).emit({ type: "result", result: "forked answer" });
+    const result = await p2;
+    expect(result.sessionId).toBe("s2");
+    expect(metas).toContainEqual({ sessionId: "s2" });
+
+    // A follow-up on the same chat reuses the forked process, no fork flags.
+    const p3 = backend.sendMessage({
+      ...baseTurn,
+      message: "continue",
+      model: "claude-sonnet-4-6",
+      sessionId: "s2",
+    });
+    proc(procs, 1).emit({ type: "result", result: "three" });
+    expect((await p3).content).toBe("three");
+    expect(procs.length).toBe(2);
+
+    for (const p of procs) p.exit(0);
+    await tick();
+  });
 });
 
 // Small helper so a turn's events can be emitted right after kicking it off.

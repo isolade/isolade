@@ -34,8 +34,14 @@ function defaultDbPath(): string {
  *
  * Version 2 adds `instances.seed_profiles` (the per-dev-VM profile-seeding
  * grant, see seed.ts) and `port_forwards.host_port` (pinned host ports).
+ *
+ * Version 3 turns the flat message list into a tree for message editing:
+ * `chat_messages.parent_id` (tree link, backfilled as a linear chain for
+ * existing chats), `chat_messages.session_id` / `anchor_id` (per-turn
+ * provider-session snapshot so a later edit can fork the session at that
+ * point), and `chats.active_leaf_id` (which branch the chat shows).
  */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 /**
  * The complete, current schema: one CREATE TABLE (plus indexes) per table in
@@ -161,16 +167,25 @@ function createSchema(sqlite: Database): void {
       model_context_window INTEGER,
       compacted INTEGER,
       cost_usd REAL,
+      active_leaf_id TEXT,
       created_at INTEGER NOT NULL DEFAULT (unixepoch())
     )
   `);
 
+  // Messages form a tree: parent_id links a message to the one it replies to
+  // (null for the chat's first message), and editing inserts a sibling under
+  // the same parent. session_id/anchor_id snapshot, per assistant turn, the
+  // provider session and the position inside it, so an edit can fork the
+  // session at that exact point. See db/schema.ts for the full story.
   sqlite.run(`
     CREATE TABLE IF NOT EXISTS chat_messages (
       id TEXT PRIMARY KEY,
       chat_id TEXT NOT NULL,
       role TEXT NOT NULL,
       content TEXT NOT NULL,
+      parent_id TEXT,
+      session_id TEXT,
+      anchor_id TEXT,
       created_at INTEGER NOT NULL DEFAULT (unixepoch())
     )
   `);
@@ -269,6 +284,33 @@ const migrations: Record<number, (sqlite: Database) => void> = {
   2: (sqlite) => {
     sqlite.run(`ALTER TABLE instances ADD COLUMN seed_profiles TEXT`);
     sqlite.run(`ALTER TABLE port_forwards ADD COLUMN host_port INTEGER`);
+  },
+  3: (sqlite) => {
+    sqlite.run(`ALTER TABLE chat_messages ADD COLUMN parent_id TEXT`);
+    sqlite.run(`ALTER TABLE chat_messages ADD COLUMN session_id TEXT`);
+    sqlite.run(`ALTER TABLE chat_messages ADD COLUMN anchor_id TEXT`);
+    sqlite.run(`ALTER TABLE chats ADD COLUMN active_leaf_id TEXT`);
+    // Backfill: existing chats are strictly linear, so chain each chat's
+    // messages in insertion order (rowid, NOT created_at, whose second
+    // precision ties a turn's user and assistant rows) and point the chat's
+    // active leaf at its newest message. session_id/anchor_id stay null:
+    // those snapshots only exist for turns recorded after this version, and
+    // forking falls back gracefully when they're missing.
+    sqlite.run(`
+      UPDATE chat_messages SET parent_id = (
+        SELECT prev.id FROM chat_messages AS prev
+        WHERE prev.chat_id = chat_messages.chat_id
+          AND prev.rowid < chat_messages.rowid
+        ORDER BY prev.rowid DESC LIMIT 1
+      )
+    `);
+    sqlite.run(`
+      UPDATE chats SET active_leaf_id = (
+        SELECT m.id FROM chat_messages AS m
+        WHERE m.chat_id = chats.id
+        ORDER BY m.rowid DESC LIMIT 1
+      )
+    `);
   },
 };
 

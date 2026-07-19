@@ -27,33 +27,40 @@ import { createTestServer } from "./helpers";
 type Action =
   | { kind: "delta"; text: string }
   | { kind: "event"; event: BackendChatEvent }
+  | { kind: "meta"; meta: { sessionId?: string; anchorId?: string } }
   | { kind: "wait"; promise: Promise<void> }
   | { kind: "throw"; message: string }
   | { kind: "abortable" }; // returns once abort signal fires
+
+interface FakeSendOpts {
+  vmId: string;
+  chatId: string;
+  message: string;
+  model: string;
+  effort: string;
+  sessionId?: string;
+  fork?: { anchorId: string };
+  signal?: AbortSignal;
+  onDelta: (text: string) => void;
+  onEvent?: (event: BackendChatEvent) => void;
+  onMeta?: (meta: { sessionId?: string; anchorId?: string }) => void;
+}
 
 class FakeBackend {
   // One-shot script, pushed onto when a test starts the turn.
   private script: Action[] = [];
   public lastSignal: AbortSignal | null = null;
+  public lastOpts: FakeSendOpts | null = null;
   public callCount = 0;
 
   setScript(actions: Action[]) {
     this.script = actions;
   }
 
-  sendMessage = async (opts: {
-    vmId: string;
-    chatId: string;
-    message: string;
-    model: string;
-    effort: string;
-    sessionId?: string;
-    signal?: AbortSignal;
-    onDelta: (text: string) => void;
-    onEvent?: (event: BackendChatEvent) => void;
-  }): Promise<{ content: string; sessionId?: string }> => {
+  sendMessage = async (opts: FakeSendOpts): Promise<{ content: string; sessionId?: string }> => {
     this.callCount++;
     this.lastSignal = opts.signal ?? null;
+    this.lastOpts = opts;
     let content = "";
     for (const action of this.script) {
       if (opts.signal?.aborted) throw new Error("aborted");
@@ -62,6 +69,8 @@ class FakeBackend {
         opts.onDelta(action.text);
       } else if (action.kind === "event") {
         await opts.onEvent?.(action.event);
+      } else if (action.kind === "meta") {
+        opts.onMeta?.(action.meta);
       } else if (action.kind === "wait") {
         await action.promise;
       } else if (action.kind === "throw") {
@@ -190,7 +199,7 @@ describe("chat streaming resilience", () => {
     return { instanceId, chatId: id };
   }
 
-  it("POST /messages emits message_id, deltas, then done", async () => {
+  it("POST /messages emits user_message, message_id, deltas, then done", async () => {
     const { instanceId, chatId } = await makeChat();
     backend.setScript([
       { kind: "delta", text: "hello " },
@@ -205,8 +214,19 @@ describe("chat streaming resilience", () => {
     expect(res.status).toBe(200);
     const { events } = await readAllSse(res);
 
-    expect(events[0]!.event).toBe("message_id");
-    const messageId = JSON.parse(events[0]!.data) as string;
+    // Frame #1 is the persisted user message (id + tree position), so the
+    // client can reconcile its optimistic bubble.
+    expect(events[0]!.event).toBe("user_message");
+    const userMessage = JSON.parse(events[0]!.data) as {
+      id: string;
+      role: string;
+      content: string;
+    };
+    expect(userMessage.role).toBe("user");
+    expect(userMessage.content).toBe("hi");
+
+    expect(events[1]!.event).toBe("message_id");
+    const messageId = JSON.parse(events[1]!.data) as string;
     expect(messageId).toMatch(/^[0-9a-f-]{36}$/);
 
     const deltaEvents = events.filter((e) => e.event === "delta");
@@ -239,7 +259,7 @@ describe("chat streaming resilience", () => {
       body: JSON.stringify({ content: "hi" }),
     });
     const { events: postEvents } = await readAllSse(postRes);
-    const messageId = JSON.parse(postEvents[0]!.data) as string;
+    const messageId = JSON.parse(postEvents.find((e) => e.event === "message_id")!.data) as string;
 
     // Now resume from the start.
     const getRes = await fetch(
@@ -269,7 +289,7 @@ describe("chat streaming resilience", () => {
       body: JSON.stringify({ content: "hi" }),
     });
     const { events: postEvents } = await readAllSse(postRes);
-    const messageId = JSON.parse(postEvents[0]!.data) as string;
+    const messageId = JSON.parse(postEvents.find((e) => e.event === "message_id")!.data) as string;
 
     // Resume with afterSeq=0: should only see "b" and "c".
     const getRes = await fetch(
@@ -637,5 +657,205 @@ describe("chat streaming resilience", () => {
     const deltas = events.filter((e) => e.event === "delta").map((e) => JSON.parse(e.data));
     expect(deltas).toEqual(["before", "after"]);
     expect(events[events.length - 1]!.event).toBe("done");
+  });
+
+  // ── message editing (branching) ────────────────────────────────────────────
+
+  // One scripted turn over the wire, returning the persisted user message id.
+  async function runTurn(
+    instanceId: string,
+    chatId: string,
+    content: string,
+    actions: Action[],
+    editMessageId?: string,
+  ): Promise<{ userMessageId: string }> {
+    backend.setScript(actions);
+    const url = editMessageId
+      ? `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages/${editMessageId}/edit`
+      : `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+    });
+    expect(res.status).toBe(200);
+    const { events } = await readAllSse(res);
+    expect(events[events.length - 1]!.event).toBe("done");
+    const userMessage = JSON.parse(events.find((e) => e.event === "user_message")!.data) as {
+      id: string;
+    };
+    return { userMessageId: userMessage.id };
+  }
+
+  it("edit forks the session at the previous turn and records a sibling branch", async () => {
+    const { instanceId, chatId } = await makeChat();
+    const turn1 = await runTurn(instanceId, chatId, "first question", [
+      { kind: "meta", meta: { sessionId: "sess-1", anchorId: "anchor-1" } },
+      { kind: "delta", text: "first answer" },
+    ]);
+    const turn2 = await runTurn(instanceId, chatId, "second question", [
+      { kind: "meta", meta: { sessionId: "sess-1", anchorId: "anchor-2" } },
+      { kind: "delta", text: "second answer" },
+    ]);
+
+    // The linear shape before the edit: u1 → a1 → u2 → a2, with snapshots.
+    const before = chatManager.getMessages(chatId);
+    expect(before.map((m) => m.role)).toEqual(["user", "assistant", "user", "assistant"]);
+    const [u1, a1, u2, a2] = before;
+    expect(u1!.id).toBe(turn1.userMessageId);
+    expect(a1!.parentId).toBe(u1!.id);
+    expect(a1!.sessionId).toBe("sess-1");
+    expect(a1!.anchorId).toBe("anchor-1");
+    expect(u2!.id).toBe(turn2.userMessageId);
+    expect(chatManager.get(chatId)?.activeLeafId).toBe(a2!.id);
+
+    // Edit u2: the turn must fork sess-1 at anchor-1 (the turn before u2).
+    const edit = await runTurn(
+      instanceId,
+      chatId,
+      "second question, edited",
+      [
+        { kind: "meta", meta: { sessionId: "sess-2", anchorId: "anchor-2b" } },
+        { kind: "delta", text: "forked answer" },
+      ],
+      u2!.id,
+    );
+    expect(backend.lastOpts?.sessionId).toBe("sess-1");
+    expect(backend.lastOpts?.fork).toEqual({ anchorId: "anchor-1" });
+
+    // The edited version is a sibling of u2 (same parent), with its own
+    // assistant child carrying the forked session's snapshot, and the chat
+    // now shows the new branch. The original branch is untouched.
+    const after = chatManager.getMessages(chatId);
+    expect(after).toHaveLength(6);
+    const u2b = after.find((m) => m.id === edit.userMessageId)!;
+    expect(u2b.parentId).toBe(a1!.id);
+    const a2b = after.find((m) => m.parentId === u2b.id)!;
+    expect(a2b.role).toBe("assistant");
+    expect(a2b.content).toBe("forked answer");
+    expect(a2b.sessionId).toBe("sess-2");
+    expect(a2b.anchorId).toBe("anchor-2b");
+    expect(chatManager.get(chatId)?.activeLeafId).toBe(a2b.id);
+    expect(chatManager.getMessage(a2!.id)?.content).toBe("second answer");
+  });
+
+  it("editing the first message starts a fresh session (no fork)", async () => {
+    const { instanceId, chatId } = await makeChat();
+    const turn1 = await runTurn(instanceId, chatId, "hello", [
+      { kind: "meta", meta: { sessionId: "sess-1", anchorId: "anchor-1" } },
+      { kind: "delta", text: "hi" },
+    ]);
+    await runTurn(
+      instanceId,
+      chatId,
+      "hello, edited",
+      [{ kind: "delta", text: "hi again" }],
+      turn1.userMessageId,
+    );
+    expect(backend.lastOpts?.sessionId).toBeUndefined();
+    expect(backend.lastOpts?.fork).toBeUndefined();
+    const msgs = chatManager.getMessages(chatId);
+    const edited = msgs.find((m) => m.content === "hello, edited")!;
+    expect(edited.parentId).toBeNull();
+  });
+
+  it("edit stamps the chat-level session onto a legacy branch tip before forking", async () => {
+    const { instanceId, chatId } = await makeChat();
+    // A pre-snapshot turn: no meta, so the assistant row has no session.
+    const turn1 = await runTurn(instanceId, chatId, "old question", [
+      { kind: "delta", text: "old answer" },
+    ]);
+    // The chat column knows the active session (legacy behavior).
+    chatManager.updateSessionId(chatId, "legacy-sess");
+
+    await runTurn(
+      instanceId,
+      chatId,
+      "old question, edited",
+      [{ kind: "delta", text: "new answer" }],
+      turn1.userMessageId,
+    );
+    // No anchor anywhere → fresh session for the edit…
+    expect(backend.lastOpts?.sessionId).toBeUndefined();
+    expect(backend.lastOpts?.fork).toBeUndefined();
+    // …but the original branch's assistant tip got the legacy session
+    // stamped, so switching back can still resume it.
+    const msgs = chatManager.getMessages(chatId);
+    const legacyAssistant = msgs.find((m) => m.content === "old answer")!;
+    expect(legacyAssistant.sessionId).toBe("legacy-sess");
+  });
+
+  it("rejects edits of assistant messages and unknown messages", async () => {
+    const { instanceId, chatId } = await makeChat();
+    await runTurn(instanceId, chatId, "hi", [{ kind: "delta", text: "hello" }]);
+    const assistant = chatManager.getMessages(chatId).find((m) => m.role === "assistant")!;
+
+    const editAssistant = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages/${assistant.id}/edit`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "nope" }),
+      },
+    );
+    expect(editAssistant.status).toBe(400);
+
+    const editUnknown = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages/does-not-exist/edit`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "nope" }),
+      },
+    );
+    expect(editUnknown.status).toBe(404);
+  });
+
+  it("active-leaf switches branches, descends to the tip, and re-points the session", async () => {
+    const { instanceId, chatId } = await makeChat();
+    await runTurn(instanceId, chatId, "q1", [
+      { kind: "meta", meta: { sessionId: "sess-1", anchorId: "anchor-1" } },
+      { kind: "delta", text: "a1" },
+    ]);
+    const turn2 = await runTurn(instanceId, chatId, "q2", [
+      { kind: "meta", meta: { sessionId: "sess-1", anchorId: "anchor-2" } },
+      { kind: "delta", text: "a2" },
+    ]);
+    await runTurn(
+      instanceId,
+      chatId,
+      "q2, edited",
+      [
+        { kind: "meta", meta: { sessionId: "sess-2", anchorId: "anchor-2b" } },
+        { kind: "delta", text: "a2b" },
+      ],
+      turn2.userMessageId,
+    );
+
+    // Switch back to the original branch by naming its user message. The
+    // server descends to that branch's tip (its assistant answer).
+    const res = await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chatId}/active-leaf`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ leafId: turn2.userMessageId }),
+    });
+    expect(res.status).toBe(200);
+    const updated = (await res.json()) as { activeLeafId: string; claudeSessionId: string | null };
+    const originalAssistant = chatManager
+      .getMessages(chatId)
+      .find((m) => m.parentId === turn2.userMessageId)!;
+    expect(updated.activeLeafId).toBe(originalAssistant.id);
+    expect(updated.claudeSessionId).toBe("sess-1");
+    expect(chatManager.get(chatId)?.activeLeafId).toBe(originalAssistant.id);
+
+    const unknown = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/active-leaf`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ leafId: "does-not-exist" }),
+      },
+    );
+    expect(unknown.status).toBe(404);
   });
 });
