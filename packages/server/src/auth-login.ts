@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { connect } from "node:net";
 import type { Socket } from "bun";
 import { type AuthStore, type Provider, parseExpiresAt } from "./auth-store";
+import { CLIENT_ID_ENV } from "./mount-map";
+import { CTL_SOCK } from "./port-control";
 import { ExecRelayForwarder, type GuestForwarder } from "./port-forwarder";
 import type { SandboxApi } from "./sandbox-client";
 
@@ -238,6 +242,36 @@ interface LoginSession {
   createdAt: number;
   /** The profile's credential store to harvest the login into. */
   store: AuthStore;
+  /** Nested only: the pinned host:K→devVM:K forward requested from the OUTER
+   * isolade for this login's callback (released on teardown). */
+  outerForwardPort: number | null;
+}
+
+// One request → one reply against the in-VM control socket the OUTER isolade's
+// broker serves (the same protocol the `isolade` guest CLI speaks, see
+// port-control.ts). Only used when this server runs nested.
+function ctlRequest(payload: unknown, timeoutMs = 5000): Promise<{ ok?: boolean; error?: string }> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const conn = connect(CTL_SOCK);
+    const timer = setTimeout(() => {
+      conn.destroy(new Error("control-socket request timed out"));
+    }, timeoutMs);
+    conn.on("connect", () => conn.end(JSON.stringify(payload)));
+    conn.on("data", (d) => chunks.push(Buffer.from(d)));
+    conn.on("end", () => {
+      clearTimeout(timer);
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      } catch {
+        reject(new Error("malformed control-socket response"));
+      }
+    });
+    conn.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
 }
 
 const URL_TIMEOUT_MS = 60_000;
@@ -300,6 +334,7 @@ export class AuthLoginManager {
       poll: null,
       createdAt: Date.now(),
       store,
+      outerForwardPort: null,
     };
     this.sessions.set(session.id, session);
 
@@ -331,6 +366,16 @@ export class AuthLoginManager {
       if (k === null) throw new Error("could not parse the loopback port from the login URL");
       const { localPort: hostP } = await this.forwarder.open(vmId, k);
       session.hostProxy = this.startProxy(k, "127.0.0.1", hostP);
+
+      // 5. Nested only (this server runs inside an expose_sandbox dev VM):
+      //    the redirect_uri sends the HOST browser to localhost:K, but our
+      //    bridge just bound THIS guest's loopback K. Ask the outer isolade —
+      //    over the control socket its broker already serves in this VM — to
+      //    pin a forward host:K → devVM:K, completing the chain for both
+      //    providers with no config and no manual step. Best-effort: on
+      //    failure the login URL still renders, and a pinned `isolade ports
+      //    add K:K` in a dev-VM terminal completes the chain by hand.
+      await this.ensureOuterCallbackForward(session, k);
 
       session.state = "awaiting_user";
       this.startCompletionPoll(session, cfg);
@@ -412,6 +457,36 @@ export class AuthLoginManager {
     }, COMPLETION_POLL_MS);
   }
 
+  // Nested-mode helper for the login callback chain (see step 5 in start()).
+  // No-op unless this server was created with a nested identity AND the outer
+  // isolade's control broker is reachable.
+  //
+  // The pin is requested EPHEMERAL: this login session lives only in memory,
+  // so a persisted pin whose session died (a `bun --watch` restart mid-login
+  // is routine in the dev loop) would be reopened by the outer isolade on
+  // every dev-VM boot, squatting host:K (codex's K is always 1455) against
+  // the host's own logins with nothing behind it. Ephemeral, a lost pin
+  // simply dies with the dev VM's forwarder, and a login retry re-requests
+  // it idempotently. (An outer isolade too old to know the flag persists the
+  // pin — old behavior, released on teardown as before.)
+  private async ensureOuterCallbackForward(session: LoginSession, k: number): Promise<void> {
+    if (!process.env[CLIENT_ID_ENV] || !existsSync(CTL_SOCK)) return;
+    try {
+      const res = await ctlRequest({ cmd: "forward", port: k, hostPort: k, ephemeral: true });
+      if (res.ok) {
+        session.outerForwardPort = k;
+        console.log(`[auth-login] outer isolade now forwards host:${k} → this VM:${k}`);
+      } else {
+        console.warn(
+          `[auth-login] outer pinned forward for ${k} refused: ${res.error ?? "unknown error"}. ` +
+            `Run \`isolade ports add ${k}:${k}\` in a dev-VM terminal to complete the login chain.`,
+        );
+      }
+    } catch (err) {
+      console.warn(`[auth-login] outer pinned forward for ${k} failed:`, err);
+    }
+  }
+
   // Stop the host proxy + completion poll and destroy the throwaway VM. Leaves
   // the session record so status() still works after completion/error.
   private teardown(session: LoginSession): void {
@@ -422,6 +497,16 @@ export class AuthLoginManager {
     if (session.hostProxy) {
       session.hostProxy.stop();
       session.hostProxy = null;
+    }
+    // Release the outer pinned callback forward, if this login requested one.
+    if (session.outerForwardPort !== null) {
+      const port = session.outerForwardPort;
+      session.outerForwardPort = null;
+      if (existsSync(CTL_SOCK)) {
+        ctlRequest({ cmd: "unforward", port }).catch((err) => {
+          console.warn(`[auth-login] releasing outer forward ${port} failed:`, err);
+        });
+      }
     }
     // Close the host-side forward listener (its guest relay dies with the VM).
     this.forwarder.closeAll(session.vmId);

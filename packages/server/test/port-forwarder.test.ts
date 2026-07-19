@@ -272,6 +272,47 @@ describe("ExecRelayForwarder", () => {
     expect(fwd.list("vm1")).toEqual([]);
   });
 
+  it("pins the requested host port, and reopens pinned over an ephemeral forward", async () => {
+    const echo = startEchoServer();
+    echoServers.push(echo);
+    const sb = sandbox();
+    sandboxes.push(sb);
+    const fwd = new ExecRelayForwarder(sb);
+
+    // An unpinned forward exists on an ephemeral port…
+    const ephemeral = await fwd.open("vm1", echo.port);
+    // …then a pinned request for the same guest port must NOT be satisfied by
+    // it: the forward is reopened on the exact requested host port.
+    const probe = startEchoServer(); // just to find a free port number
+    const pin = probe.port;
+    probe.stop(true);
+    const pinned = await fwd.open("vm1", echo.port, pin);
+    expect(pinned.localPort).toBe(pin);
+    expect(fwd.list("vm1")).toEqual([pinned]);
+    expect(pinned.localPort).not.toBe(ephemeral.localPort);
+    expect(await roundTrip(pin, "pinned")).toBe("PINNED");
+
+    // A later unpinned open returns the existing (pinned) forward untouched.
+    expect((await fwd.open("vm1", echo.port)).localPort).toBe(pin);
+  });
+
+  it("a colliding pinned bind throws and leaves the existing forward intact", async () => {
+    const echo = startEchoServer();
+    echoServers.push(echo);
+    const sb = sandbox();
+    sandboxes.push(sb);
+    const fwd = new ExecRelayForwarder(sb);
+
+    const before = await fwd.open("vm1", echo.port);
+    // A port that is definitely taken: the echo server's own.
+    const taken = startEchoServer();
+    echoServers.push(taken);
+    await expect(fwd.open("vm1", echo.port, taken.port)).rejects.toThrow();
+    // The prior forward survived the failed pin and still works.
+    expect(fwd.list("vm1")).toEqual([before]);
+    expect(await roundTrip(before.localPort, "still up")).toBe("STILL UP");
+  });
+
   it("closes the client socket when the guest relay can't reach the target", async () => {
     // No echo server for this port → the guest relay's connect fails and it
     // exits non-zero, which must close the host-side client socket.

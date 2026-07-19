@@ -167,9 +167,9 @@ export function createFilesRouter(ctx: RouteContext): Hono {
     const instance = instances.get(id);
     if (!instance) return c.json({ error: "not found" }, 404);
     if (instance.archived) return archivedError(c);
-    const { remotePort } = createPortForwardBodySchema.parse(await c.req.json());
+    const { remotePort, hostPort } = createPortForwardBodySchema.parse(await c.req.json());
     try {
-      return c.json(await instances.addForward(id, remotePort), 201);
+      return c.json(await instances.addForward(id, remotePort, hostPort), 201);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return c.json({ error: message }, 500);

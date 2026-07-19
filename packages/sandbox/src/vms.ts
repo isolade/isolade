@@ -27,6 +27,7 @@ import { join } from "path";
 type PatchBuilderInstance = InstanceType<typeof PatchBuilder>;
 
 import { deriveHome, imageUserName, inspectImageConfig } from "./builds";
+import { dropVmOwner, recordVmOwner } from "./clients";
 import { buildRelayScript, openLoopbackRelay } from "./guest-relay";
 import { getLocalRegistryEndpoint } from "./host-network";
 import { msbStateHome } from "./msb-home";
@@ -80,6 +81,12 @@ export interface VmCreateOpts {
   /** Global network posture. Absent → open internet with no local/host
    * access (the historical default). See buildNetworkPolicy. */
   network?: NetworkConfig;
+  /** Which sandbox client is creating this VM ("host" for the host server's
+   * own calls). Required — an unattributed VM could never be cascaded when
+   * its client is removed, so the HTTP route refuses identity-less requests
+   * rather than defaulting them. Non-host VMs are recorded in the client
+   * registry (see clients.ts). */
+  clientId: string;
 }
 
 export interface PortBinding {
@@ -119,6 +126,32 @@ export function resolveGuestHomePath(input: string, home: string): string {
   if (input.startsWith("$HOME/")) return join(home, input.slice("$HOME/".length));
   if (input === "$HOME") return home;
   return input;
+}
+
+// Volume mount points are materialized by microsandbox in the upper layer, and
+// every missing parent dir on the way is created ROOT-owned — the same failure
+// mode as PatchBuilder parents (see addPatches). A non-root runtime user then
+// can't create sibling entries next to a mount: e.g. a profile mounting
+// `~/.local/share/isolade/profiles` leaves `~/.local/share/isolade` root-owned,
+// and the nested isolade's `isolade.db` beside the mount fails with
+// SQLITE_CANTOPEN. Collect every HOME-rooted volume's parent chain — up to and
+// including $HOME, but EXCLUDING the mount point itself (a chown on a virtiofs
+// root would reach through to the host directory) — for the create-time chown.
+export function collectVolumeParentDirs(volumes: readonly VmVolume[], home: string): string[] {
+  const homePrefix = home.endsWith("/") ? home : `${home}/`;
+  const dirs = new Set<string>();
+  for (const vol of volumes) {
+    const mountPath = resolveGuestHomePath(vol.guestPath, home);
+    if (!mountPath.startsWith(homePrefix)) continue;
+    let cursor = mountPath;
+    while (true) {
+      const slash = cursor.lastIndexOf("/");
+      if (slash < homePrefix.length - 1) break;
+      cursor = cursor.slice(0, slash);
+      dirs.add(cursor);
+    }
+  }
+  return [...dirs];
 }
 
 // Translate the global NetworkConfig (two orthogonal axes: internet
@@ -397,6 +430,15 @@ export class VmManager {
     const tBuilderCreated = performance.now();
 
     this.vms.set(name, { sandbox });
+    // Ownership is recorded only after the VM exists, so a crash in between
+    // leaks an untracked VM rather than tracking a VM that was never created.
+    recordVmOwner(name, opts.clientId);
+
+    // Volume mounts materialize their missing parent dirs root-owned, exactly
+    // like PatchBuilder writes do, so fold them into the chown below.
+    patchedHomePaths = [
+      ...new Set([...patchedHomePaths, ...collectVolumeParentDirs(opts.volumes ?? [], home)]),
+    ];
 
     // PatchBuilder writes credential files as root in the rootfs (uid/gid
     // are hard-coded to 0 in microsandbox, with no owner knob on the API). When
@@ -530,8 +572,8 @@ export class VmManager {
     };
 
     // /workspace is our guest workdir. Minimal base images like alpine don't
-    // have it. mkdir is idempotent so this is safe even on isolade-dev
-    // where the Dockerfile already creates it. Not added to homePaths, since the
+    // have it. mkdir is idempotent so this is safe even on images whose
+    // Dockerfile already creates it. Not added to homePaths, since the
     // build fragment owns /workspace as AGENT_USER at image build time.
     p.mkdir("/workspace");
 
@@ -1060,6 +1102,12 @@ export class VmManager {
   async remove(vmId: string) {
     const state = this.vms.get(vmId);
     this.vms.delete(vmId);
+    // Ownership is dropped only once the persisted record is gone (or was
+    // never there). A failed removal keeps the entry, so the VM stays
+    // attributable and the host's boot-time client sweep can retry it —
+    // dropping eagerly would turn a transient failure into an untracked
+    // orphan no cleanup can ever find again.
+    //
     // If we still hold the live handle, use it. Otherwise the sandbox-service
     // process was restarted after the VM was created. The in-memory map is
     // gone but the microsandbox VM is still running. Reattach via the
@@ -1075,8 +1123,16 @@ export class VmManager {
       try {
         await Sandbox.remove(state.sandbox.name);
       } catch (err) {
+        // stop() failing usually means the VM was already dead, and remove()
+        // erroring right after is then expected noise — but "usually dead" is
+        // not proof the record is gone. Keep the ownership entry on either
+        // failure path: a VM that survived stays attributable for the boot-time
+        // client sweep's retry, and retrying a truly-gone VM is a graceful
+        // no-op.
         if (stopped) console.warn(`[vm-remove ${vmId}] Sandbox.remove failed:`, err);
+        return;
       }
+      dropVmOwner(vmId);
       return;
     }
     let handle;
@@ -1086,6 +1142,7 @@ export class VmManager {
       // No persisted record either, so nothing to remove. (Already cleaned up,
       // or the name was never valid.)
       console.warn(`[vm-remove ${vmId}] no live handle and Sandbox.get failed:`, err);
+      dropVmOwner(vmId);
       return;
     }
     try {
@@ -1097,7 +1154,9 @@ export class VmManager {
       await handle.remove();
     } catch (err) {
       console.warn(`[vm-remove ${vmId}] remove failed:`, err);
+      return; // record persists; keep the ownership entry for a retry
     }
+    dropVmOwner(vmId);
   }
 
   // Stop and remove every VM we know about. Called when the user wants

@@ -32,6 +32,7 @@ import { createPromptRouter } from "./routes/prompt";
 import { createRuntimeRouter } from "./routes/runtime";
 import { type SandboxApi, SandboxClient } from "./sandbox-client";
 import { SecretsStore } from "./secrets-store";
+import { importSeedProfiles, sweepSeedStaging } from "./seed";
 import { PersistentSessionManager } from "./session-manager";
 import { TerminalManager } from "./terminals";
 import { ActiveProfileTracker, TitleVmManager } from "./title-vm-manager";
@@ -175,6 +176,18 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
       ? { dbPath: dbPathOrOpts }
       : dbPathOrOpts;
   const db = createDb(opts.dbPath);
+  // Nested-dev seeding (isolade within isolade): when this server boots inside
+  // an `expose_sandbox` dev VM, the host staged a profile bundle at SEED_MOUNT.
+  // Import it BEFORE ProfileManager is constructed: reconcile() leaves rows it
+  // already finds alone, so seeded profiles arrive READY (their image refs live
+  // in the shared host sandbox cache) and the constructor-tail GC includes them
+  // in this instance's keep-set registration. No-op when the mount is absent
+  // (every ordinary boot). Never blocks boot.
+  try {
+    importSeedProfiles(db);
+  } catch (err) {
+    console.warn("[server] seed import failed:", err);
+  }
   // The update check persists its state in app_state (see update-check-store.ts),
   // so it needs the DB. Wire it before startUpdateChecks / the /api/update route.
   initUpdateChecks(db);
@@ -205,6 +218,13 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
   const instances = new InstanceManager(db, sandboxClient, profiles, secretsStore, prAttachments, {
     sandboxSocketPath: opts.sandboxSocketPath,
   });
+  // Reclaim seed staging dirs orphaned by a crash between staging and the
+  // instance insert (or a missed removal). Local filesystem only, never blocks.
+  try {
+    sweepSeedStaging(new Set(instances.list().map((i) => i.id)));
+  } catch (err) {
+    console.warn("[server] seed staging sweep failed:", err);
+  }
   // Per-profile always-warm titling VMs + the reference-counter that decides,
   // from window activate/heartbeat/deactivate signals, when to warm one and
   // when to tear it down. Lets a chat's first-message title be minted instantly
@@ -245,6 +265,14 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
       console.warn("[server] titling-VM reap failed:", err);
     });
     await instances.resyncAll();
+    // Retry nested-client removals a crash or failed cascade left behind.
+    // Only where the in-process sandbox lives: a server sharing an external
+    // sandbox can't tell its own orphans from other servers' live clients.
+    if (opts.sandboxSocketPath) {
+      await instances.sweepOrphanClients().catch((err) => {
+        console.warn("[server] orphan-client sweep failed:", err);
+      });
+    }
   })().catch((err) => {
     console.warn("[server] VM resync failed:", err);
   });

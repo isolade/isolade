@@ -31,8 +31,11 @@ function defaultDbPath(): string {
  * empty again. Any pre-release database is expected to already be at this exact
  * shape; recreating it (or re-stamping its user_version to 1) is the supported
  * way to bring it onto the squashed baseline.
+ *
+ * Version 2 adds `instances.seed_profiles` (the per-dev-VM profile-seeding
+ * grant, see seed.ts) and `port_forwards.host_port` (pinned host ports).
  */
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 /**
  * The complete, current schema: one CREATE TABLE (plus indexes) per table in
@@ -79,6 +82,7 @@ function createSchema(sqlite: Database): void {
       archived INTEGER NOT NULL DEFAULT 0,
       pinned INTEGER NOT NULL DEFAULT 0,
       expose_sandbox INTEGER NOT NULL DEFAULT 0,
+      seed_profiles TEXT,
       created_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER)),
       updated_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER))
     )
@@ -90,6 +94,7 @@ function createSchema(sqlite: Database): void {
     CREATE TABLE IF NOT EXISTS port_forwards (
       instance_id TEXT NOT NULL,
       remote_port INTEGER NOT NULL,
+      host_port INTEGER,
       PRIMARY KEY (instance_id, remote_port)
     )
   `);
@@ -260,7 +265,12 @@ function createSchema(sqlite: Database): void {
  *     },
  *   };
  */
-const migrations: Record<number, (sqlite: Database) => void> = {};
+const migrations: Record<number, (sqlite: Database) => void> = {
+  2: (sqlite) => {
+    sqlite.run(`ALTER TABLE instances ADD COLUMN seed_profiles TEXT`);
+    sqlite.run(`ALTER TABLE port_forwards ADD COLUMN host_port INTEGER`);
+  },
+};
 
 function migrate(sqlite: Database): void {
   const { user_version: current } = sqlite.query("PRAGMA user_version").get() as {

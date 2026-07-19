@@ -148,6 +148,16 @@ describe("resolveAndMaybeCount", () => {
     expect(after.checkedAt).toBe(later.getTime()); // timestamp still advanced
   });
 
+  it("is always resolve-only when nested, even on a first-ever check", async () => {
+    stubOk();
+    const store = tempStore();
+    const status = await resolveAndMaybeCount(store, "0.1.0", "macos", utc(2026, 5, 10), true);
+
+    expect(new URL(lastUrl).searchParams.has("periods")).toBe(false);
+    expect(status.available).toBe(true);
+    expect(status.latest).toBe("v2.0.0");
+  });
+
   it("does not advance state on failure, so the count is retried", async () => {
     globalThis.fetch = (async () => {
       throw new Error("offline");

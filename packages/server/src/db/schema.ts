@@ -83,6 +83,11 @@ export const instances = sqliteTable("instances", {
   // flag, so the tunnel always matches the env the guest actually sees. A
   // profile config toggle only affects instances created after it.
   exposeSandbox: integer("expose_sandbox", { mode: "boolean" }).notNull().default(false),
+  // The profile ids seeded into this dev VM's nested isolade (see seed.ts),
+  // frozen at create like exposeSandbox: the seed bundle is staged and mounted
+  // at create, so this row — never the guest-writable bundle — records what
+  // the host actually granted. Null/empty for ordinary instances.
+  seedProfiles: text("seed_profiles", { mode: "json" }).$type<string[]>(),
   // Millisecond precision (timestamp_ms), unlike the second-precision timestamps
   // on other tables: updatedAt drives the recency-sorted sidebar, and several
   // instances can finish a turn within the same wall-clock second. Seconds tied
@@ -106,6 +111,11 @@ export const portForwards = sqliteTable(
   {
     instanceId: text("instance_id").notNull(),
     remotePort: integer("remote_port").notNull(),
+    // Requested host loopback port. Null → the kernel picks a free one (the
+    // default). Set for PINNED forwards, where the host port must equal a
+    // value some external party dialed by number — e.g. an OAuth redirect_uri
+    // (`localhost:K`) reaching a login flow inside a nested isolade.
+    hostPort: integer("host_port"),
   },
   (t) => [primaryKey({ columns: [t.instanceId, t.remotePort] })],
 );

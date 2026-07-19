@@ -1,7 +1,13 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { execSync } from "child_process";
+import { eq } from "drizzle-orm";
 import { schema } from "../src/db";
-import type { SandboxApi } from "../src/sandbox-client";
+import { CLIENT_ID_ENV, MOUNT_MAP_ENV } from "../src/mount-map";
+import { profileDir } from "../src/profile-config";
+import type { CreateVmOpts, SandboxApi } from "../src/sandbox-client";
+import { SEED_MOUNT, seedStagingDir } from "../src/seed";
 import { createTestServer } from "./helpers";
 
 // Records the VM-lifecycle calls the archive flow makes, so a no-VM test can
@@ -359,6 +365,236 @@ describe("instance archive lifecycle", () => {
     expect((await fetch(`${baseUrl}/api/instances/arch-guard`)).status).toBe(200);
     expect((await fetch(`${baseUrl}/api/instances/arch-guard/chats`)).status).toBe(200);
     expect((await fetch(`${baseUrl}/api/instances/arch-guard/terminals`)).status).toBe(200);
+  });
+});
+
+// The host half of isolade-in-isolade: creating an expose_sandbox instance
+// stages the seed bundle, injects the nested-mode env, records the grant, and
+// pre-registers the seeded refs; removing it cascades the nested client. All
+// DB + filesystem + recorded sandbox calls — no VM.
+describe("expose_sandbox seeding", () => {
+  let server: ReturnType<typeof createTestServer>;
+  let createdVms: CreateVmOpts[];
+  let keepSets: Array<{ clientId: string; keep: string[] }>;
+  let removedClients: string[];
+  let clientList: string[];
+  // Test hook, fired after each recorded registerKeepSet: lets a test land a
+  // "rebuild" between the registration and create()'s re-resolve.
+  let onRegisterKeepSet: (() => void) | null;
+
+  function seedingSandbox(): SandboxApi {
+    return {
+      async createVm(opts: CreateVmOpts) {
+        createdVms.push(opts);
+        return { vmId: `vm-${createdVms.length}`, ports: [] };
+      },
+      async listClients() {
+        return clientList;
+      },
+      async destroyVm() {},
+      async stopVm() {},
+      async exec() {
+        return { stdout: "", stderr: "", exitCode: 0 };
+      },
+      async writeFile() {},
+      async execStream() {
+        return { exitCode: 0 };
+      },
+      async waitUntilReady() {
+        return true;
+      },
+      async garbageCollect() {},
+      async registerKeepSet(clientId: string, keep: string[]) {
+        keepSets.push({ clientId, keep });
+        onRegisterKeepSet?.();
+      },
+      async removeClient(clientId: string) {
+        removedClients.push(clientId);
+      },
+    } as unknown as SandboxApi;
+  }
+
+  // A minimal buildable profile dir (config.toml + Dockerfile) plus its DB row
+  // memoizing a built image, which is all create() and seeding read.
+  function writeProfile(id: string, configToml: string, image: string | null) {
+    mkdirSync(profileDir(id), { recursive: true });
+    writeFileSync(join(profileDir(id), "config.toml"), configToml);
+    writeFileSync(join(profileDir(id), "Dockerfile"), "FROM scratch\n");
+    server.db
+      .insert(schema.profiles)
+      .values({ id, name: id, image, status: image ? "ready" : "pending" })
+      .run();
+  }
+
+  beforeAll(() => {
+    createdVms = [];
+    keepSets = [];
+    removedClients = [];
+    clientList = [];
+    onRegisterKeepSet = null;
+    server = createTestServer({
+      sandbox: seedingSandbox(),
+      // Any socket path: it enables the reverse forwarder so expose_sandbox
+      // resolves true. The forwarder's acceptor stream runs against the fake.
+      sandboxSocketPath: "/tmp/isolade-test-sandbox.sock",
+    });
+    writeProfile(
+      "dev",
+      `name = "dev"
+expose_sandbox = true
+seed_profiles = ["payload", "broken", "ghost"]
+[build]
+dockerfile = "./Dockerfile"
+`,
+      "img-dev",
+    );
+    writeProfile(
+      "payload",
+      `name = "payload"
+[build]
+dockerfile = "./Dockerfile"
+[[repos]]
+name = "repo"
+source = "https://github.com/example/repo"
+`,
+      "img-payload",
+    );
+    // Unloadable config at seed time: its local repo source doesn't exist.
+    writeProfile(
+      "broken",
+      `name = "broken"
+[build]
+dockerfile = "./Dockerfile"
+[[repos]]
+name = "repo"
+source = "/nonexistent/checkout"
+`,
+      "img-broken",
+    );
+    // "ghost" has no profile at all.
+    writeProfile(
+      "no-expose",
+      `name = "no-expose"
+seed_profiles = ["payload"]
+[build]
+dockerfile = "./Dockerfile"
+`,
+      "img-no-expose",
+    );
+  });
+
+  afterAll(async () => {
+    await server.cleanup();
+  });
+
+  it("stages the seed, injects nested env, records the grant, and cascades on remove", async () => {
+    const instance = await server.instances.create({ profileId: "dev", title: "dev vm" });
+
+    // Only the loadable, image-bearing seed profile made it into the bundle.
+    const staging = seedStagingDir(instance.id);
+    const manifest = JSON.parse(readFileSync(join(staging, "manifest.json"), "utf8"));
+    expect(manifest.profiles).toEqual({ payload: { name: "payload", image: "img-payload" } });
+    expect(existsSync(join(staging, "profiles", "payload", "config.toml"))).toBe(true);
+
+    // The VM got the seed mount and the nested-mode env.
+    const opts = createdVms.at(-1)!;
+    expect(opts.volumes).toContainEqual({ guestPath: SEED_MOUNT, hostPath: staging });
+    expect(opts.env?.ISOLADE_SANDBOX_URL).toBeDefined();
+    expect(opts.env?.[CLIENT_ID_ENV]).toBe(instance.id);
+    const mountMap = JSON.parse(opts.env?.[MOUNT_MAP_ENV] ?? "[]");
+    expect(mountMap).toContainEqual({ guestPath: SEED_MOUNT, hostPath: staging });
+
+    // The grant is frozen on the row, and the refs are pre-protected.
+    expect(instance.seedProfiles).toEqual(["payload"]);
+    expect(keepSets).toEqual([{ clientId: instance.id, keep: ["img-payload"] }]);
+
+    // Removing the dev VM cascades the nested client and drops the staging —
+    // sequenced behind the fire-and-forget destroyVm, so poll briefly.
+    await server.instances.remove(instance.id);
+    for (let i = 0; i < 100 && removedClients.length === 0; i++) {
+      await Bun.sleep(5);
+    }
+    expect(removedClients).toEqual([instance.id]);
+    expect(existsSync(staging)).toBe(false);
+  });
+
+  it("re-registers and stages the fresh ref when a seed profile is rebuilt mid-create", async () => {
+    keepSets = [];
+    let fired = false;
+    onRegisterKeepSet = () => {
+      if (fired) return;
+      fired = true;
+      // A host rebuild of the seeded profile lands right after the first
+      // keep-set registration: the memoized ref moves on, so the ref just
+      // registered may already have been collected by the sweep the
+      // registration waited out (see registerSeedKeepSet).
+      server.db
+        .update(schema.profiles)
+        .set({ image: "img-payload-2" })
+        .where(eq(schema.profiles.id, "payload"))
+        .run();
+    };
+    const instance = await server.instances.create({ profileId: "dev", title: "raced" });
+    onRegisterKeepSet = null;
+
+    // The mismatch was detected: the fresh ref was registered and is what the
+    // staged manifest carries.
+    expect(keepSets.map((k) => k.keep)).toEqual([["img-payload"], ["img-payload-2"]]);
+    const manifest = JSON.parse(
+      readFileSync(join(seedStagingDir(instance.id), "manifest.json"), "utf8"),
+    );
+    expect(manifest.profiles.payload.image).toBe("img-payload-2");
+    await server.instances.remove(instance.id);
+  });
+
+  it("an ephemeral forward (persist: false) opens without writing a row", async () => {
+    const instance = await server.instances.create({ profileId: "no-expose", title: "fwd" });
+    const rows = () =>
+      server.db
+        .select()
+        .from(schema.portForwards)
+        .where(eq(schema.portForwards.instanceId, instance.id))
+        .all();
+
+    // The lifetime the nested login's callback pin rides on (auth-login.ts):
+    // the forward opens, but nothing is persisted for a restart to reopen.
+    const binding = await server.instances.addForward(instance.id, 6100, undefined, {
+      persist: false,
+    });
+    expect(binding.remotePort).toBe(6100);
+    expect(rows()).toEqual([]);
+
+    // A default (persisted) forward, for contrast.
+    await server.instances.addForward(instance.id, 6200);
+    expect(rows().map((r) => r.remotePort)).toEqual([6200]);
+
+    server.instances.removeForward(instance.id, 6100);
+    server.instances.removeForward(instance.id, 6200);
+    await server.instances.remove(instance.id);
+  });
+
+  it("boot sweep removes only clients with no instance row", async () => {
+    removedClients = [];
+    const instance = await server.instances.create({ profileId: "dev", title: "live dev" });
+    clientList = ["host", instance.id, "dead-instance"];
+
+    await server.instances.sweepOrphanClients();
+    // The host and the live dev VM survive; only the orphan is retried.
+    expect(removedClients).toEqual(["dead-instance"]);
+    await server.instances.remove(instance.id);
+  });
+
+  it("ignores seed_profiles without expose_sandbox", async () => {
+    keepSets = [];
+    const instance = await server.instances.create({ profileId: "no-expose", title: "plain" });
+    const opts = createdVms.at(-1)!;
+    expect(opts.env).toBeUndefined();
+    expect(opts.volumes?.some((v) => v.guestPath === SEED_MOUNT)).toBe(false);
+    expect(instance.seedProfiles).toBeNull();
+    expect(keepSets).toEqual([]);
+    expect(existsSync(seedStagingDir(instance.id))).toBe(false);
+    await server.instances.remove(instance.id);
+    expect(removedClients).not.toContain(instance.id);
   });
 });
 
