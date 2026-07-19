@@ -6,6 +6,7 @@ import type { Db } from "./db";
 import { schema } from "./db";
 import type { GitConfigManager } from "./git-config";
 import type { SigningConfig } from "./git-config-store";
+import { CLIENT_ID_ENV, MOUNT_MAP_ENV } from "./mount-map";
 import {
   buildControlCli,
   buildInstallCliCommand,
@@ -22,6 +23,7 @@ import type { ProfileManager } from "./profiles";
 import { runRequestBroker } from "./request-broker";
 import { GUEST_SANDBOX_PORT, SandboxReverseForwarder } from "./sandbox-forward";
 import type { SecretsStore } from "./secrets-store";
+import { removeSeedStaging, SEED_MOUNT, type SeedProfileEntry, stageSeed } from "./seed";
 import { shellQuote } from "./shell";
 import { runSignerStream, SIGN_SOCK } from "./sign-broker";
 import { buildSignShimScript } from "./sign-shim";
@@ -29,12 +31,13 @@ import { buildSignShimScript } from "./sign-shim";
 type CommitterIdentity = { name: string; email: string };
 
 import { WORKSPACE_ROOT } from "./contracts";
-import type {
-  ExecResult,
-  PortForwardBinding,
-  SandboxApi,
-  SandboxSecretBinding,
-  SandboxVolumeBinding,
+import {
+  type ExecResult,
+  HOST_CLIENT_ID,
+  type PortForwardBinding,
+  type SandboxApi,
+  type SandboxSecretBinding,
+  type SandboxVolumeBinding,
 } from "./sandbox-client";
 
 // Guest path of the commit-signing shim git is pointed at via gpg.ssh.program.
@@ -49,6 +52,14 @@ const INIT_COMMAND_TIMEOUT_MS = 10 * 60_000;
 // Guest path the initializer transcript is appended to, so a failed setup is
 // inspectable via a terminal / VS Code without re-running anything.
 const INIT_LOG_PATH = "/tmp/isolade-init.log";
+
+// One desired host→guest forward. `hostPort` pins the host loopback port
+// (runtime forwards only — config-declared ports always get an ephemeral one);
+// undefined lets the kernel pick.
+interface ForwardSpec {
+  remotePort: number;
+  hostPort?: number;
+}
 
 export class InstanceManager {
   // Live host→guest forward bindings, keyed by instance id. The forwarder below
@@ -228,10 +239,59 @@ export class InstanceManager {
           `isolade has no in-process sandbox to serve; ignoring.`,
       );
     }
+
+    // Seed profiles into the nested isolade (config dirs + built image refs;
+    // see seed.ts). Meaningless without the exposed sandbox — the refs point
+    // into ITS cache — so it's warn-and-ignore otherwise. Per-profile
+    // validation is warn-and-skip: a seed problem should degrade the nested
+    // experience, not block the dev VM.
+    let seeded: SeedProfileEntry[] = [];
+    if (exposeSandbox) {
+      seeded = this.resolveSeedEntries(id, config.seedProfiles);
+    } else if (config.seedProfiles.length > 0) {
+      console.warn(
+        `[instance-create ${id}] profile ${profileId} sets seed_profiles without an ` +
+          `exposed sandbox; ignoring.`,
+      );
+    }
+    if (seeded.length > 0) {
+      // Register the seeded refs as this dev VM's retention keep-set BEFORE
+      // the (multi-second) VM boot, so a host rebuild + GC of a seeded profile
+      // in that window can't collect them (see clients.ts). Unprotected refs
+      // would defeat the seed, so a failed registration aborts the create
+      // rather than booting a VM whose images may vanish mid-boot. A failed
+      // create below unwinds this registration.
+      try {
+        seeded = await this.registerSeedKeepSet(id, config.seedProfiles, seeded);
+      } catch (err) {
+        // Drop whatever registration landed (best-effort — the boot-time
+        // orphan-client sweep retries it if this fails too).
+        this.sandboxClient.removeClient(id).catch(() => {});
+        throw new Error(`seeding failed: ${err instanceof Error ? err.message : String(err)}`, {
+          cause: err,
+        });
+      }
+      // Staged only after the registered keep-set and the profiles table
+      // agree, so the manifest's refs are exactly the protected ones.
+      volumes.push({ guestPath: SEED_MOUNT, hostPath: stageSeed(id, seeded) });
+    }
+
+    // Nested-mode env, all frozen into the persisted VM record at create:
+    //   ISOLADE_SANDBOX_URL  where the nested server reaches the host sandbox.
+    //   ISOLADE_CLIENT_ID    its sandbox client identity — this instance's id,
+    //                        the one identifier that exists both now and at
+    //                        remove() time (the msb vmId doesn't exist yet).
+    //   ISOLADE_MOUNT_MAP    this VM's own volumes, verbatim, so the nested
+    //                        server can translate its guest-local volume paths
+    //                        to their host backing dirs (see mount-map.ts).
     const env =
       exposeSandbox && this.sandboxForwarder
         ? {
             ISOLADE_SANDBOX_URL: `http://127.0.0.1:${this.sandboxForwarder.guestPort}`,
+            [CLIENT_ID_ENV]: id,
+            [MOUNT_MAP_ENV]: JSON.stringify(
+              volumes.map((v) => ({ guestPath: v.guestPath, hostPath: v.hostPath })),
+            ),
           }
         : undefined;
 
@@ -249,6 +309,13 @@ export class InstanceManager {
         network,
       })
       .catch((e: unknown) => {
+        // Unwind the seeding side effects: nothing will ever boot against
+        // this staging dir, and the keep-set entry would otherwise retain
+        // its refs forever (strict retention, no TTL).
+        if (seeded.length > 0) {
+          this.sandboxClient.removeClient(id).catch(() => {});
+          removeSeedStaging(id);
+        }
         throw new Error(`VM creation failed: ${e instanceof Error ? e.message : String(e)}`);
       });
     const tVmCreated = performance.now();
@@ -262,6 +329,7 @@ export class InstanceManager {
         image,
         profileId,
         exposeSandbox,
+        seedProfiles: seeded.length > 0 ? seeded.map((s) => s.id) : null,
       })
       .run();
 
@@ -277,7 +345,7 @@ export class InstanceManager {
       git: profileGit,
       signing: signingConfig,
       exposeSandbox,
-      remotePorts: envPorts,
+      forwards: envPorts.map((remotePort) => ({ remotePort })),
     });
 
     // Kick off the profile's lifecycle commands in the booted VM. runSetup
@@ -302,6 +370,81 @@ export class InstanceManager {
     );
 
     return this.decorate(instance);
+  }
+
+  // Validate a dev profile's seed_profiles grant into stageable entries.
+  // Warn-and-skip per profile: each needs a built image (the ref the nested
+  // instance boots from) and a config whose repos are all git sources — local
+  // sources resolve against host paths that don't exist inside the guest, so
+  // the seeded profile could never rebuild (loadProfileConfig would throw at
+  // nested instance create).
+  private resolveSeedEntries(instanceId: string, seedIds: readonly string[]): SeedProfileEntry[] {
+    const out: SeedProfileEntry[] = [];
+    for (const seedId of seedIds) {
+      const profile = this.profiles.get(seedId);
+      if (!profile) {
+        console.warn(`[instance-create ${instanceId}] seed profile ${seedId} not found; skipping`);
+        continue;
+      }
+      if (!profile.image) {
+        console.warn(
+          `[instance-create ${instanceId}] seed profile ${seedId} has no built image; skipping`,
+        );
+        continue;
+      }
+      try {
+        const config = loadProfileConfig(seedId);
+        const local = config.repos.filter((r) => r.source.kind === "local");
+        if (local.length > 0) {
+          console.warn(
+            `[instance-create ${instanceId}] seed profile ${seedId} uses local repo ` +
+              `source(s) (${local.map((r) => r.name).join(", ")}), which cannot resolve ` +
+              `inside a guest; skipping`,
+          );
+          continue;
+        }
+      } catch (err) {
+        console.warn(
+          `[instance-create ${instanceId}] seed profile ${seedId} has an unloadable config; ` +
+            `skipping:`,
+          err,
+        );
+        continue;
+      }
+      out.push({ id: seedId, name: profile.name, image: profile.image });
+    }
+    return out;
+  }
+
+  // Pre-protect the seed's image refs: register them as the dev VM's retention
+  // keep-set, then re-resolve the entries until the two agree. The
+  // registration is serialized behind any in-flight sweep (see
+  // BuilderManager.runKeepSetRegistration), so a ref the profiles table still
+  // memoizes once it returns is provably alive: every sweep that finished
+  // before it had that ref inside its union (via the host's own keep-set). The
+  // loop covers the other case — a rebuild that landed while we waited moved
+  // the memoized ref on, and the sweep we waited out may have collected the
+  // one we registered — by promoting the fresh entries and registering again.
+  // A source that won't hold still after a few rounds (rebuilds landing
+  // back-to-back) surfaces as a create failure rather than a seed whose images
+  // may be gone.
+  private async registerSeedKeepSet(
+    instanceId: string,
+    seedIds: readonly string[],
+    seeded: SeedProfileEntry[],
+  ): Promise<SeedProfileEntry[]> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await this.sandboxClient.registerKeepSet(instanceId, [
+        ...new Set(seeded.map((s) => s.image)),
+      ]);
+      const recheck = this.resolveSeedEntries(instanceId, seedIds);
+      const stable =
+        recheck.length === seeded.length &&
+        recheck.every((e, i) => e.id === seeded[i]!.id && e.image === seeded[i]!.image);
+      if (stable) return seeded;
+      seeded = recheck;
+    }
+    throw new Error("seed profiles kept changing during create (rebuilds in flight?); try again");
   }
 
   // Recency order, newest-active first: the order the sidebar renders in.
@@ -402,9 +545,25 @@ export class InstanceManager {
       // Fire-and-forget so the HTTP handler returns promptly, but log
       // failures: a swallowed error here is exactly how we end up with
       // orphan microsandbox processes outliving their instances.
-      this.sandboxClient.destroyVm(instance.vmId).catch((err) => {
+      const destroyed = this.sandboxClient.destroyVm(instance.vmId).catch((err) => {
         console.warn(`[instance-remove ${id} vmId=${instance.vmId}] destroyVm failed:`, err);
       });
+      // An expose_sandbox VM was a sandbox CLIENT (its nested isolade created
+      // VMs and registered an image keep-set under this instance's id).
+      // Cascade its removal: destroy its leftover VMs, drop its keep-set, and
+      // sweep — then drop the seed staging dir. Sequenced AFTER the VM's own
+      // destroy settles: the staging dir backs a live bind mount until then,
+      // and deleting it under a running VM can wedge the teardown. remove()
+      // only, deliberately: archive() keeps all of it (strict retention — an
+      // archived dev VM must unarchive intact).
+      if (instance.exposeSandbox) {
+        void destroyed.then(async () => {
+          await this.sandboxClient.removeClient(id).catch((err) => {
+            console.warn(`[instance-remove ${id}] nested-client cascade failed:`, err);
+          });
+          removeSeedStaging(id);
+        });
+      }
     }
   }
 
@@ -602,6 +761,25 @@ export class InstanceManager {
     ]);
   }
 
+  // Boot-time reconciliation of the sandbox client registry against the
+  // instances table: any registered client whose instance row no longer exists
+  // was left behind by a crash or a failed removal cascade (remove()'s cascade
+  // is fire-and-forget and has no other retry). Host-with-in-process-sandbox
+  // only — the caller gates on that, since a server sharing an external
+  // sandbox can't know which clients belong to other servers' tables.
+  async sweepOrphanClients(): Promise<void> {
+    const clients = await this.sandboxClient.listClients();
+    const live = new Set(this.list().map((i) => i.id));
+    for (const clientId of clients) {
+      if (clientId === HOST_CLIENT_ID || live.has(clientId)) continue;
+      console.log(`[instance-resync] removing orphaned sandbox client ${clientId}`);
+      await this.sandboxClient.removeClient(clientId).catch((err) => {
+        console.warn(`[instance-resync] orphan client ${clientId} removal failed:`, err);
+      });
+      removeSeedStaging(clientId);
+    }
+  }
+
   // Refresh in-memory port bindings for an instance whose VM is still
   // alive. Does NOT toggle status or bump lastError on the happy path.
   // when the sandbox-service held its VMs through a server reload, the
@@ -634,16 +812,44 @@ export class InstanceManager {
 
   // Open a new runtime forward (from the UI or the in-VM agent helper): persist
   // it so it survives restart, then open the host listener. Idempotent, so a
-  // repeat call returns the existing binding.
-  async addForward(id: string, remotePort: number): Promise<PortForwardBinding> {
+  // repeat call returns the existing binding. `hostPort` pins the host loopback
+  // port (see GuestForwarder.open); a pinned open that collides throws before
+  // anything is opened, but the persisted row keeps the pin for the next
+  // restart's reopen attempt.
+  //
+  // `persist: false` skips the row entirely: the forward lives until it is
+  // unforwarded or the VM/server restarts, and is never reopened. That is the
+  // right lifetime for pins requested by an automated flow whose own state is
+  // in-memory (the nested login callback, see auth-login.ts) — a persisted pin
+  // whose requester died mid-flow would squat the pinned host port across
+  // every later restart with nothing behind it.
+  async addForward(
+    id: string,
+    remotePort: number,
+    hostPort?: number,
+    opts: { persist?: boolean } = {},
+  ): Promise<PortForwardBinding> {
     const instance = this.get(id);
     if (!instance) throw new Error(`instance ${id} not found`);
-    this.db
-      .insert(schema.portForwards)
-      .values({ instanceId: id, remotePort })
-      .onConflictDoNothing()
-      .run();
-    const binding = await this.forwarder.open(instance.vmId, remotePort);
+    if (opts.persist !== false) {
+      // A pinned request records its pin; an unpinned repeat leaves any existing
+      // row (and its pin) untouched, preserving the old "repeat addForward never
+      // mutates the persisted row" invariant. Un-pinning is removeForward + re-add.
+      const insert = this.db
+        .insert(schema.portForwards)
+        .values({ instanceId: id, remotePort, hostPort: hostPort ?? null });
+      if (hostPort === undefined) {
+        insert.onConflictDoNothing().run();
+      } else {
+        insert
+          .onConflictDoUpdate({
+            target: [schema.portForwards.instanceId, schema.portForwards.remotePort],
+            set: { hostPort },
+          })
+          .run();
+      }
+    }
+    const binding = await this.forwarder.open(instance.vmId, remotePort, hostPort);
     this.portForwards.set(id, this.forwarder.list(instance.vmId));
     return binding;
   }
@@ -666,10 +872,21 @@ export class InstanceManager {
   }
 
   // The forwards an instance should have open: its profile's config-declared
-  // ports plus any runtime forwards persisted for it. Deduped, with config
-  // ports first, then runtime extras.
-  private desiredRemotePorts(id: string, profileId: string | null): number[] {
-    return [...new Set([...this.readPortsForProfile(profileId), ...this.persistedRemotePorts(id)])];
+  // ports plus any runtime forwards persisted for it. Deduped by guest port,
+  // with a persisted runtime row's host-port pin winning over the (pin-less)
+  // config declaration for the same port.
+  private desiredForwards(id: string, profileId: string | null): ForwardSpec[] {
+    const byRemote = new Map<number, ForwardSpec>();
+    for (const remotePort of this.readPortsForProfile(profileId)) {
+      byRemote.set(remotePort, { remotePort });
+    }
+    for (const row of this.persistedForwards(id)) {
+      byRemote.set(row.remotePort, {
+        remotePort: row.remotePort,
+        hostPort: row.hostPort ?? undefined,
+      });
+    }
+    return [...byRemote.values()];
   }
 
   // Config-declared ports for a profile, best-effort (a missing/invalid config
@@ -683,25 +900,24 @@ export class InstanceManager {
     }
   }
 
-  private persistedRemotePorts(id: string): number[] {
+  private persistedForwards(id: string) {
     return this.db
       .select()
       .from(schema.portForwards)
       .where(eq(schema.portForwards.instanceId, id))
-      .all()
-      .map((r) => r.remotePort);
+      .all();
   }
 
   // Re-establish the host listeners for a (re)booted VM: drop any stale ones
   // this manager holds for the VM (and reset the forwarder's per-VM relay-script
   // state), then open each desired port fresh. Best-effort per port: a failed
-  // open is logged, not fatal, so one bad port can't wedge a restart. Localports
-  // are ephemeral, so they may change across a restart.
-  private async reopenForwards(id: string, vmId: string, remotePorts: number[]): Promise<void> {
+  // open is logged, not fatal, so one bad port can't wedge a restart. Unpinned
+  // local ports are ephemeral, so they may change across a restart.
+  private async reopenForwards(id: string, vmId: string, forwards: ForwardSpec[]): Promise<void> {
     this.forwarder.closeAll(vmId);
-    for (const remotePort of remotePorts) {
+    for (const { remotePort, hostPort } of forwards) {
       try {
-        await this.forwarder.open(vmId, remotePort);
+        await this.forwarder.open(vmId, remotePort, hostPort);
       } catch (err) {
         console.warn(`[port-forward ${id} vmId=${vmId}] open ${remotePort} failed:`, err);
       }
@@ -766,15 +982,15 @@ export class InstanceManager {
     git: GitConfigManager | null;
     signing: SigningConfig | null;
     exposeSandbox: boolean;
-    remotePorts: number[];
+    forwards: ForwardSpec[];
   }): Promise<void> {
-    const { id, vmId, identity, git, signing, exposeSandbox, remotePorts } = params;
+    const { id, vmId, identity, git, signing, exposeSandbox, forwards } = params;
     await this.setupAgentAuth(vmId);
     await this.setupGitConfig(vmId, identity, signing);
     this.ensureSignerBroker(vmId, git, signing);
     this.setupPortControl(id, vmId);
     this.setupSandboxForward(vmId, exposeSandbox);
-    await this.reopenForwards(id, vmId, remotePorts);
+    await this.reopenForwards(id, vmId, forwards);
   }
 
   // The establish params for a persisted instance (restart / re-attach), all
@@ -795,7 +1011,7 @@ export class InstanceManager {
       git,
       signing: this.resolveSigningForVm(instance.profileId),
       exposeSandbox: instance.exposeSandbox,
-      remotePorts: this.desiredRemotePorts(instance.id, instance.profileId),
+      forwards: this.desiredForwards(instance.id, instance.profileId),
     };
   }
 
@@ -927,8 +1143,18 @@ export class InstanceManager {
     if (this.portControlStreams.has(vmId)) return;
     const portOps: PortControlOps = {
       list: () => this.listPortForwards(id),
-      detected: async () => (await this.probePorts(id)).detected,
-      forward: (remotePort) => this.addForward(id, remotePort),
+      forward: (remotePort, hostPort, ephemeral) => {
+        // Host-port pinning from INSIDE a VM is an expose_sandbox privilege.
+        // An ordinary agent VM may open ephemeral forwards, but letting it
+        // claim exact host loopback ports would allow squatting on numbers
+        // other host-local flows dial (e.g. OAuth callback ports). The dev VM
+        // already has full-fleet trust, and its nested login flow is what
+        // needs the pin (see auth-login.ts).
+        if (hostPort !== undefined && !this.get(id)?.exposeSandbox) {
+          throw new Error("pinned host ports are only available to expose_sandbox instances");
+        }
+        return this.addForward(id, remotePort, hostPort, { persist: !ephemeral });
+      },
       unforward: (remotePort) => this.removeForward(id, remotePort),
     };
     const prOps: PrControlOps = {

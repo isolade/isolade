@@ -1,6 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import { ESSENTIAL_NETWORK_DOMAINS, type NetworkConfig } from "@isolade/shared";
-import { buildNetworkPolicy, getVmMemoryMib, isInsecureRegistryRef } from "../src/vms";
+import {
+  buildNetworkPolicy,
+  collectVolumeParentDirs,
+  getVmMemoryMib,
+  isInsecureRegistryRef,
+} from "../src/vms";
 
 // Compact view of a rule for assertions: "<action> <direction> <destination>".
 const ruleSig = (r: {
@@ -153,5 +158,37 @@ describe("buildNetworkPolicy", () => {
     const hostRule = p.rules[0]!;
     expect(hostRule.action).toBe("allow");
     expect(hostRule.ports).toEqual([{ start: 5432, end: 5432 }]);
+  });
+});
+
+describe("collectVolumeParentDirs", () => {
+  const HOME = "/home/agent";
+
+  it("collects missing-parent chains up to and including $HOME, excluding the mount", () => {
+    const dirs = collectVolumeParentDirs(
+      [{ guestPath: "~/.local/share/isolade/profiles", hostPath: "/host/x" }],
+      HOME,
+    );
+    expect(dirs.toSorted()).toEqual([
+      "/home/agent",
+      "/home/agent/.local",
+      "/home/agent/.local/share",
+      "/home/agent/.local/share/isolade",
+    ]);
+    // The mount point itself is excluded: chowning a virtiofs root would
+    // reach through to the host directory.
+    expect(dirs).not.toContain("/home/agent/.local/share/isolade/profiles");
+  });
+
+  it("dedupes across volumes and skips non-HOME mounts", () => {
+    const dirs = collectVolumeParentDirs(
+      [
+        { guestPath: "~/.cache/isolade", hostPath: "/host/a" },
+        { guestPath: "$HOME/.cache/sccache", hostPath: "/host/b" },
+        { guestPath: "/run/isolade-seed", hostPath: "/host/c" },
+      ],
+      HOME,
+    );
+    expect(dirs.toSorted()).toEqual(["/home/agent", "/home/agent/.cache"]);
   });
 });

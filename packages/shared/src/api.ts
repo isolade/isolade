@@ -107,9 +107,13 @@ export const uploadFileBodySchema = z.object({
 });
 
 // Open a runtime port forward. `remotePort` is the guest port to expose. The
-// host loopback port is chosen by the server and returned in the binding.
+// host loopback port is chosen by the server and returned in the binding —
+// unless `hostPort` pins it (needed when something external dials the host
+// port by a fixed number, e.g. an OAuth redirect_uri). A pinned port that is
+// already taken fails the request.
 export const createPortForwardBodySchema = z.object({
   remotePort: z.number().int().min(1).max(65535),
+  hostPort: z.number().int().min(1).max(65535).optional(),
 });
 
 // Identify one attached PR for detach (and any future per-PR REST action). The

@@ -6,33 +6,39 @@ import { buildControlCli, handlePortCommand, type PortControlOps } from "../src/
 import { runRequestBroker } from "../src/request-broker";
 import type { ExecStreamOpts, PortForwardBinding, SandboxApi } from "../src/sandbox-client";
 
-// A fake ops that records calls and returns canned bindings.
+// A fake ops that records calls and returns canned bindings. `forwarded`
+// mirrors live state (unforward removes), so `ports rm --all` round-trips.
 function fakeOps(overrides: Partial<PortControlOps> = {}): PortControlOps & {
   forwarded: number[];
   unforwarded: number[];
+  calls: Array<{ remotePort: number; hostPort?: number; ephemeral?: boolean }>;
 } {
   const forwarded: number[] = [];
   const unforwarded: number[] = [];
+  const calls: Array<{ remotePort: number; hostPort?: number; ephemeral?: boolean }> = [];
   return {
     forwarded,
     unforwarded,
+    calls,
     list: () =>
       forwarded.map((remotePort) => ({
         address: "127.0.0.1",
         localPort: 40000 + remotePort,
         remotePort,
       })),
-    detected: async () => [8080],
-    forward: async (remotePort) => {
+    forward: async (remotePort, hostPort, ephemeral) => {
       forwarded.push(remotePort);
+      calls.push({ remotePort, hostPort, ephemeral });
       return {
         address: "127.0.0.1",
-        localPort: 40000 + remotePort,
+        localPort: hostPort ?? 40000 + remotePort,
         remotePort,
       } as PortForwardBinding;
     },
     unforward: (remotePort) => {
       unforwarded.push(remotePort);
+      const i = forwarded.indexOf(remotePort);
+      if (i >= 0) forwarded.splice(i, 1);
     },
     ...overrides,
   };
@@ -44,13 +50,12 @@ async function call(cmd: object, ops: PortControlOps): Promise<any> {
 }
 
 describe("handlePortCommand", () => {
-  it("lists forwarded + detected ports", async () => {
+  it("lists forwarded ports", async () => {
     const ops = fakeOps();
     await ops.forward(5173);
     expect(await call({ cmd: "list" }, ops)).toEqual({
       ok: true,
       forwarded: [{ remotePort: 5173, localPort: 45173 }],
-      detected: [8080],
     });
   });
 
@@ -70,6 +75,28 @@ describe("handlePortCommand", () => {
       ok: true,
     });
     expect(ops.unforwarded).toEqual([3000]);
+  });
+
+  it("passes hostPort and the ephemeral flag through to ops.forward", async () => {
+    const calls: Array<[number, number | undefined, boolean | undefined]> = [];
+    const ops = fakeOps({
+      forward: async (remotePort, hostPort, ephemeral) => {
+        calls.push([remotePort, hostPort, ephemeral]);
+        return {
+          address: "127.0.0.1",
+          localPort: hostPort ?? 40000 + remotePort,
+          remotePort,
+        } as PortForwardBinding;
+      },
+    });
+    // The nested login's pinned ephemeral request (see auth-login.ts).
+    expect(
+      await call({ cmd: "forward", port: 1455, hostPort: 1455, ephemeral: true }, ops),
+    ).toEqual({ ok: true, remotePort: 1455, localPort: 1455 });
+    expect(calls).toEqual([[1455, 1455, true]]);
+    // A non-boolean flag is rejected before ops is touched.
+    expect((await call({ cmd: "forward", port: 3000, ephemeral: "yes" }, ops)).ok).toBe(false);
+    expect(calls).toHaveLength(1);
   });
 
   it("rejects invalid ports and unknown commands", async () => {
@@ -202,18 +229,35 @@ describe("port-control broker + CLI round-trip", () => {
     while (!existsSync(sock) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
     expect(existsSync(sock)).toBe(true);
 
-    const fwd = await runCli(cliPath, ["forward", "5173"]);
+    const fwd = await runCli(cliPath, ["ports", "add", "5173"]);
     expect(fwd.code).toBe(0);
-    expect(fwd.stdout).toContain("host localhost:45173");
-    expect(ops.forwarded).toEqual([5173]);
+    expect(fwd.stdout).toContain("localhost:45173 -> guest 5173");
+    expect(ops.calls).toEqual([{ remotePort: 5173 }]);
+
+    // Docker publish order: HOST:GUEST pins the host side.
+    const pinned = await runCli(cliPath, ["ports", "add", "45174:5174"]);
+    expect(pinned.code).toBe(0);
+    expect(pinned.stdout).toContain("localhost:45174 -> guest 5174");
+    expect(ops.calls.at(-1)).toEqual({ remotePort: 5174, hostPort: 45174 });
 
     const list = await runCli(cliPath, ["ports"]);
     expect(list.code).toBe(0);
-    expect(list.stdout).toContain("5173  ->  host localhost:45173");
-    expect(list.stdout).toContain("Detected");
+    expect(list.stdout).toContain("localhost:45173 -> 5173");
+    expect(list.stdout).toContain("localhost:45174 -> 5174");
 
-    const un = await runCli(cliPath, ["unforward", "5173"]);
+    // rm keys on the guest port, and accepts a pasted HOST:GUEST mapping.
+    const un = await runCli(cliPath, ["ports", "rm", "45174:5174"]);
     expect(un.code).toBe(0);
-    expect(ops.unforwarded).toEqual([5173]);
+    expect(ops.unforwarded).toEqual([5174]);
+
+    const all = await runCli(cliPath, ["ports", "rm", "--all"]);
+    expect(all.code).toBe(0);
+    expect(all.stdout).toContain("Stopped forwarding 5173.");
+    expect(ops.unforwarded).toEqual([5174, 5173]);
+
+    // The old flat spellings are gone, and bad input exits with usage.
+    expect((await runCli(cliPath, ["forward", "5173"])).code).toBe(2);
+    expect((await runCli(cliPath, ["ports", "add"])).code).toBe(2);
+    expect((await runCli(cliPath, ["ports", "add", "5173:80:90"])).code).toBe(2);
   });
 });

@@ -26,9 +26,16 @@ type SandboxVmManager = Pick<
   | "listVmHandles"
 >;
 
-type RunBuild = (tarStream: ReadableStream) => AsyncGenerator<string, string>;
+// Both runners require the caller's client identity (see clients.ts). There
+// is deliberately no "host" default anywhere on this path: an identity-less
+// request is refused at the route, never treated as the host's.
+type RunBuild = (tarStream: ReadableStream, clientId: string) => AsyncGenerator<string, string>;
 
-type RunRegistryGc = (keep: string[], log?: (line: string) => void) => Promise<void>;
+type RunRegistryGc = (
+  keep: string[],
+  clientId: string,
+  log?: (line: string) => void,
+) => Promise<void>;
 
 // What the HTTP veneer needs from whoever owns the runtime objects. In
 // production this is always sandboxAppDeps(runtime). Tests pass a fake
@@ -39,15 +46,24 @@ export interface SandboxAppDeps {
   runBuild?: RunBuild;
   runRegistryGc?: RunRegistryGc;
   getStats?: () => Promise<unknown>;
+  /** Replace a client's retention keep-set (no sweep). See clients.ts. */
+  registerKeepSet?: (clientId: string, keep: string[]) => Promise<void>;
+  /** Every client id known to the registry (see clients.ts). */
+  listClients?: () => Promise<string[]>;
+  /** Remove a nested client: destroy its VMs, drop its keep-set, sweep. */
+  removeClient?: (clientId: string) => Promise<void>;
 }
 
 /** The full dep set for a live runtime: the one production wiring. */
 export function sandboxAppDeps(runtime: SandboxRuntime): SandboxAppDeps {
   return {
     vmManager: runtime.vmManager,
-    runBuild: (tarStream) => runtime.builder.runBuild(tarStream),
-    runRegistryGc: (keep, log) => runtime.builder.runRegistryGc(keep, log),
+    runBuild: (tarStream, clientId) => runtime.builder.runBuild(tarStream, clientId),
+    runRegistryGc: (keep, clientId, log) => runtime.builder.runRegistryGc(keep, clientId, log),
     getStats: runtime.getStats,
+    registerKeepSet: runtime.registerKeepSet,
+    listClients: runtime.listClients,
+    removeClient: runtime.removeClient,
   };
 }
 
@@ -72,6 +88,13 @@ export function createSandboxApp(deps: SandboxAppDeps) {
 
   app.post("/vms", async (c) => {
     const opts = await c.req.json();
+    // Identity is mandatory: a VM created without a client id could never be
+    // attributed for ownership/cascade bookkeeping (see clients.ts), and a
+    // silent "host" default would let a caller predating the client registry
+    // masquerade as the host. Refuse instead.
+    if (typeof opts?.clientId !== "string" || opts.clientId.length === 0) {
+      return c.json({ error: "clientId required" }, 400);
+    }
     try {
       const { vmId, ports } = await vmManager.create(opts);
       return c.json({ id: vmId, ports }, 201);
@@ -306,10 +329,16 @@ export function createSandboxApp(deps: SandboxAppDeps) {
   app.post("/builds", async (c) => {
     const tarStream = c.req.raw.body;
     if (!tarStream) return c.json({ error: "request body required" }, 400);
+    // The body is the raw context tar, so the client identity rides a query
+    // param rather than a JSON field. Required — an identity-less build has
+    // no keep-set to protect its ref, so it is refused, never defaulted to
+    // the host.
+    const clientId = c.req.query("client");
+    if (!clientId) return c.json({ error: "client query parameter required" }, 400);
 
     return streamSSE(c, async (stream) => {
       try {
-        const gen = buildRunner(tarStream);
+        const gen = buildRunner(tarStream, clientId);
         while (true) {
           const result = await gen.next();
           if (result.done) {
@@ -338,9 +367,9 @@ export function createSandboxApp(deps: SandboxAppDeps) {
   });
 
   app.post("/registry/gc", async (c) => {
-    let body: { keep?: unknown };
+    let body: { keep?: unknown; clientId?: unknown };
     try {
-      body = (await c.req.json()) as { keep?: unknown };
+      body = (await c.req.json()) as { keep?: unknown; clientId?: unknown };
     } catch (err) {
       console.warn("[sandbox] /registry/gc: failed to parse body:", err);
       return c.json({ error: `invalid JSON body: ${String(err)}` }, 400);
@@ -349,9 +378,16 @@ export function createSandboxApp(deps: SandboxAppDeps) {
       console.warn("[sandbox] /registry/gc: rejecting body", JSON.stringify(body));
       return c.json({ error: "keep must be a string[]" }, 400);
     }
+    // Required: a GC registers the caller's keep-set before sweeping, so an
+    // identity-less request has nothing valid to register — and defaulting it
+    // to the host would let it shrink the host's keep-set. Refuse instead.
+    if (typeof body.clientId !== "string" || body.clientId.length === 0) {
+      return c.json({ error: "clientId required" }, 400);
+    }
+    const clientId = body.clientId;
     return streamSSE(c, async (stream) => {
       try {
-        await gcRunner(body.keep as string[], (line) => {
+        await gcRunner(body.keep as string[], clientId, (line) => {
           void stream.writeSSE({ event: "log", data: line }).catch(() => {});
         });
         await stream.writeSSE({ event: "done", data: "" });
@@ -360,6 +396,63 @@ export function createSandboxApp(deps: SandboxAppDeps) {
         await stream.writeSSE({ event: "error", data: String(err) }).catch(() => {});
       }
     });
+  });
+
+  // Clients (nested isolade servers driving this sandbox, see clients.ts).
+
+  // Every client id the registry knows. The host server reconciles this
+  // against its instances table at boot and retries removals a crash or a
+  // failed cascade left behind.
+  app.get("/clients", async (c) => {
+    if (!deps.listClients) {
+      return c.json({ error: notWired("client registry").message }, 501);
+    }
+    try {
+      return c.json({ clients: await deps.listClients() });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  // Replace a client's retention keep-set without sweeping. The host server
+  // uses this at dev-VM create to pre-protect the image refs it seeds into the
+  // nested instance, closing the window before that instance's first own GC.
+  app.put("/clients/:id/keep", async (c) => {
+    if (!deps.registerKeepSet) {
+      return c.json({ error: notWired("client registry").message }, 501);
+    }
+    const clientId = c.req.param("id");
+    let body: { keep?: unknown };
+    try {
+      body = (await c.req.json()) as { keep?: unknown };
+    } catch (err) {
+      return c.json({ error: `invalid JSON body: ${String(err)}` }, 400);
+    }
+    if (!Array.isArray(body.keep) || !body.keep.every((x) => typeof x === "string")) {
+      return c.json({ error: "keep must be a string[]" }, 400);
+    }
+    try {
+      await deps.registerKeepSet(clientId, body.keep as string[]);
+      return c.json({ ok: true });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  // Remove a client: destroy the VMs it created, drop its keep-set, and sweep
+  // the image caches against the remaining union. Called by the host server
+  // when an `expose_sandbox` instance is deleted.
+  app.delete("/clients/:id", async (c) => {
+    if (!deps.removeClient) {
+      return c.json({ error: notWired("client registry").message }, 501);
+    }
+    const clientId = c.req.param("id");
+    try {
+      await deps.removeClient(clientId);
+      return c.json({ ok: true });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
   });
 
   return app;

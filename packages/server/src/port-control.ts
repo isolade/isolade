@@ -4,9 +4,12 @@ import type { PortForwardBinding } from "./sandbox-client";
 // guest and talks to the host over the generic request broker (request-broker.ts),
 // so the agent (or a human at a shell) can inspect and change forwards with:
 //
-//   isolade ports              # list forwarded + detected ports
-//   isolade forward 5173       # expose guest port 5173 on host loopback
-//   isolade unforward 5173     # stop forwarding it
+//   isolade ports                # list forwards (host -> guest, one per line)
+//   isolade ports add 5173       # expose guest 5173 on an ephemeral host port
+//   isolade ports add 8080:5173  # pin host 8080 -> guest 5173 (docker publish
+//                                # order; expose_sandbox instances only)
+//   isolade ports rm 5173 ...    # stop forwarding (also accepts HOST:GUEST)
+//   isolade ports rm --all
 //
 // The CLI can't reach the host loopback URL itself (it's in the VM). The point
 // is to make a server it started visible in the human's Ports panel / preview.
@@ -20,8 +23,13 @@ export const CTL_BROKER_PATH = "/tmp/isolade-ctl-broker.cjs";
 // bound to a specific instance id.
 export interface PortControlOps {
   list(): PortForwardBinding[];
-  detected(): Promise<number[]>;
-  forward(remotePort: number): Promise<PortForwardBinding>;
+  /** Open a forward. `hostPort` pins the host loopback port (the CLI's
+   * `ports add 1455:1455`); omitted, the kernel picks one. `ephemeral: true` skips the
+   * persisted row, so the forward dies with the VM/server instead of being
+   * reopened on every restart — the lifetime automated flows want (a nested
+   * isolade pins its OAuth callback this way, see auth-login.ts). User-typed
+   * forwards persist. */
+  forward(remotePort: number, hostPort?: number, ephemeral?: boolean): Promise<PortForwardBinding>;
   unforward(remotePort: number): void;
 }
 
@@ -34,7 +42,7 @@ function isValidPort(port: unknown): port is number {
  * come back as `{ ok: false, error }`. */
 export async function handlePortCommand(request: Buffer, ops: PortControlOps): Promise<Buffer> {
   const reply = (obj: unknown) => Buffer.from(JSON.stringify(obj), "utf8");
-  let msg: { cmd?: string; port?: unknown };
+  let msg: { cmd?: string; port?: unknown; hostPort?: unknown; ephemeral?: unknown };
   try {
     msg = JSON.parse(request.toString("utf8"));
   } catch {
@@ -46,11 +54,17 @@ export async function handlePortCommand(request: Buffer, ops: PortControlOps): P
         const forwarded = ops
           .list()
           .map((b) => ({ remotePort: b.remotePort, localPort: b.localPort }));
-        return reply({ ok: true, forwarded, detected: await ops.detected() });
+        return reply({ ok: true, forwarded });
       }
       case "forward": {
         if (!isValidPort(msg.port)) return reply({ ok: false, error: "invalid port" });
-        const b = await ops.forward(msg.port);
+        if (msg.hostPort !== undefined && !isValidPort(msg.hostPort)) {
+          return reply({ ok: false, error: "invalid host port" });
+        }
+        if (msg.ephemeral !== undefined && typeof msg.ephemeral !== "boolean") {
+          return reply({ ok: false, error: "invalid ephemeral flag" });
+        }
+        const b = await ops.forward(msg.port, msg.hostPort, msg.ephemeral);
         return reply({
           ok: true,
           remotePort: b.remotePort,
@@ -91,7 +105,7 @@ const SOCK = ${JSON.stringify(socketPath)};
 const [, , cmd, ...rest] = process.argv;
 
 function usage() {
-  console.error('usage: isolade <ports | forward PORT | unforward PORT | pr [add|list|rm] ...>');
+  console.error('usage: isolade <ports [add [HOST:]PORT | rm PORT...|--all] | pr [add|list|rm] ...>');
   process.exit(2);
 }
 
@@ -156,22 +170,47 @@ if (cmd === 'pr') {
       console.log('Detached ' + res.removed.owner + '/' + res.removed.repo + '#' + res.removed.number + ' from this chat.');
     });
   } else usage();
-} else if (cmd === undefined || cmd === 'ports' || cmd === 'list') {
-  send({ cmd: 'list' }, (res) => {
-    if (!res.forwarded.length) console.log('No ports forwarded.');
-    else {
-      console.log('Forwarded:');
-      for (const f of res.forwarded) console.log('  ' + f.remotePort + '  ->  host localhost:' + f.localPort);
+} else if (cmd === 'ports') {
+  const sub = rest[0];
+  if (sub === undefined) {
+    send({ cmd: 'list' }, (res) => {
+      if (!res.forwarded.length) console.log('No ports forwarded.');
+      else for (const f of res.forwarded) console.log('localhost:' + f.localPort + ' -> ' + f.remotePort);
+    });
+  } else if (sub === 'add') {
+    // add [HOST:]PORT, docker publish order: the optional pinned host
+    // loopback port first, the guest port last. Bare PORT gets an ephemeral
+    // host port; pinning is an expose_sandbox privilege (the host refuses it
+    // elsewhere).
+    if (rest[1] === undefined || rest[2] !== undefined) usage();
+    const parts = String(rest[1]).split(':');
+    if (parts.length > 2) usage();
+    const port = Number(parts[parts.length - 1]);
+    const hostPort = parts.length === 2 ? Number(parts[0]) : undefined;
+    if (!Number.isInteger(port) || port < 1) usage();
+    if (hostPort !== undefined && (!Number.isInteger(hostPort) || hostPort < 1)) usage();
+    send({ cmd: 'forward', port, ...(hostPort !== undefined ? { hostPort } : {}) }, (res) => {
+      console.log('Forwarding localhost:' + res.localPort + ' -> guest ' + res.remotePort + ' (visible in the Ports panel).');
+    });
+  } else if (sub === 'rm' || sub === 'remove') {
+    if (rest[1] === undefined) usage();
+    if (rest[1] === '--all') {
+      send({ cmd: 'list' }, (res) => {
+        if (!res.forwarded.length) { console.log('No ports forwarded.'); return; }
+        for (const f of res.forwarded) {
+          send({ cmd: 'unforward', port: f.remotePort }, () => console.log('Stopped forwarding ' + f.remotePort + '.'));
+        }
+      });
+    } else {
+      // Each argument is a guest port; a pasted HOST:GUEST mapping is
+      // accepted and keyed on its guest side.
+      const ports = rest.slice(1).map((a) => Number(String(a).split(':').pop()));
+      if (ports.some((p) => !Number.isInteger(p) || p < 1)) usage();
+      for (const port of ports) {
+        send({ cmd: 'unforward', port }, () => console.log('Stopped forwarding ' + port + '.'));
+      }
     }
-    if (res.detected && res.detected.length) console.log('Detected (listening, not forwarded): ' + res.detected.join(', '));
-  });
-} else if (cmd === 'forward' || cmd === 'unforward') {
-  const port = Number(rest[0]);
-  if (!Number.isInteger(port)) usage();
-  send({ cmd, port }, (res) => {
-    if (cmd === 'forward') console.log('Forwarding guest ' + res.remotePort + ' -> host localhost:' + res.localPort + ' (visible in the Ports panel).');
-    else console.log('Stopped forwarding ' + port + '.');
-  });
+  } else usage();
 } else usage();
 `;
 }

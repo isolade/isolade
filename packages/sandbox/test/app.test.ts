@@ -71,7 +71,7 @@ describe("sandbox app HTTP routes", () => {
     const res = await app.request("/vms", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image: "test-image", ports: [{ remote: 3000 }] }),
+      body: JSON.stringify({ image: "test-image", ports: [{ remote: 3000 }], clientId: "host" }),
     });
 
     expect(res.status).toBe(201);
@@ -81,8 +81,23 @@ describe("sandbox app HTTP routes", () => {
     });
     expect(manager.calls[0]).toEqual({
       method: "create",
-      args: [{ image: "test-image", ports: [{ remote: 3000 }] }],
+      args: [{ image: "test-image", ports: [{ remote: 3000 }], clientId: "host" }],
     });
+  });
+
+  it("refuses to create a VM without a client identity", async () => {
+    const manager = new FakeVmManager();
+    const app = createSandboxApp({ vmManager: manager });
+
+    const res = await app.request("/vms", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image: "test-image" }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "clientId required" });
+    expect(manager.calls).toEqual([]);
   });
 
   it("stops a VM without removing it", async () => {
@@ -140,16 +155,18 @@ describe("sandbox app HTTP routes", () => {
   });
 
   it("streams build logs and the final image id", async () => {
+    const clients: string[] = [];
     const app = createSandboxApp({
       vmManager: new FakeVmManager(),
-      async *runBuild(_tarStream) {
+      async *runBuild(_tarStream, clientId) {
+        clients.push(clientId);
         yield "first line";
         yield "second line";
         return "localhost:5000/isolade/image:latest";
       },
     });
 
-    const res = await app.request("/builds", {
+    const res = await app.request("/builds?client=host", {
       method: "POST",
       body: "tar",
     });
@@ -161,23 +178,39 @@ describe("sandbox app HTTP routes", () => {
     expect(text).toContain("data: second line");
     expect(text).toContain("event: done");
     expect(text).toContain('data: {"imageId":"localhost:5000/isolade/image:latest"}');
+    expect(clients).toEqual(["host"]);
   });
 
   it("requires a body for builds", async () => {
     const app = createSandboxApp({ vmManager: new FakeVmManager() });
 
-    const res = await app.request("/builds", { method: "POST" });
+    const res = await app.request("/builds?client=host", { method: "POST" });
 
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: "request body required" });
   });
 
-  it("streams registry gc progress and forwards the keep set", async () => {
-    const calls: { keep: string[] }[] = [];
+  it("refuses a build without a client identity", async () => {
     const app = createSandboxApp({
       vmManager: new FakeVmManager(),
-      async runRegistryGc(keep, log) {
-        calls.push({ keep });
+      // eslint-disable-next-line require-yield
+      async *runBuild() {
+        throw new Error("should not be called");
+      },
+    });
+
+    const res = await app.request("/builds", { method: "POST", body: "tar" });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "client query parameter required" });
+  });
+
+  it("streams registry gc progress and forwards the keep set", async () => {
+    const calls: { keep: string[]; clientId: string }[] = [];
+    const app = createSandboxApp({
+      vmManager: new FakeVmManager(),
+      async runRegistryGc(keep, clientId, log) {
+        calls.push({ keep, clientId });
         log?.("deleted isolade/old:latest");
       },
     });
@@ -185,15 +218,33 @@ describe("sandbox app HTTP routes", () => {
     const res = await app.request("/registry/gc", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ keep: ["host:5001/isolade/abc:latest"] }),
+      body: JSON.stringify({ keep: ["host:5001/isolade/abc:latest"], clientId: "host" }),
     });
     const text = await res.text();
 
     expect(res.status).toBe(200);
-    expect(calls).toEqual([{ keep: ["host:5001/isolade/abc:latest"] }]);
+    expect(calls).toEqual([{ keep: ["host:5001/isolade/abc:latest"], clientId: "host" }]);
     expect(text).toContain("event: log");
     expect(text).toContain("data: deleted isolade/old:latest");
     expect(text).toContain("event: done");
+  });
+
+  it("refuses a registry gc without a client identity", async () => {
+    const app = createSandboxApp({
+      vmManager: new FakeVmManager(),
+      async runRegistryGc() {
+        throw new Error("should not be called");
+      },
+    });
+
+    const res = await app.request("/registry/gc", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ keep: [] }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "clientId required" });
   });
 
   it("rejects malformed registry gc payloads", async () => {
@@ -227,7 +278,7 @@ describe("sandbox app HTTP routes", () => {
       const res = await app.request("/registry/gc", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ keep: [] }),
+        body: JSON.stringify({ keep: [], clientId: "host" }),
       });
       const text = await res.text();
       expect(res.status).toBe(200);

@@ -6,9 +6,18 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+### Added
+
+- Developing Isolade within Isolade got easier. A nested instance now starts
+  with the host profiles listed under `seed_profiles` already built and ready to
+  run, and providers stay signed in across nested instances after a single
+  login.
+- Port forwards can now pin the host port with `isolade ports add 8080:8080`.
+  This supersedes the previous `isolade forward` syntax.
+
 ### Fixed
 
-- Fix the chat Stop button for OpenAI models so it properly stops the active
+- Fixed the chat Stop button for OpenAI models so it properly stops the active
   response instead of only disconnecting the visible stream.
 
 ## [0.1.0] - 2026-07-15

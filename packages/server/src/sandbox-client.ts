@@ -1,6 +1,7 @@
 import { parseSse } from "@isolade/shared";
 import {
   errorResponseSchema,
+  HOST_CLIENT_ID,
   type NetworkConfig,
   type PortForward,
   type SandboxSecret,
@@ -10,6 +11,15 @@ import {
   sandboxVmCreateRequestSchema,
   sandboxVmCreateResponseSchema,
 } from "./contracts";
+import {
+  CLIENT_ID_ENV,
+  MOUNT_MAP_ENV,
+  type MountMapEntry,
+  parseMountMap,
+  translateHostPath,
+} from "./mount-map";
+
+export { HOST_CLIENT_ID };
 
 export type PortForwardBinding = PortForward;
 export type SandboxVolumeBinding = SandboxVolume;
@@ -80,6 +90,15 @@ export interface SandboxApi {
   getStats(): Promise<unknown>;
   waitUntilReady(timeoutMs?: number): Promise<boolean>;
   garbageCollect(keep: string[], onLog?: (line: string) => void): Promise<void>;
+  // Client registry (multi-server image retention + VM ownership, see
+  // packages/sandbox/src/clients.ts). `registerKeepSet` replaces `clientId`'s
+  // retention set without sweeping (the host pre-protects refs it seeds into a
+  // nested instance). `listClients` returns every registered client id (boot
+  // reconciliation). `removeClient` cascades a deleted nested client: its VMs
+  // are destroyed, its keep-set dropped, and the caches swept.
+  registerKeepSet(clientId: string, keep: string[]): Promise<void>;
+  listClients(): Promise<string[]>;
+  removeClient(clientId: string): Promise<void>;
 }
 
 async function getErrorMessage(resp: Response): Promise<string> {
@@ -92,13 +111,50 @@ async function getErrorMessage(resp: Response): Promise<string> {
 
 export class SandboxClient implements SandboxApi {
   private wsBase: string;
+  /** This server's sandbox client identity. "host" unless the host injected a
+   * nested identity at dev-VM create (ISOLADE_CLIENT_ID). */
+  private clientId: string;
+  /** Nested-mode mount map (ISOLADE_MOUNT_MAP), null when not nested. */
+  private mountMap: MountMapEntry[] | null;
 
-  constructor(private baseUrl: string) {
+  constructor(
+    private baseUrl: string,
+    opts: { clientId?: string; mountMap?: MountMapEntry[] | null } = {},
+  ) {
     this.wsBase = baseUrl.replace(/^http/, "ws");
+    this.clientId = opts.clientId ?? process.env[CLIENT_ID_ENV] ?? HOST_CLIENT_ID;
+    this.mountMap =
+      opts.mountMap !== undefined ? opts.mountMap : parseMountMap(process.env[MOUNT_MAP_ENV]);
+  }
+
+  // Nested mode: rewrite each volume's hostPath (a path in THIS guest's
+  // filesystem) to its host backing path via the injected mount map, and drop
+  // any volume that no host-backed mount covers — the host runtime could only
+  // bind a nonexistent path. See mount-map.ts. Passthrough when not nested.
+  private translateVolumes(volumes: SandboxVolumeBinding[] | undefined) {
+    if (!this.mountMap || !volumes) return volumes;
+    const out: SandboxVolumeBinding[] = [];
+    for (const vol of volumes) {
+      const hostPath = translateHostPath(this.mountMap, vol.hostPath);
+      if (hostPath === null) {
+        console.warn(
+          `[sandbox-client] dropping volume ${vol.guestPath}: ${vol.hostPath} is not ` +
+            `under any host-backed mount of this dev VM (add it to the dev profile's ` +
+            `[runtime].caches to make it mountable in nested agent VMs)`,
+        );
+        continue;
+      }
+      out.push({ ...vol, hostPath });
+    }
+    return out;
   }
 
   async createVm(opts: CreateVmOpts): Promise<{ vmId: string; ports: PortForwardBinding[] }> {
-    const body = sandboxVmCreateRequestSchema.parse(opts);
+    const body = sandboxVmCreateRequestSchema.parse({
+      ...opts,
+      volumes: this.translateVolumes(opts.volumes),
+      clientId: this.clientId,
+    });
     const resp = await fetch(`${this.baseUrl}/vms`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -337,7 +393,7 @@ export class SandboxClient implements SandboxApi {
   }
 
   async build(tarStream: ReadableStream | null, onLog: (line: string) => void): Promise<string> {
-    const resp = await fetch(`${this.baseUrl}/builds`, {
+    const resp = await fetch(`${this.baseUrl}/builds?client=${encodeURIComponent(this.clientId)}`, {
       method: "POST",
       headers: {
         "content-type": "application/octet-stream",
@@ -394,15 +450,16 @@ export class SandboxClient implements SandboxApi {
     return false;
   }
 
-  // Asks the sandbox to keep only the given image refs (and the implicit
-  // base-pass refs the builder pairs with them) and reclaim everything else
-  // from the local registry. Streams progress lines via `onLog`. Throws on
-  // an SSE `error` event. Otherwise it resolves once `done` is received.
+  // Registers this client's keep-set with the sandbox and asks it to reclaim
+  // everything outside the union of ALL clients' keep-sets (the host plus any
+  // nested isolade instances sharing the runtime). Streams progress lines via
+  // `onLog`. Throws on an SSE `error` event. Otherwise it resolves once `done`
+  // is received.
   async garbageCollect(keep: string[], onLog: (line: string) => void = () => {}): Promise<void> {
     const resp = await fetch(`${this.baseUrl}/registry/gc`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ keep }),
+      body: JSON.stringify({ keep, clientId: this.clientId }),
       // Manifest+blob deletion across a large registry can sit silent for
       // long stretches, so bypass Bun's default fetch timeout the same way the
       // build endpoint does.
@@ -416,6 +473,39 @@ export class SandboxClient implements SandboxApi {
     for await (const ev of parseSse(resp.body, { idleTimeoutMs: 0 })) {
       if (ev.event === "log") onLog(ev.data);
       else if (ev.event === "error") throw new Error(`registry gc error: ${ev.data}`);
+    }
+  }
+
+  async registerKeepSet(clientId: string, keep: string[]): Promise<void> {
+    const resp = await fetch(`${this.baseUrl}/clients/${encodeURIComponent(clientId)}/keep`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ keep }),
+    });
+    if (!resp.ok) {
+      throw new Error(`registerKeepSet ${clientId}: ${await getErrorMessage(resp)}`);
+    }
+  }
+
+  async listClients(): Promise<string[]> {
+    const resp = await fetch(`${this.baseUrl}/clients`);
+    if (!resp.ok) throw new Error(`listClients: ${await getErrorMessage(resp)}`);
+    const body = (await resp.json()) as { clients?: unknown };
+    return Array.isArray(body.clients)
+      ? body.clients.filter((c): c is string => typeof c === "string")
+      : [];
+  }
+
+  async removeClient(clientId: string): Promise<void> {
+    const resp = await fetch(`${this.baseUrl}/clients/${encodeURIComponent(clientId)}`, {
+      method: "DELETE",
+      // The cascade removes VMs and sweeps caches, which can sit silent for a
+      // while on a big cache, so bypass Bun's default fetch timeout.
+      // @ts-ignore: Bun-specific option
+      timeout: false,
+    });
+    if (!resp.ok) {
+      throw new Error(`removeClient ${clientId}: ${await getErrorMessage(resp)}`);
     }
   }
 }

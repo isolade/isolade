@@ -39,9 +39,11 @@ const HOST = "127.0.0.1";
  * the host listeners. The server (InstanceManager) owns which ports *should* be
  * forwarded and when. */
 export interface GuestForwarder {
-  /** Open (or return the existing) forward from a fresh host loopback port to
-   * `remotePort` inside the VM. Idempotent per (vmId, remotePort). */
-  open(vmId: string, remotePort: number): Promise<PortForwardBinding>;
+  /** Open (or return the existing) forward from a host loopback port to
+   * `remotePort` inside the VM. Idempotent per (vmId, remotePort). The host
+   * port is ephemeral unless `hostPort` PINS it (see openLoopbackRelay); a
+   * pinned open rejects when the port is taken. */
+  open(vmId: string, remotePort: number, hostPort?: number): Promise<PortForwardBinding>;
   /** Close a single forward, tearing down its listener and live connections. */
   close(vmId: string, remotePort: number): void;
   /** Currently-open forwards for a VM, in insertion order. */
@@ -84,26 +86,52 @@ export class ExecRelayForwarder implements GuestForwarder {
     this.relayWritten.add(vmId);
   }
 
-  open(vmId: string, remotePort: number): Promise<PortForwardBinding> {
-    const existing = this.forVm(vmId).get(remotePort);
-    if (existing) return Promise.resolve(existing.binding);
+  async open(vmId: string, remotePort: number, hostPort?: number): Promise<PortForwardBinding> {
     const key = `${vmId}:${remotePort}`;
-    let pending = this.opening.get(key);
-    if (!pending) {
-      pending = this.doOpen(vmId, remotePort).finally(() => this.opening.delete(key));
-      this.opening.set(key, pending);
+    // Wait out any in-flight open for this guest port rather than joining its
+    // promise: the pending open may carry a DIFFERENT host-port pin, and a
+    // pinned request must never be silently answered with an ephemeral-port
+    // binding (the whole point of the pin is that something external dials
+    // that exact number). Once it settles, re-evaluate against the result.
+    while (this.opening.has(key)) {
+      await this.opening.get(key)?.catch(() => {});
     }
+    const existing = this.forVm(vmId).get(remotePort);
+    if (existing && (hostPort === undefined || existing.binding.localPort === hostPort)) {
+      return existing.binding;
+    }
+    // No forward yet, or an existing one on the wrong host port: open (and on
+    // success replace — see doOpen, which only tears the old forward down
+    // after the new listener is bound, so a failed pinned bind leaves the
+    // previous forward untouched).
+    const pending = this.doOpen(vmId, remotePort, hostPort).finally(() => this.opening.delete(key));
+    this.opening.set(key, pending);
     return pending;
   }
 
-  private async doOpen(vmId: string, remotePort: number): Promise<PortForwardBinding> {
+  private async doOpen(
+    vmId: string,
+    remotePort: number,
+    hostPort?: number,
+  ): Promise<PortForwardBinding> {
     await this.ensureRelayScript(vmId);
     const server = openLoopbackRelay({
       transport: this.sandbox,
       vmId,
       relayPath: RELAY_PATH,
       target: remotePort,
+      hostPort,
     });
+
+    // The new listener is bound. Only now replace a prior forward for this
+    // guest port (the pin-mismatch reopen), so a bind failure above threw
+    // without destroying anything.
+    const prior = this.forVm(vmId).get(remotePort);
+    if (prior) {
+      try {
+        prior.server.stop(true);
+      } catch {}
+    }
 
     const binding: PortForwardBinding = {
       address: HOST,

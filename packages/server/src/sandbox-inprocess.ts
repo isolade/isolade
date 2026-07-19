@@ -1,11 +1,12 @@
 import type { SandboxRuntime } from "@isolade/sandbox/runtime";
-import type {
-  CreateVmOpts,
-  ExecInteractiveOpts,
-  ExecResult,
-  ExecStreamOpts,
-  SandboxApi,
-  VmHandle,
+import {
+  type CreateVmOpts,
+  type ExecInteractiveOpts,
+  type ExecResult,
+  type ExecStreamOpts,
+  HOST_CLIENT_ID,
+  type SandboxApi,
+  type VmHandle,
 } from "./sandbox-client";
 
 // In-process implementation of SandboxApi: drives the sandbox runtime objects
@@ -18,11 +19,13 @@ export class InProcessSandboxClient implements SandboxApi {
 
   // The wire request type and VmManager's VmCreateOpts are structurally the
   // same shape (the HTTP route passes the parsed body straight through). The
-  // cast bridges the two nominal types without a runtime round-trip.
+  // cast bridges the two nominal types without a runtime round-trip. In-process
+  // calls are by definition the host's own, so they're stamped "host".
   async createVm(opts: CreateVmOpts): Promise<VmHandle> {
-    return this.runtime.vmManager.create(
-      opts as Parameters<SandboxRuntime["vmManager"]["create"]>[0],
-    );
+    return this.runtime.vmManager.create({
+      ...opts,
+      clientId: HOST_CLIENT_ID,
+    } as Parameters<SandboxRuntime["vmManager"]["create"]>[0]);
   }
 
   async destroyVm(vmId: string): Promise<void> {
@@ -67,7 +70,7 @@ export class InProcessSandboxClient implements SandboxApi {
 
   async build(tarStream: ReadableStream | null, onLog: (line: string) => void): Promise<string> {
     if (!tarStream) throw new Error("build: request body required");
-    const gen = this.runtime.builder.runBuild(tarStream);
+    const gen = this.runtime.builder.runBuild(tarStream, HOST_CLIENT_ID);
     while (true) {
       const result = await gen.next();
       if (result.done) return result.value;
@@ -86,6 +89,18 @@ export class InProcessSandboxClient implements SandboxApi {
   }
 
   async garbageCollect(keep: string[], onLog: (line: string) => void = () => {}): Promise<void> {
-    await this.runtime.builder.runRegistryGc(keep, onLog);
+    await this.runtime.builder.runRegistryGc(keep, HOST_CLIENT_ID, onLog);
+  }
+
+  async registerKeepSet(clientId: string, keep: string[]): Promise<void> {
+    await this.runtime.registerKeepSet(clientId, keep);
+  }
+
+  async listClients(): Promise<string[]> {
+    return this.runtime.listClients();
+  }
+
+  async removeClient(clientId: string): Promise<void> {
+    await this.runtime.removeClient(clientId);
   }
 }

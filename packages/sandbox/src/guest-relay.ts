@@ -205,23 +205,30 @@ export interface RelayTransport {
   ): Promise<{ exitCode: number }>;
 }
 
-/** Open a host loopback listener on an ephemeral port. Each accepted connection
- * runs a guest relay process (`node <relayPath> <target>`) over its own exec
- * stream and is bridged to it by a SocketPump, so the connection terminates on
- * the guest target (a loopback TCP port or a unix socket path). The caller must
- * have written `buildRelayScript()` to `relayPath` first. Returns the listener.
- * Read `.port` for the host port and call `.stop(true)` to tear it down. */
+/** Open a host loopback listener fronting a guest target. Each accepted
+ * connection runs a guest relay process (`node <relayPath> <target>`) over its
+ * own exec stream and is bridged to it by a SocketPump, so the connection
+ * terminates on the guest target (a loopback TCP port or a unix socket path).
+ * The caller must have written `buildRelayScript()` to `relayPath` first.
+ * Returns the listener. Read `.port` for the host port and call `.stop(true)`
+ * to tear it down.
+ *
+ * The listener binds an ephemeral port by default (no collision race). Pass
+ * `hostPort` to PIN it — needed when an external party dials the host port by
+ * a fixed number (an OAuth redirect_uri's `localhost:K`). A pinned bind throws
+ * if the port is taken; that's the caller's collision to surface. */
 export function openLoopbackRelay(opts: {
   transport: RelayTransport;
   vmId: string;
   relayPath: string;
   target: number | string;
+  hostPort?: number;
 }): TCPSocketListener<SocketPump> {
   const { transport, vmId, relayPath, target } = opts;
   const command = `node ${relayPath} ${target}`;
   return Bun.listen<SocketPump>({
     hostname: HOST,
-    port: 0, // ephemeral, the kernel hands us a free port, no collision race
+    port: opts.hostPort ?? 0,
     socket: {
       open: (client: Socket<SocketPump>) => {
         // The host listener accepted a client (e.g. a browser, or the ttyd WS

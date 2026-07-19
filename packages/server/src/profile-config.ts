@@ -288,6 +288,13 @@ export const profileConfigSchema = z
     // (and the resolution onto the instance row), so toggling it does not change
     // existing instances. Recreate them to pick up the new value.
     expose_sandbox: z.boolean().default(false),
+    // DEV-ONLY, requires expose_sandbox: host profile ids seeded into the
+    // nested isolade at instance create — their config dirs plus their built
+    // image refs (valid in the shared sandbox cache), so the nested instance
+    // starts with runnable profiles and no rebuild. Snapshot at create; no
+    // auth tokens or secret values ride along (see seed.ts). Like
+    // expose_sandbox, the grant is frozen per instance at create.
+    seed_profiles: z.array(z.string().min(1)).default([]),
     secrets: z.array(secretConfigSchema).default([]),
   })
   .strict();
@@ -394,6 +401,9 @@ export interface ResolvedProfileConfig {
   /** DEV-ONLY: expose the host's in-process sandbox API inside the VM (isolade
    * within isolade). See sandbox-forward.ts. Off unless the profile opts in. */
   exposeSandbox: boolean;
+  /** DEV-ONLY: host profile ids to seed into the nested isolade (config dirs +
+   * built image refs). Only meaningful with exposeSandbox. See seed.ts. */
+  seedProfiles: string[];
   /** Prepended to the first user message of every new chat. */
   prelude: string | null;
   /** Skill packages to install via `npx skills add` in the agent layer. */
@@ -658,6 +668,7 @@ export function loadProfileConfig(profileId: string): ResolvedProfileConfig {
       caches: resolveCacheMounts(profileId, config.runtime?.caches ?? []),
       hostPorts: config.network?.host_ports ?? [],
       exposeSandbox: config.expose_sandbox,
+      seedProfiles: config.seed_profiles,
       prelude: config.prompt?.prelude || null,
       skills: build.skills,
       secrets: resolveSecretDeclarations(config.secrets),

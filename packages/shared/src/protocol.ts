@@ -3,6 +3,10 @@ import { networkConfigSchema } from "./api";
 import { secretInjectModeSchema } from "./base";
 import { portForwardSchema } from "./domain";
 
+/** The sandbox client identity of the host server's own calls. Nested clients
+ * (isolade-in-isolade dev VMs) identify as their instance id instead. */
+export const HOST_CLIENT_ID = "host";
+
 export const sandboxVolumeSchema = z.object({
   // Path inside the guest. May start with ~/ or $HOME/, resolved against
   // the image's runtime HOME on the sandbox side.
@@ -36,6 +40,14 @@ export const sandboxVmCreateRequestSchema = z.object({
   // Global network posture. Absent → the sandbox applies the "open internet,
   // no local/host access" default, matching pre-feature behavior.
   network: networkConfigSchema.optional(),
+  // Which sandbox client is creating this VM. Stamped by the client
+  // implementation itself ("host" for the host server's own calls, the dev-VM
+  // instance id for a nested isolade). Drives VM ownership and image-retention
+  // bookkeeping in the sandbox's client registry. REQUIRED: the sandbox
+  // refuses identity-less requests rather than defaulting them to the host,
+  // so a caller that predates the client registry fails loudly instead of
+  // masquerading as the host (and clobbering its retention bookkeeping).
+  clientId: z.string().min(1),
 });
 
 export const sandboxVmCreateResponseSchema = z.object({

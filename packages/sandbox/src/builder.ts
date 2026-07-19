@@ -10,6 +10,7 @@ import {
   runMicrosandboxGc,
   runRegistryGarbageCollect,
 } from "./builds";
+import { addToKeepSet, keepUnion, setKeepSet } from "./clients";
 import {
   detectHostIp,
   getLocalRegistryLoopbackEndpoint,
@@ -402,7 +403,12 @@ export class BuilderManager {
   // the main buildctl context. Builder responsibilities are mechanical:
   // extract the tar, register the buildctl `--local`s in lockstep with the
   // user Dockerfile's `COPY --from=<name>` lines, push.
-  async *runBuild(tarStream: ReadableStream): AsyncGenerator<string, string> {
+  //
+  // `clientId` is the caller's identity in the client registry (clients.ts),
+  // required so the fresh ref lands in the right keep-set. Deliberately no
+  // "host" default: identity-less callers must be refused at the transport,
+  // never silently treated as the host.
+  async *runBuild(tarStream: ReadableStream, clientId: string): AsyncGenerator<string, string> {
     let release!: () => void;
     const next = new Promise<void>((r) => {
       release = r;
@@ -412,7 +418,7 @@ export class BuilderManager {
     try {
       await prev.catch(() => {});
       try {
-        return yield* this.doRunBuild(tarStream);
+        return yield* this.doRunBuild(tarStream, clientId);
       } finally {
         // Shut the builder VM down between builds. The cache disk is a
         // host-side ext4 image that survives the VM's lifetime, so the next
@@ -427,7 +433,10 @@ export class BuilderManager {
     }
   }
 
-  private async *doRunBuild(tarStream: ReadableStream): AsyncGenerator<string, string> {
+  private async *doRunBuild(
+    tarStream: ReadableStream,
+    clientId: string,
+  ): AsyncGenerator<string, string> {
     // ensureBuilder() boots the VM if needed, which is what brings up the
     // libkrun bridge interface. Only after that can ensureConfig() detect
     // the host IP and resolve the registry endpoint.
@@ -648,6 +657,13 @@ export class BuilderManager {
       yield line;
     }
 
+    // Register the fresh ref in the building client's keep-set NOW, while this
+    // build still holds the opChain slot. Any sweep queued behind us computes
+    // its union after this line runs, so there is no window in which another
+    // client's GC can collect an image that was just built. The client's next
+    // full keep-set registration (its post-build GC) subsumes this entry.
+    addToKeepSet(clientId, finalRefCache);
+
     // With the image safely materialized in microsandbox's cache, the
     // registry blob copy is redundant. Drop it now (under the same opChain
     // slot the build holds) so the registry doesn't accumulate per-build
@@ -826,16 +842,45 @@ export class BuilderManager {
     }
   }
 
-  // Reclaim both layers of image storage:
+  // Register the calling client's keep-set, then sweep both layers of image
+  // storage down to the UNION of every registered client's keep-set:
   //   1) the in-process OCI registry's manifests + blobs (BuildKit pushes
   //      every workspace build here).
   //   2) microsandbox's local image cache at ~/.microsandbox/cache/ (rows in
   //      msb.db + the per-layer .erofs / per-manifest fsmeta+vmdk files).
-  // Both share the keep set (full image refs like `<host:port>/isolade/
-  // <uid>:latest`) and need the same serialization (the registry forbids
-  // concurrent pushes during garbage-collect, and msb.db musn't be touched
-  // mid-pull). opChain handles the latter.
-  async runRegistryGc(keep: string[], log: (line: string) => void = () => {}): Promise<void> {
+  //
+  // Union semantics are what makes the shared runtime safe for more than one
+  // isolade server (the host + nested `expose_sandbox` dev instances): each
+  // caller only DECLARES what it needs, and nothing another client still
+  // retains is ever collected. The failure direction is a bounded leak (a
+  // stale keep-set retains images until its client is removed), never a
+  // clobber. See clients.ts.
+  //
+  // Both layers need the same serialization (the registry forbids concurrent
+  // pushes during garbage-collect, and msb.db mustn't be touched mid-pull).
+  // opChain handles that.
+  //
+  // `clientId` names whose keep-set `keep` replaces — required, with no
+  // "host" default, so an identity-less caller can never shrink the host's
+  // keep-set by accident (the transport refuses such requests instead).
+  async runRegistryGc(
+    keep: string[],
+    clientId: string,
+    log: (line: string) => void = () => {},
+  ): Promise<void> {
+    await this.runClientSweep(log, () => setKeepSet(clientId, keep));
+  }
+
+  // Replace a client's keep-set inside an opChain slot, with no sweep. The
+  // write itself is a plain synchronous file update; what the slot buys is a
+  // happens-after edge for callers that PRE-PROTECT refs they are about to
+  // hand out (the host server seeding a dev VM): once this resolves, every
+  // earlier-queued sweep has fully finished, so no sweep whose union predates
+  // this registration is still deleting. A ref the caller's source of truth
+  // still lists after this returns is therefore alive; one that was replaced
+  // while we waited may already be collected, which the caller detects by
+  // re-reading that source (see InstanceManager.registerSeedKeepSet).
+  async runKeepSetRegistration(clientId: string, keep: readonly string[]): Promise<void> {
     let release!: () => void;
     const next = new Promise<void>((r) => {
       release = r;
@@ -844,6 +889,36 @@ export class BuilderManager {
     this.opChain = next;
     try {
       await prev.catch(() => {});
+      setKeepSet(clientId, keep);
+    } finally {
+      release();
+    }
+  }
+
+  // Sweep both storage layers against the union of all registered keep-sets.
+  // `register` (when given) runs INSIDE the opChain slot, before the union is
+  // computed: a keep-set REPLACEMENT snapshotted from a client's DB before an
+  // in-flight build memoized its ref must not land after that build's
+  // addToKeepSet, or it would erase the fresh ref right before this sweep.
+  // Serializing the registration behind the build closes that ordering.
+  // Client removal calls this with no registration (the dropped keep-set makes
+  // that client's images sweepable).
+  async runClientSweep(
+    log: (line: string) => void = () => {},
+    register?: () => void,
+  ): Promise<void> {
+    let release!: () => void;
+    const next = new Promise<void>((r) => {
+      release = r;
+    });
+    const prev = this.opChain;
+    this.opChain = next;
+    try {
+      await prev.catch(() => {});
+      register?.();
+      // The union is computed inside the opChain slot, after any in-flight
+      // build has registered its fresh ref (see doRunBuild).
+      const keep = keepUnion();
       // GC only needs to talk to the local in-process registry, which is
       // reachable via loopback regardless of whether the libkrun bridge IP
       // exists yet (on macOS, bridge100 only appears once the first VM has

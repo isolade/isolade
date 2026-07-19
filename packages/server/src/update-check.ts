@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { UpdateStatus } from "./contracts";
 import type { Db } from "./db";
+import { isNestedInstance } from "./mount-map";
 import { type LatestInfo, UpdateCheckStore } from "./update-check-store";
 
 const UPDATE_URL = process.env.ISOLADE_UPDATE_URL || "https://isolade.com/api/update";
@@ -174,10 +175,11 @@ export async function resolveAndMaybeCount(
   current: string,
   plat: string,
   now: Date = new Date(),
+  nested: boolean = isNestedInstance(),
 ): Promise<UpdateStatus> {
   const state = store.read();
   const lastChecked = state.lastCheckedAt !== null ? new Date(state.lastCheckedAt) : null;
-  const periods = derivePeriods(lastChecked, now);
+  const periods = nested ? [] : derivePeriods(lastChecked, now);
 
   const fetched = await fetchLatest(plat, periods, current); // never throws, null on failure
   if (!fetched) return toStatus(current, state.latest, state.lastCheckedAt);

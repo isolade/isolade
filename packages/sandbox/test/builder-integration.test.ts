@@ -116,7 +116,7 @@ ctx("BuilderManager integration", () => {
       const tar = await makeTar({
         Dockerfile: "FROM alpine:3.19\nRUN echo hello > /hello.txt\n",
       });
-      const { logs, result } = await drain(builder.runBuild(tar));
+      const { logs, result } = await drain(builder.runBuild(tar, "host"));
 
       expect(result).toMatch(/^[\w.-]+:\d+\/isolade\/[\w.-]+:latest$/);
       const joined = logs.join("\n");
@@ -146,7 +146,7 @@ ctx("BuilderManager integration", () => {
         "context/hello.txt": "hi from context\n",
         "repos/test/payload.txt": "hi from repo\n",
       });
-      const { result } = await drain(builder.runBuild(tar));
+      const { result } = await drain(builder.runBuild(tar, "host"));
       expect(result).toMatch(/\/isolade\//);
     },
     BUILD_TIMEOUT_MS,
@@ -158,7 +158,7 @@ ctx("BuilderManager integration", () => {
       const tar = await makeTar({
         Dockerfile: "FROM alpine:3.19\nRUN exit 17\n",
       });
-      await expect(drain(builder.runBuild(tar))).rejects.toThrow();
+      await expect(drain(builder.runBuild(tar, "host"))).rejects.toThrow();
     },
     BUILD_TIMEOUT_MS,
   );
@@ -178,7 +178,7 @@ ctx("BuilderManager integration", () => {
         "context/blob.bin": blob,
       });
       try {
-        const { result } = await drain(builder.runBuild(tar));
+        const { result } = await drain(builder.runBuild(tar, "host"));
         expect(result).toMatch(/\/isolade\/[\w.-]+:latest$/);
       } catch (err) {
         const logs = (err as { logs?: string[] }).logs ?? [];
