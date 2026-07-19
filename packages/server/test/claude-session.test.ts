@@ -34,6 +34,7 @@ function sessionFor(proc: FakeProc, onExit: () => void = () => {}) {
     // Large enough that the safety-net timers never fire mid-test.
     interruptGraceMs: 60_000,
     shutdownGraceMs: 60_000,
+    controlTimeoutMs: 60_000,
   });
 }
 
@@ -112,10 +113,7 @@ describe("ClaudeSession", () => {
     expect(proc.interrupts().length).toBe(1);
 
     // The CLI acks (swallowed), injects the synthetic turn, and ends the turn.
-    proc.emit({
-      type: "control_response",
-      response: { subtype: "success", request_id: "int-1" },
-    });
+    proc.succeedControl(proc.interrupts()[0]);
     proc.emit({
       type: "user",
       message: {
@@ -185,5 +183,99 @@ describe("ClaudeSession", () => {
         hooks: makeHooks().hooks,
       }),
     ).rejects.toThrow(/abort/i);
+  });
+
+  it("changes model and effort through correlated controls without restarting", async () => {
+    const proc = new FakeProc();
+    const session = sessionFor(proc);
+
+    const changed = session.reconfigure("claude-opus-4-8", "max");
+    await tick();
+    const modelControl = proc.controls("set_model")[0];
+    expect(modelControl.request).toEqual({
+      subtype: "set_model",
+      model: "claude-opus-4-8",
+    });
+    proc.succeedControl(modelControl);
+
+    await tick();
+    const effortControl = proc.controls("apply_flag_settings")[0];
+    expect(effortControl.request).toEqual({
+      subtype: "apply_flag_settings",
+      settings: { effortLevel: "max" },
+    });
+    proc.succeedControl(effortControl);
+
+    await changed;
+    expect(session.model).toBe("claude-opus-4-8");
+    expect(session.effort).toBe("max");
+    expect(session.isDead()).toBe(false);
+
+    const sd = session.shutdown();
+    proc.exit(0);
+    await sd;
+  });
+
+  it("rejects a failed control and keeps the prior configuration", async () => {
+    const proc = new FakeProc();
+    const session = sessionFor(proc);
+
+    const changed = session.reconfigure("claude-opus-4-8", "high");
+    await tick();
+    proc.failControl(proc.controls("set_model")[0], "unsupported control");
+
+    await expect(changed).rejects.toThrow(/set_model.*unsupported control/);
+    expect(session.model).toBe("claude-sonnet-4-6");
+    expect(session.isDead()).toBe(false);
+
+    const sd = session.shutdown();
+    proc.exit(0);
+    await sd;
+  });
+
+  it("rejects pending controls when the process exits", async () => {
+    const proc = new FakeProc();
+    const session = sessionFor(proc);
+
+    const context = session.getContextUsage();
+    await tick();
+    proc.exit(1);
+
+    await expect(context).rejects.toThrow(/exited with code 1/);
+    expect(session.isDead()).toBe(true);
+  });
+
+  it("preserves UTF-8 characters split across stdout chunks", async () => {
+    const proc = new FakeProc();
+    const session = sessionFor(proc);
+    const turn = session.runTurn({ userText: "hi", hooks: makeHooks().hooks });
+    const encoded = Buffer.from(`${JSON.stringify({ type: "result", result: "café 🦀" })}\n`);
+    const emojiStart = encoded.indexOf(Buffer.from("🦀"));
+    proc.emitStdout(encoded.subarray(0, emojiStart + 2));
+    proc.emitStdout(encoded.subarray(emojiStart + 2));
+
+    expect((await turn).content).toBe("café 🦀");
+    const sd = session.shutdown();
+    proc.exit(0);
+    await sd;
+  });
+
+  it("bounds stderr retained for process errors", async () => {
+    const proc = new FakeProc();
+    const session = sessionFor(proc);
+    const turn = session.runTurn({ userText: "hi", hooks: makeHooks().hooks });
+    proc.emitStderr(`discard-me-${"x".repeat(20_000)}`);
+    proc.emitStderr("tail-marker");
+    proc.exit(1);
+
+    try {
+      await turn;
+      throw new Error("expected turn to reject");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      expect(message.length).toBeLessThan(17_000);
+      expect(message).not.toContain("discard-me");
+      expect(message).toContain("tail-marker");
+    }
   });
 });

@@ -177,13 +177,11 @@ export const chatSchema = z.object({
 });
 export const chatArraySchema = z.array(chatSchema);
 
-// Structured snapshot of `claude -p "/context"` output. Anthropic-only:
-// codex has no equivalent slash command. `available: false` for codex chats
-// (and for claude chats that haven't streamed a turn yet, since without a
-// sessionId there's no thread to probe). When available, `categories` is the
-// estimated usage table (System prompt / System tools / MCP tools / Skills /
-// Messages / Free space / Autocompact buffer). The upstream CLI estimates
-// each line, so percentages may not sum exactly to 100.
+// Structured snapshot of Claude's `get_context_usage` control response.
+// Codex has no equivalent. `available: false` for codex chats and for Claude
+// chats that haven't streamed a turn yet, since there is no thread to probe.
+// The upstream CLI estimates each category, so percentages may not sum exactly
+// to 100.
 export const contextBreakdownCategorySchema = z.object({
   name: z.string(),
   tokens: z.number().int().nonnegative(),

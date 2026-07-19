@@ -3,6 +3,7 @@ import type { ChatEvent } from "../src/chat/backend";
 import { ClaudeBackend } from "../src/chat/claude-backend";
 import type { ChatManager } from "../src/chats";
 import type { SandboxClient } from "../src/sandbox-client";
+import { FakeProc, tick } from "./fake-proc";
 
 // Feeds a fixed list of stream-json lines (one Claude CLI event each) to the
 // stdout callback, then exits, exercising ClaudeBackend's parser without a VM.
@@ -274,32 +275,36 @@ describe("ClaudeBackend stream-json parsing", () => {
     expect(events.some((e) => e.type === "raw")).toBe(true);
   });
 
-  it("probeContext parses the /context token table (k/m suffixes, percentages)", async () => {
-    const report = [
-      "**Tokens:** 19.8k / 200k (10%)",
-      "",
-      "### Estimated usage by category",
-      "| Category | Tokens | % |",
-      "| --- | --- | --- |",
-      "| System prompt | 2.5k | 1.3% |",
-      "| Messages | 17.3k | 8.7% |",
-    ].join("\n");
+  it("probeContext requests structured usage from the persistent process", async () => {
+    const proc = new FakeProc();
     const client = {
-      exec: async () => ({
-        stdout: JSON.stringify({ result: report }),
-        stderr: "",
-        exitCode: 0,
-      }),
+      execStream: proc.execStream,
     };
     const backend = new ClaudeBackend(
       client as unknown as SandboxClient,
       fakeChatManager(() => {}),
     );
-    const bd = await backend.probeContext({
+    const pending = backend.probeContext({
       vmId: "vm",
+      chatId: "chat",
       model: "claude-sonnet-4-5",
+      effort: "high",
       sessionId: "s",
     });
+    await tick();
+    const control = proc.controls("get_context_usage")[0];
+    expect(control).toBeDefined();
+    proc.succeedControl(control, {
+      totalTokens: 19_800,
+      maxTokens: 167_000,
+      rawMaxTokens: 200_000,
+      percentage: 10,
+      categories: [
+        { name: "System prompt", tokens: 2_500, color: "blue" },
+        { name: "Messages", tokens: 17_300, color: "green" },
+      ],
+    });
+    const bd = await pending;
     expect(bd.available).toBe(true);
     if (bd.available) {
       expect(bd.totalTokens).toBe(19_800);
@@ -307,9 +312,15 @@ describe("ClaudeBackend stream-json parsing", () => {
       expect(bd.percent).toBe(10);
       expect(bd.categories).toEqual([
         { name: "System prompt", tokens: 2_500, percent: 1.3 },
-        { name: "Messages", tokens: 17_300, percent: 8.7 },
+        { name: "Messages", tokens: 17_300, percent: 8.6 },
       ]);
     }
+    expect(proc.command).toContain("--input-format stream-json");
+    expect(proc.command).toContain("--resume s");
+    expect(proc.command).not.toContain("/context");
+    backend.disposeChat("chat");
+    proc.exit(0);
+    await tick();
   });
 
   it("generateTitle runs `claude -p` in the VM and parses the result", async () => {
@@ -420,7 +431,9 @@ describe("ClaudeBackend stream-json parsing", () => {
     );
     const bd = await backend.probeContext({
       vmId: "vm",
+      chatId: "chat",
       model: "claude-sonnet-4-5",
+      effort: "high",
     });
     expect(bd.available).toBe(false);
   });

@@ -34,8 +34,8 @@ const DEFAULT_SESSION_IDLE_MS = 15 * 60_000;
 export class ClaudeBackend implements ChatBackend {
   // Anthropic only reports per-turn usage. codex maintains the running total
   // on the wire. We mirror codex by accumulating across turns per chat so the
-  // unified `usage` event always carries both `last` and `total`. Cleared
-  // when the session id is reset (model switch in chats.ts).
+  // unified `usage` event always carries both `last` and `total`. Cleared when
+  // a chat starts without a resumable Claude session.
   private chatTotals = new Map<string, TokenUsage>();
   // Same story for cost: Claude's `total_cost_usd` reports the cost of the
   // current turn only, so we sum it across turns ourselves.
@@ -43,8 +43,9 @@ export class ClaudeBackend implements ChatBackend {
 
   // One long-lived `claude -p --input-format stream-json` process per chat.
   // Reused across turns so the conversation (and any background tasks the
-  // agent spawned) persist. Recreated when the model/effort changes (those
-  // are launch flags) or when the process dies.
+  // agent spawned) persist. Model and effort changes are applied through the
+  // CLI control protocol. A process is recreated only when it dies, moves to
+  // another VM, or rejects a control request.
   private sessions = new Map<string, ClaudeSession>();
   private idleTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly idleMs: number;
@@ -146,44 +147,44 @@ export class ClaudeBackend implements ChatBackend {
     const claudeEffort = CLAUDE_EFFORTS.has(opts.effort) ? opts.effort : undefined;
 
     let session = this.sessions.get(opts.chatId);
-    if (
-      session &&
-      (session.isDead() ||
-        session.vmId !== opts.vmId ||
-        session.model !== opts.model ||
-        session.effort !== claudeEffort)
-    ) {
-      // Model/effort are launch flags (a live process can't switch them), and
-      // a dead or wrong-VM session can't be reused. Retire it (graceful stdin
-      // close) and start fresh. The new process resumes the same conversation
-      // via `--resume`, so context carries across the swap.
+    if (session && (session.isDead() || session.vmId !== opts.vmId)) {
       this.sessions.delete(opts.chatId);
       this.clearIdle(opts.chatId);
       if (!session.isDead()) void session.shutdown();
       session = undefined;
     }
 
+    if (session) {
+      // Don't let an idle timer retire the process while a control request is
+      // waiting for its correlated response.
+      this.clearIdle(opts.chatId);
+      if (session.model !== opts.model || session.effort !== claudeEffort) {
+        try {
+          await session.reconfigure(opts.model, claudeEffort);
+        } catch (err) {
+          // Older or incompatible CLI versions may reject a control. Preserve
+          // compatibility by falling back to the old resume-and-restart path.
+          console.warn("[claude] live model/effort update failed, restarting session:", err);
+          if (this.sessions.get(opts.chatId) === session) {
+            this.sessions.delete(opts.chatId);
+          }
+          if (!session.isDead()) void session.shutdown();
+          session = undefined;
+        }
+      }
+    }
+
     if (!session) {
       // No resume id → brand new session, so the running totals from any
-      // previous chat under this id are stale (model switch clears the id in
-      // chats.ts:updateModel).
+      // previous chat under this id are stale.
       if (!opts.sessionId) this.resetTotals(opts.chatId);
-      const command = this.buildCommand(opts.model, claudeEffort, opts.sessionId);
-      const created = new ClaudeSession({
-        sandboxClient: this.sandboxClient,
-        vmId: opts.vmId,
-        command,
-        model: opts.model,
-        effort: claudeEffort,
-        onExit: () => {
-          // The process ended on its own (VM restart, crash, idle reap that
-          // already closed stdin). Drop it so the next turn starts fresh.
-          if (this.sessions.get(opts.chatId) === created) {
-            this.sessions.delete(opts.chatId);
-            this.clearIdle(opts.chatId);
-          }
-        },
-      });
+      const created = this.createChatSession(
+        opts.chatId,
+        opts.vmId,
+        opts.model,
+        claudeEffort,
+        opts.sessionId,
+      );
       this.sessions.set(opts.chatId, created);
       session = created;
     }
@@ -284,6 +285,31 @@ export class ClaudeBackend implements ChatBackend {
       args.push("--resume", resumeSessionId);
     }
     return args.join(" ");
+  }
+
+  private createChatSession(
+    chatId: string,
+    vmId: string,
+    model: string,
+    effort: string | undefined,
+    sessionId: string | undefined,
+  ): ClaudeSession {
+    const created = new ClaudeSession({
+      sandboxClient: this.sandboxClient,
+      vmId,
+      command: this.buildCommand(model, effort, sessionId),
+      model,
+      effort,
+      onExit: () => {
+        // The process ended on its own (VM restart, crash, idle reap that
+        // already closed stdin). Drop it so the next turn starts fresh.
+        if (this.sessions.get(chatId) === created) {
+          this.sessions.delete(chatId);
+          this.clearIdle(chatId);
+        }
+      },
+    });
+    return created;
   }
 
   private armIdle(chatId: string, session: ClaudeSession): void {
@@ -672,15 +698,14 @@ export class ClaudeBackend implements ChatBackend {
     return { onEvent, onNonJsonLine, getContent: () => fullContent };
   }
 
-  // Run `claude -p "/context"` against the resumed session and parse the
-  // markdown table the CLI prints. We pass `--no-session-persistence` so the
-  // probe doesn't append `<command-name>/context</command-name>` artifacts to
-  // the chat's JSONL log, since those would inflate the `Messages` bucket on the
-  // next real turn. The CLI still loads the resumed history into memory for
-  // the read, so the `Messages` line reflects the live session.
+  // Ask the chat's persistent process for the structured data behind
+  // `/context`. If the process was reaped while idle, resume it once and keep
+  // that replacement as the chat's new live process.
   async probeContext(opts: {
     vmId: string;
+    chatId: string;
     model: string;
+    effort: ChatEffort;
     sessionId?: string;
   }): Promise<ContextBreakdown> {
     if (!opts.sessionId) {
@@ -689,33 +714,51 @@ export class ClaudeBackend implements ChatBackend {
         reason: "no session yet, send a message first",
       };
     }
-    const args = [
-      "claude",
-      "-p",
-      "/context",
-      "--output-format",
-      "json",
-      "--model",
-      opts.model,
-      "--dangerously-skip-permissions",
-      "--strict-mcp-config",
-      "--no-session-persistence",
-      "--resume",
-      opts.sessionId,
-    ];
-    const { stdout, stderr, exitCode } = await this.sandboxClient.exec(opts.vmId, args.join(" "), {
-      timeoutMs: 15_000,
-    });
-    if (exitCode !== 0) {
-      throw new Error(
-        `claude /context exited with code ${exitCode}${stderr ? `: ${stderr.trim()}` : ""}`,
+    const claudeEffort = CLAUDE_EFFORTS.has(opts.effort) ? opts.effort : undefined;
+    let session = this.sessions.get(opts.chatId);
+    if (session && (session.isDead() || session.vmId !== opts.vmId)) {
+      this.sessions.delete(opts.chatId);
+      this.clearIdle(opts.chatId);
+      if (!session.isDead()) void session.shutdown();
+      session = undefined;
+    }
+
+    if (session) {
+      this.clearIdle(opts.chatId);
+      if (session.model !== opts.model || session.effort !== claudeEffort) {
+        try {
+          await session.reconfigure(opts.model, claudeEffort);
+        } catch (err) {
+          console.warn("[claude] live model/effort update failed during context probe:", err);
+          if (this.sessions.get(opts.chatId) === session) {
+            this.sessions.delete(opts.chatId);
+          }
+          if (!session.isDead()) void session.shutdown();
+          session = undefined;
+        }
+      }
+    }
+
+    if (!session) {
+      session = this.createChatSession(
+        opts.chatId,
+        opts.vmId,
+        opts.model,
+        claudeEffort,
+        opts.sessionId,
       );
+      this.sessions.set(opts.chatId, session);
     }
-    const parsed = parseContextReport(stdout);
-    if (!parsed) {
-      return { available: false, reason: "could not parse /context output" };
+
+    try {
+      const response = await session.getContextUsage();
+      const breakdown = parseContextUsage(response);
+      return breakdown ?? { available: false, reason: "invalid context usage response" };
+    } finally {
+      if (this.sessions.get(opts.chatId) === session && !session.isDead()) {
+        this.armIdle(opts.chatId, session);
+      }
     }
-    return { available: true, ...parsed };
   }
 
   // Generate a short chat title via the in-VM `claude` CLI. Routed through the
@@ -828,73 +871,46 @@ export class ClaudeBackend implements ChatBackend {
   }
 }
 
-// Parses the Markdown that `claude -p "/context"` writes into the `result`
-// field of its JSON envelope. Looks for the `**Tokens:** X / Y (Z%)` summary
-// and the `Estimated usage by category` table. Tokens are reported in mixed
-// formats (`19.8k`, `735`, `< 20`, `~240`). See `parseTokenCount` below.
-function parseContextReport(rawStdout: string): {
-  totalTokens: number;
-  contextWindow: number;
-  percent: number;
-  categories: { name: string; tokens: number; percent: number }[];
-} | null {
-  let report: string;
-  try {
-    report = JSON.parse(rawStdout).result as string;
-  } catch {
-    return null;
-  }
-  if (typeof report !== "string") return null;
-
-  const totalMatch = report.match(
-    /\*\*Tokens:\*\*\s+([0-9.]+[km]?)\s*\/\s*([0-9.]+[km]?)\s*\(([0-9.]+)%\)/i,
-  );
-  if (!totalMatch) return null;
-  const totalTokens = parseTokenCount(totalMatch[1]);
-  const contextWindow = parseTokenCount(totalMatch[2]);
-  const percent = parseFloat(totalMatch[3] ?? "");
+// Convert the CLI's stable structured control response into the existing API
+// shape. `rawMaxTokens` is the full model context window used by `/context`
+// for both its summary and category percentages. `maxTokens` may exclude the
+// autocompact reserve, so it is not the denominator shown to users.
+function parseContextUsage(response: Record<string, unknown>): ContextBreakdown | null {
+  const totalTokens = finiteNonnegative(response.totalTokens);
+  const contextWindow = finitePositive(response.rawMaxTokens);
   if (totalTokens == null || contextWindow == null) return null;
 
-  // The category table sits directly under `### Estimated usage by category`
-  // and ends at the next blank line / heading. Each row is `| name | tokens
-  // | pct% |`.
-  const categories: { name: string; tokens: number; percent: number }[] = [];
-  const sectionStart = report.indexOf("Estimated usage by category");
-  if (sectionStart >= 0) {
-    const section = report.slice(sectionStart);
-    for (const line of section.split("\n")) {
-      if (!line.startsWith("|")) {
-        if (categories.length > 0) break;
-        continue;
-      }
-      const cells = line
-        .split("|")
-        .slice(1, -1)
-        .map((c) => c.trim());
-      const [name, tokensRaw, pctRaw] = cells;
-      if (name === undefined || tokensRaw === undefined || pctRaw === undefined) continue;
-      if (name.toLowerCase() === "category") continue;
-      if (name.startsWith("-")) continue;
-      const tokens = parseTokenCount(tokensRaw);
-      const pct = parseFloat(pctRaw.replace("%", ""));
-      if (tokens == null || Number.isNaN(pct)) continue;
-      categories.push({ name, tokens, percent: pct });
-    }
-  }
-  return { totalTokens, contextWindow, percent, categories };
+  const reportedPercent = finiteNonnegative(response.percentage);
+  const rawCategories = Array.isArray(response.categories) ? response.categories : [];
+  const categories = rawCategories.flatMap((category) => {
+    if (!category || typeof category !== "object") return [];
+    const value = category as Record<string, unknown>;
+    const tokens = finiteNonnegative(value.tokens);
+    if (typeof value.name !== "string" || tokens == null) return [];
+    return [
+      {
+        name: value.name,
+        tokens: Math.round(tokens),
+        percent: Number(((tokens / contextWindow) * 100).toFixed(1)),
+      },
+    ];
+  });
+
+  return {
+    available: true,
+    totalTokens: Math.round(totalTokens),
+    contextWindow: Math.round(contextWindow),
+    percent: reportedPercent ?? Number(((totalTokens / contextWindow) * 100).toFixed(1)),
+    categories,
+  };
 }
 
-// Handles the CLI's flavors: `19.8k`, `1m`, `947.2k`, plain digits, plus
-// `< N` / `~N` (returns N).
-function parseTokenCount(raw: string | undefined): number | null {
-  if (raw == null) return null;
-  const cleaned = raw.replace(/[<>~]/g, "").trim().toLowerCase();
-  const m = cleaned.match(/^([0-9.]+)([km])?$/);
-  if (!m) return null;
-  const n = parseFloat(m[1] ?? "");
-  if (Number.isNaN(n)) return null;
-  const mult = m[2] === "m" ? 1_000_000 : m[2] === "k" ? 1_000 : 1;
-  return Math.round(n * mult);
+function finiteNonnegative(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function finitePositive(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
 }
 
 // Parse the `usage` object on Claude CLI's `result` envelope, which is the

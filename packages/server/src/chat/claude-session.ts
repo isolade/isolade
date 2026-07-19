@@ -1,5 +1,9 @@
+import { StringDecoder } from "node:string_decoder";
 import { PushQueue } from "@isolade/shared";
 import type { SandboxApi } from "../sandbox-client";
+
+const DEFAULT_CONTROL_TIMEOUT_MS = 15_000;
+const MAX_STDERR_CHARS = 16 * 1024;
 
 // Per-turn callbacks supplied by ClaudeBackend. The session owns transport and
 // turn framing. The backend owns *interpreting* events (deltas, tool calls,
@@ -8,9 +12,9 @@ import type { SandboxApi } from "../sandbox-client";
 // I/O layer.
 export interface TurnHooks {
   // Invoked for every parsed CLI event except transport-level
-  // `control_response` (our own interrupt ack, which is meaningless to the
-  // chat UI). Includes the terminal `result` event so the backend can do its
-  // turn-cumulative usage accounting before the turn resolves.
+  // `control_response` records, which are correlated internally. Includes the
+  // terminal `result` event so the backend can do its turn-cumulative usage
+  // accounting before the turn resolves.
   onEvent: (event: Record<string, unknown>) => void;
   // A stdout line that didn't parse as JSON: CLI bug, truncation, version
   // skew. The backend surfaces it as a `raw` event + warns.
@@ -30,6 +34,22 @@ interface ActiveTurn {
   watchdog: ReturnType<typeof setTimeout> | null;
 }
 
+interface PendingControl {
+  subtype: string;
+  resolve: (response: Record<string, unknown>) => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+type ControlRequest =
+  | { subtype: "interrupt" }
+  | { subtype: "set_model"; model?: string }
+  | {
+      subtype: "apply_flag_settings";
+      settings: { effortLevel: string | null };
+    }
+  | { subtype: "get_context_usage" };
+
 export interface ClaudeSessionOpts {
   sandboxClient: Pick<SandboxApi, "execStream">;
   vmId: string;
@@ -48,6 +68,8 @@ export interface ClaudeSessionOpts {
   // How long `shutdown()` waits for a graceful stdin-EOF exit before
   // force-killing. Default 5s.
   shutdownGraceMs?: number;
+  // Bound for a correlated control request. Default 15s.
+  controlTimeoutMs?: number;
 }
 
 // One long-lived `claude -p --input-format stream-json` process. User turns are
@@ -56,12 +78,13 @@ export interface ClaudeSessionOpts {
 // stdin or the process dies on its own.
 export class ClaudeSession {
   readonly vmId: string;
-  readonly model: string;
-  readonly effort: string | undefined;
+  model: string;
+  effort: string | undefined;
 
   private readonly opts: ClaudeSessionOpts;
   private readonly interruptGraceMs: number;
   private readonly shutdownGraceMs: number;
+  private readonly controlTimeoutMs: number;
 
   private readonly stdin = new PushQueue<Buffer>();
   // The process is force-killed by aborting this, which closes the underlying WS,
@@ -74,11 +97,14 @@ export class ClaudeSession {
   private dead = false;
   private sessionId: string | undefined;
   private stderr = "";
+  private readonly stdoutDecoder = new StringDecoder("utf8");
+  private readonly stderrDecoder = new StringDecoder("utf8");
   private lineBuffer = "";
   private active: ActiveTurn | null = null;
   private processPromise: Promise<{ exitCode: number }> | null = null;
   private shutdownTimer: ReturnType<typeof setTimeout> | null = null;
   private controlSeq = 0;
+  private readonly pendingControls = new Map<string, PendingControl>();
 
   constructor(opts: ClaudeSessionOpts) {
     this.opts = opts;
@@ -87,6 +113,7 @@ export class ClaudeSession {
     this.effort = opts.effort;
     this.interruptGraceMs = opts.interruptGraceMs ?? 5_000;
     this.shutdownGraceMs = opts.shutdownGraceMs ?? 5_000;
+    this.controlTimeoutMs = opts.controlTimeoutMs ?? DEFAULT_CONTROL_TIMEOUT_MS;
   }
 
   isDead(): boolean {
@@ -166,6 +193,33 @@ export class ClaudeSession {
     }
   }
 
+  // Update launch-time choices without replacing the process. The CLI applies
+  // these controls to subsequent turns, so callers invoke this only while the
+  // session is idle. Keeping the process preserves background commands and
+  // other in-memory state that a --resume restart would lose.
+  async reconfigure(model: string, effort: string | undefined): Promise<void> {
+    if (this.active) throw new Error("cannot reconfigure claude during an active turn");
+    if (model !== this.model) {
+      await this.sendControl({ subtype: "set_model", model });
+      this.model = model;
+    }
+    if (effort !== this.effort) {
+      await this.sendControl({
+        subtype: "apply_flag_settings",
+        settings: { effortLevel: effort ?? null },
+      });
+      this.effort = effort;
+    }
+  }
+
+  // Return the structured data behind /context from this live process. This
+  // avoids spawning and resuming a second CLI, and avoids parsing a Markdown
+  // rendering whose formatting is not an API.
+  async getContextUsage(): Promise<Record<string, unknown>> {
+    if (this.active) throw new Error("cannot probe claude context during an active turn");
+    return this.sendControl({ subtype: "get_context_usage" });
+  }
+
   // Graceful shutdown: close stdin so the CLI drains the current turn (if any)
   // and exits, killing its background tasks. Force-kills if it doesn't exit
   // within the grace window. Safe to call more than once.
@@ -196,7 +250,7 @@ export class ClaudeSession {
       signal: this.processAbort.signal,
       stdout: (chunk: Buffer) => this.onStdout(chunk),
       stderr: (chunk: Buffer) => {
-        this.stderr += chunk.toString("utf8");
+        this.appendStderr(this.stderrDecoder.write(chunk));
       },
     });
     this.processPromise
@@ -224,15 +278,11 @@ export class ClaudeSession {
   private interrupt(): void {
     const active = this.active;
     if (this.dead || !active || active.settled) return;
-    this.stdin.push(
-      Buffer.from(
-        JSON.stringify({
-          type: "control_request",
-          request_id: `int-${++this.controlSeq}`,
-          request: { subtype: "interrupt" },
-        }) + "\n",
-      ),
-    );
+    void this.sendControl({ subtype: "interrupt" }).catch(() => {
+      // The turn result or force-kill watchdog below is authoritative for the
+      // caller. A missing interrupt acknowledgement must not become an
+      // unhandled rejection.
+    });
     // Safety net: if the CLI doesn't wind the turn down, force-kill so the
     // caller's turn can't hang forever. This kills background tasks too, but
     // only as a last resort when the graceful interrupt didn't take.
@@ -243,7 +293,7 @@ export class ClaudeSession {
   }
 
   private onStdout(chunk: Buffer): void {
-    this.lineBuffer += chunk.toString("utf8");
+    this.lineBuffer += this.stdoutDecoder.write(chunk);
     const lines = this.lineBuffer.split("\n");
     this.lineBuffer = lines.pop()!;
     for (const line of lines) this.handleLine(line);
@@ -259,8 +309,10 @@ export class ClaudeSession {
       return;
     }
 
-    // Our own interrupt ack: transport-level, not part of the conversation.
-    if (event.type === "control_response") return;
+    if (event.type === "control_response") {
+      this.handleControlResponse(event);
+      return;
+    }
 
     // Track the CLI's session id for the turn's return value (the backend
     // separately persists it from the same event).
@@ -300,8 +352,80 @@ export class ClaudeSession {
     fn();
   }
 
+  private sendControl(request: ControlRequest): Promise<Record<string, unknown>> {
+    if (this.dead) return Promise.reject(new Error("claude session is no longer alive"));
+    if (!this.started) this.start();
+
+    const requestId = `ctrl-${++this.controlSeq}`;
+    return new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingControls.delete(requestId);
+        reject(new Error(`claude control request timed out: ${request.subtype}`));
+      }, this.controlTimeoutMs);
+      timer.unref?.();
+      this.pendingControls.set(requestId, {
+        subtype: request.subtype,
+        resolve,
+        reject,
+        timer,
+      });
+      this.stdin.push(
+        Buffer.from(
+          JSON.stringify({
+            type: "control_request",
+            request_id: requestId,
+            request,
+          }) + "\n",
+        ),
+      );
+    });
+  }
+
+  private handleControlResponse(event: Record<string, unknown>): void {
+    const response = event.response;
+    if (!response || typeof response !== "object") return;
+    const body = response as Record<string, unknown>;
+    const requestId = body.request_id;
+    if (typeof requestId !== "string") return;
+    const pending = this.pendingControls.get(requestId);
+    if (!pending) return;
+    this.pendingControls.delete(requestId);
+    clearTimeout(pending.timer);
+
+    if (body.subtype === "error") {
+      const detail = typeof body.error === "string" ? `: ${body.error}` : "";
+      pending.reject(new Error(`claude control request failed (${pending.subtype})${detail}`));
+      return;
+    }
+    if (body.subtype !== "success") {
+      pending.reject(new Error(`invalid claude control response (${pending.subtype})`));
+      return;
+    }
+    const result = body.response;
+    pending.resolve(
+      result && typeof result === "object" ? (result as Record<string, unknown>) : {},
+    );
+  }
+
+  private appendStderr(text: string): void {
+    if (!text) return;
+    this.stderr = (this.stderr + text).slice(-MAX_STDERR_CHARS);
+  }
+
+  private rejectPendingControls(err: Error): void {
+    for (const pending of this.pendingControls.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(err);
+    }
+    this.pendingControls.clear();
+  }
+
   private onProcessEnd(exitCode: number | undefined, err: unknown): void {
     if (this.dead) return;
+    this.lineBuffer += this.stdoutDecoder.end();
+    if (this.lineBuffer.trim()) this.handleLine(this.lineBuffer);
+    this.lineBuffer = "";
+    this.appendStderr(this.stderrDecoder.end());
     this.dead = true;
     if (this.shutdownTimer) {
       clearTimeout(this.shutdownTimer);
@@ -310,16 +434,18 @@ export class ClaudeSession {
     // Release the stdin iterator so execStream's stdin pump isn't left parked.
     this.stdin.end();
 
+    const message = err
+      ? err instanceof Error
+        ? err.message
+        : String(err)
+      : `claude exited with code ${exitCode}${this.stderr ? `: ${this.stderr.trim()}` : ""}`;
+    this.rejectPendingControls(new Error(message));
+
     const active = this.active;
     if (active && !active.settled) {
       // The process died with a turn still streaming. Surface it the same way
       // the old per-turn process exit did (`claude exited with code N`), so the
       // failure isn't mistaken for a clean turn.
-      const message = err
-        ? err instanceof Error
-          ? err.message
-          : String(err)
-        : `claude exited with code ${exitCode}${this.stderr ? `: ${this.stderr.trim()}` : ""}`;
       this.settleTurn(active, () => active.reject(new Error(message)));
     }
 
