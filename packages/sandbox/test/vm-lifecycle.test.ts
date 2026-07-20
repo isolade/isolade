@@ -9,9 +9,10 @@ import { VmManager } from "../src/vms";
 
 // Recovery of persisted VM records at boot / restart, exercised through the
 // getHandle()/startSandbox() seams so the status-driven state machine runs
-// without a live microsandbox. The errors below are the REAL SDK error classes
-// (matching what connect()/start() throw in production), so these tests also
-// pin the code+message classification the recovery branches depend on.
+// without a live microsandbox. The error shapes below mirror what the SDK
+// throws in production — including the unmapped raw napi form of the Rust
+// SandboxNotRunning variant, which is what connect() actually surfaces today —
+// so these tests pin the classification the recovery branches depend on.
 
 type Status = "running" | "stopped" | "crashed" | "draining";
 
@@ -102,9 +103,20 @@ class Harness extends VmManager {
 }
 
 const VM = "vm-1";
+// The node SDK has no mapping for the Rust SandboxNotRunning variant, so it
+// arrives as a raw napi error: the native `[VariantName]` tag still in the
+// message, and napi's generic status string as the code.
+const napiError = (message: string) =>
+  Object.assign(new Error(message), { code: "GenericFailure" });
 const noAgentEndpoint = () =>
+  napiError(`[SandboxNotRunning] sandbox "${VM}" has no agent endpoint (is it running?)`);
+const notRunning = () =>
+  napiError(`[SandboxNotRunning] sandbox '${VM}' is not running (status: Stopped)`);
+// The shapes older SDK layers used for the same two states. Classification
+// keeps matching them so an SDK bump can't silently disable recovery again.
+const legacyNoAgentEndpoint = () =>
   new RuntimeError(`runtime error: no agent endpoint found for sandbox "${VM}"`);
-const notRunning = () => new CustomError(`sandbox '${VM}' is not running (status: Stopped)`);
+const legacyNotRunning = () => new CustomError(`sandbox '${VM}' is not running (status: Stopped)`);
 const stillRunning = () =>
   new SandboxStillRunningError(`cannot start sandbox '${VM}': already running`);
 const notFound = () => new SandboxNotFoundError(VM);
@@ -130,6 +142,30 @@ describe("VmManager.attachExisting recovery", () => {
     expect(handle.killed).toBe(true); // stale record reset
     expect(mgr.startLog).toEqual([VM]); // then cold-booted
     expect(ports).toEqual([{ address: "127.0.0.1", localPort: 41000, remotePort: 8080 }]);
+  });
+
+  it("recovers a raced-to-stopped record (connect refused) by killing + cold-booting", async () => {
+    // kill() on an already-stopped record is a no-op in production, so the
+    // collapsed recovery branch is safe for this sub-state too.
+    const handle = new FakeHandle("running", notRunning());
+    const mgr = new Harness({ handles: [handle], starts: [new FakeSandbox(VM)] });
+
+    await mgr.attachExisting(VM);
+
+    expect(handle.killed).toBe(true);
+    expect(mgr.startLog).toEqual([VM]);
+  });
+
+  it("recovers the same states in their legacy SDK error shapes", async () => {
+    for (const connectErr of [legacyNoAgentEndpoint(), legacyNotRunning()]) {
+      const handle = new FakeHandle("running", connectErr);
+      const mgr = new Harness({ handles: [handle], starts: [new FakeSandbox(VM)] });
+
+      await mgr.attachExisting(VM);
+
+      expect(handle.killed).toBe(true);
+      expect(mgr.startLog).toEqual([VM]);
+    }
   });
 
   it("cold-boots a stopped record without connecting", async () => {
@@ -214,6 +250,49 @@ describe("VmManager.attachExisting recovery", () => {
     });
 
     await expect(mgr.attachExisting(VM)).rejects.toThrow("rootfs missing");
+  });
+});
+
+describe("VmManager.restart", () => {
+  it("repairs a stale-running record on a map miss via the unconditional stop", async () => {
+    // The stop half must run even when the VM isn't in the in-memory map (the
+    // state after an app restart whose boot resync failed): it drives the
+    // record through microsandbox's own stop path, so the follow-up attach
+    // cold-boots from a clean stopped record instead of having to diagnose
+    // connect() errors.
+    const handle = new FakeHandle("running", noAgentEndpoint());
+    const booted = new FakeSandbox(VM, [{ hostPort: 42000, guestPort: 8080 }]);
+    // getHandle is consumed twice: once by stop(), once by the re-attach.
+    // FakeHandle.stop() flips its status, so the second read sees "stopped".
+    const mgr = new Harness({ handles: [handle, handle], starts: [booted] });
+
+    const ports = await mgr.restart(VM);
+
+    expect(handle.stopped).toBe(true); // record repaired, not error-classified
+    expect(mgr.startLog).toEqual([VM]); // then cold-booted
+    expect(ports).toEqual([{ address: "127.0.0.1", localPort: 42000, remotePort: 8080 }]);
+  });
+
+  it("stop-then-boots a healthy orphan VM on a map miss (restart means restart)", async () => {
+    const sandbox = new FakeSandbox(VM);
+    const handle = new FakeHandle("running", sandbox);
+    const mgr = new Harness({ handles: [handle, handle], starts: [new FakeSandbox(VM)] });
+
+    await mgr.restart(VM);
+
+    expect(sandbox.synced).toBe(true); // guest flushed before power-off
+    expect(handle.stopped).toBe(true);
+    expect(mgr.startLog).toEqual([VM]);
+  });
+
+  it("cold-boots an already-stopped record without touching it (unarchive)", async () => {
+    const handle = new FakeHandle("stopped", new Error("connect must not be called"));
+    const mgr = new Harness({ handles: [handle, handle], starts: [new FakeSandbox(VM)] });
+
+    await mgr.restart(VM);
+
+    expect(handle.stopped).toBe(false); // stop() early-returns on the status
+    expect(mgr.startLog).toEqual([VM]);
   });
 });
 

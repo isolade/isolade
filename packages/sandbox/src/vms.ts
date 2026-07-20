@@ -237,10 +237,12 @@ export function buildNetworkPolicy(
 }
 
 // microsandbox surfaces typed errors carrying a lowercase discriminant `.code`
-// (see the SDK's MicrosandboxError hierarchy). We branch recovery on the code
-// rather than on message text so the state machine below doesn't break when the
-// wording of an error changes. Falls back to duck-typing a string `.code` for
-// the rare raw napi error that slips past the SDK's instanceof.
+// (see the SDK's MicrosandboxError hierarchy). Recovery branches prefer the
+// code over message text so the state machine below doesn't break when the
+// wording of an error changes; where the node SDK has no mapping for a native
+// variant (see isSandboxNotRunning), they fall back to the `[VariantName]` tag
+// the napi binding embeds in the message. Duck-types a string `.code` for the
+// raw napi errors that slip past the SDK's instanceof.
 function msbErrorCode(err: unknown): string | undefined {
   if (err instanceof MicrosandboxError) return err.code;
   const code = (err as { code?: unknown } | null | undefined)?.code;
@@ -263,20 +265,32 @@ function isSandboxStillRunning(err: unknown): boolean {
   return msbErrorCode(err) === "sandboxStillRunning";
 }
 
-// `connect` refused because the record isn't in a running/draining state. It
-// stopped out from under us (e.g. a concurrent stop) between the status read
-// and the connect. For a stop that means "already down"; for an attach it means
-// "cold-boot it instead".
-function isNotRunning(err: unknown): boolean {
-  return msbErrorCode(err) === "custom" && /is not running/i.test(errMessage(err));
-}
-
-// A record microsandbox still marks running, but whose agent relay socket is
-// gone: the owning sandbox process died (SIGKILL/crash) without updating the
-// DB. connect() surfaces this as a Runtime error naming the missing endpoint.
-// This is the recoverable "stale-running" state: reset the record and cold-boot.
-function isNoAgentEndpoint(err: unknown): boolean {
-  return msbErrorCode(err) === "runtime" && /no agent endpoint/i.test(errMessage(err));
+// `connect` failed because the VM isn't actually reachable. Two sub-states,
+// both recoverable by resetting the record and cold-booting:
+//   - the record isn't running/draining (a concurrent stop won the race
+//     between our status read and the connect), or
+//   - the record still says running but its agent relay socket is gone (the
+//     owning sandbox process died — SIGKILL, crash, host shutdown — without
+//     updating the DB): the "stale-running" state.
+//
+// The vendored Rust SDK raises both as its SandboxNotRunning variant, which
+// the node SDK's error mapping does NOT translate (CTORS in error-mapping.ts
+// has no entry for it). It therefore arrives as a raw napi Error whose code is
+// the generic "GenericFailure" and whose message keeps the native binding's
+// `[SandboxNotRunning]` tag — so match that tag, not the wording after it.
+// Also match the typed code a future SDK mapping would carry, plus the shapes
+// older SDKs used (custom / runtime): this classifier going stale against an
+// SDK bump is exactly how stale-running instances got stuck in `error` after
+// every unclean shutdown instead of self-healing.
+function isSandboxNotRunning(err: unknown): boolean {
+  const message = errMessage(err);
+  if (message.startsWith("[SandboxNotRunning]")) return true;
+  const code = msbErrorCode(err);
+  return (
+    code === "sandboxNotRunning" ||
+    (code === "custom" && /is not running/i.test(message)) ||
+    (code === "runtime" && /no agent endpoint/i.test(message))
+  );
 }
 
 export class VmManager {
@@ -888,14 +902,22 @@ export class VmManager {
   }
 
   // Stops a VM and re-starts it from its persisted microsandbox record.
-  // Used by the user-facing "Restart VM" action. Returns the fresh
-  // PortBinding[] so the server can repopulate its in-memory map. On a map
-  // miss the stop half is skipped: attachExisting's startOrConnect handles
-  // every persisted state: booting a stopped/crashed record, attaching to a
-  // still-running orphan, and recovering a stale-running one (dead process,
-  // DB still says running) by resetting it and cold-booting.
+  // Used by the user-facing "Restart VM" action and by unarchive. Returns the
+  // fresh PortBinding[] so the server can repopulate its in-memory map.
+  //
+  // The stop half runs unconditionally, not only on an in-memory map hit. It's
+  // a no-op for an already-stopped record (the unarchive case), and for a
+  // stale-running one (dead process, DB still says running) it repairs the
+  // record through microsandbox's own stop path — running → draining →
+  // reconciled to a terminal state on the next status read — without having to
+  // diagnose anything from connect() errors. Stopping a healthy orphan VM on a
+  // map miss is fine too: stop-then-boot is what "restart" means.
   async restart(vmId: string): Promise<PortBinding[]> {
-    if (this.vms.has(vmId)) await this.stop(vmId);
+    // Let any in-flight attach settle first so its handle lands in the map and
+    // stop() tears it down properly, rather than stopping the VM by name while
+    // the attach is mid-adoption and would return a handle to a dead VM.
+    await this.reattachInFlight.get(vmId)?.catch(() => undefined);
+    await this.stop(vmId);
     // Coalesce like ensure(): a broker reconnect or probe can hit ensureAttached
     // while we're re-attaching, and two rival handles would tear the VM down.
     return this.attachExistingCoalesced(vmId);
@@ -1038,16 +1060,16 @@ export class VmManager {
     try {
       return await handle.connect();
     } catch (err) {
-      // Raced to stopped between the status read and the connect → cold-boot it.
-      if (isNotRunning(err)) return this.startSandbox(vmId);
-      // Stale-running: the record says running but its agent socket is gone
-      // (owning process died in an unclean prior shutdown). Reset it with kill(),
-      // which force-terminates any lingering PID and marks the record stopped,
-      // then cold-boot from the surviving rootfs.
-      if (isNoAgentEndpoint(err)) {
+      // Unreachable but recoverable: either it raced to stopped between the
+      // status read and the connect, or the record is stale-running (still
+      // marked running, but its agent socket is gone after an unclean prior
+      // shutdown). Reset it with kill() — which force-terminates any lingering
+      // PID, marks the record stopped, and is a no-op when it's already
+      // stopped — then cold-boot from the surviving rootfs.
+      if (isSandboxNotRunning(err)) {
         console.warn(
-          `[vm-attach ${vmId}] record is marked running but its agent socket is ` +
-            `gone (unclean prior shutdown). Resetting the stale record and cold-booting`,
+          `[vm-attach ${vmId}] record unreachable (${errMessage(err)}). ` +
+            `Resetting it and cold-booting`,
         );
         await handle
           .kill()
