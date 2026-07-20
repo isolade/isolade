@@ -90,6 +90,10 @@ describe("UploadStore", () => {
     );
     expect(store.listForMessage("msg-1").length).toBe(2);
     expect((byMessage.get("msg-2") ?? []).map((u) => u.id)).toEqual([a.id]);
+    const bounded = store.byMessageForChat("chat-1", ["msg-2"]);
+    expect([...bounded.keys()]).toEqual(["msg-2"]);
+    expect((bounded.get("msg-2") ?? []).map((u) => u.id)).toEqual([a.id]);
+    expect(store.byMessageForChat("chat-1", []).size).toBe(0);
 
     store.removeForChat("chat-1");
     expect(store.byMessageForChat("chat-1").size).toBe(0);

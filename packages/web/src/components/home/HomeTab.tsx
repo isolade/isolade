@@ -48,6 +48,7 @@ import UpdateBanner from "../UpdateBanner";
 import InstancesSidebar from "./InstancesSidebar";
 import InstanceView from "./InstanceView";
 import NewInstancePane from "./NewInstancePane";
+import RetainedInstanceViews from "./RetainedInstanceViews";
 import SidePanel, { type PanelMode } from "./SidePanel";
 
 type View =
@@ -70,6 +71,35 @@ type View =
       id: string;
       pendingFirstMessage?: { chatId: string; content: string; uploadIds?: string[] };
     };
+
+const NOOP = () => {};
+
+function apiValueEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (left instanceof Date && right instanceof Date) return left.getTime() === right.getTime();
+  if (typeof left !== "object" || left === null || typeof right !== "object" || right === null) {
+    return false;
+  }
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function apiRowEqual<T extends { id: string }>(left: T, right: T): boolean {
+  const keys = Object.keys(left) as (keyof T)[];
+  if (keys.length !== Object.keys(right).length) return false;
+  return keys.every((key) => apiValueEqual(left[key], right[key]));
+}
+
+function reconcileApiRows<T extends { id: string }>(previous: T[], incoming: T[]): T[] {
+  const previousById = new Map(previous.map((row) => [row.id, row]));
+  const reconciled = incoming.map((row) => {
+    const existing = previousById.get(row.id);
+    return existing && apiRowEqual(existing, row) ? existing : row;
+  });
+  return reconciled.length === previous.length &&
+    reconciled.every((row, index) => row === previous[index])
+    ? previous
+    : reconciled;
+}
 
 // Pathname-based routing: /c/<id> deep-links to a specific instance. Relies
 // on Vite's built-in SPA fallback in dev and Tauri's webview serving index.html
@@ -307,13 +337,15 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
       // (updatedAt desc, then createdAt desc, then id). See InstanceManager.list.
       // We render that order verbatim rather than re-sorting here, so there's a
       // single source of truth and the sidebar order can't disagree with itself.
-      setInstances(await listInstances());
+      const incoming = await listInstances();
+      setInstances((previous) => reconcileApiRows(previous, incoming));
     } catch {}
   }, []);
 
   const refreshChats = useCallback(async () => {
     try {
-      setAllChats(await listChats());
+      const incoming = await listChats();
+      setAllChats((previous) => reconcileApiRows(previous, incoming));
     } catch {}
   }, []);
 
@@ -601,9 +633,17 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     })();
   };
 
-  const handleTitleAutoUpdated = (instanceId: string, title: string) => {
+  const handleTitleAutoUpdated = useCallback((instanceId: string, title: string) => {
     setInstances((prev) => prev.map((c) => (c.id === instanceId ? { ...c, title } : c)));
-  };
+  }, []);
+
+  const handleInstanceResourceChange = useCallback(
+    (instanceId: string) => {
+      void refreshChats();
+      void refreshTerminalsFor(instanceId);
+    },
+    [refreshChats, refreshTerminalsFor],
+  );
 
   // Detach a PR badge from a chat. Optimistic: drop it locally so it disappears
   // at once, then persist. The 1s instance poll reconciles either way, so a
@@ -809,41 +849,31 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     }
   };
 
-  const instanceProps = useMemo(() => {
-    if (view.kind === "creating") {
-      return {
-        instance: view.synth,
-        chats: [view.synthChat],
-        terminals: [] as Terminal[],
-        pendingFirstMessage: {
-          chatId: view.synthChat.id,
-          content: view.firstMessage,
-          uploadIds: view.firstUploadIds,
-        },
-        pending: true,
-        creationError: view.error,
-        onTitleAutoUpdated: () => {},
-        onResourceChange: () => {},
-      };
+  const activeInstanceId = view.kind === "instance" ? view.id : null;
+  const activeInstance =
+    activeInstanceId != null ? (instances.find((c) => c.id === activeInstanceId) ?? null) : null;
+  const chatsByInstance = useMemo(() => {
+    const grouped = new Map<string, Chat[]>();
+    for (const chat of allChats) {
+      const chats = grouped.get(chat.instanceId) ?? [];
+      chats.push(chat);
+      grouped.set(chat.instanceId, chats);
     }
-    if (view.kind === "instance") {
-      const active = instances.find((c) => c.id === view.id) ?? null;
-      if (!active) return null;
-      return {
-        instance: active,
-        chats: allChats.filter((c) => c.instanceId === active.id),
-        pendingFirstMessage: view.pendingFirstMessage ?? null,
-        pending: false,
-        creationError: null,
-        onTitleAutoUpdated: handleTitleAutoUpdated,
-        onResourceChange: () => {
-          void refreshChats();
-          void refreshTerminalsFor(active.id);
-        },
-      };
-    }
-    return null;
-  }, [view, instances, allChats, refreshChats, refreshTerminalsFor]);
+    return grouped;
+  }, [allChats]);
+  // A live instance keeps its complete chat subtree and DOM. Sidebar
+  // navigation only changes which strictly-contained pane is visible, so
+  // parsed Markdown, disclosure state, drafts, and scroll position survive.
+  // Archived instances are released unless one is currently being viewed.
+  const retainedInstances = useMemo(
+    () =>
+      instances.filter(
+        (instance) =>
+          (!instance.archived && (instance.profileId ?? null) === activeProfileId) ||
+          instance.id === activeInstanceId,
+      ),
+    [activeInstanceId, activeProfileId, instances],
+  );
 
   // Sidebar only shows instances whose title has landed (either the
   // auto-generated one or the server-side truncation fallback). Untitled
@@ -867,10 +897,7 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
   // The right panel only exists alongside a live instance. Its terminal needs
   // a running VM and its preview needs the VM's forwarded ports. The title bar
   // owns its toggle. The body mounts the panel only while it's open.
-  const activeInstanceId = view.kind === "instance" ? view.id : null;
-  const activeInstance =
-    activeInstanceId != null ? (instances.find((c) => c.id === activeInstanceId) ?? null) : null;
-  const showSidePanel = view.kind === "instance" && instanceProps != null;
+  const showSidePanel = view.kind === "instance" && activeInstance != null;
   const sidebarTerminal =
     activeInstanceId != null ? ((terminalsByInstance[activeInstanceId] ?? [])[0] ?? null) : null;
 
@@ -1020,35 +1047,59 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
               contentFrame,
             )}
           >
-            {view.kind === "drafting" && (
-              <NewInstancePane
-                profileId={activeProfileId}
+            <div className="relative min-h-0 flex-1">
+              {view.kind === "drafting" && (
+                <div className="absolute inset-0 flex min-h-0">
+                  <NewInstancePane
+                    profileId={activeProfileId}
+                    chatModels={chatModels}
+                    modelOverrides={modelOverrides}
+                    defaultModelId={DEFAULT_CHAT_MODEL_ID}
+                    onSubmit={handleSubmitDraft}
+                  />
+                </div>
+              )}
+
+              <RetainedInstanceViews
+                instances={retainedInstances}
+                chatsByInstance={chatsByInstance}
+                activeInstanceId={activeInstanceId}
+                pendingFirstMessage={
+                  view.kind === "instance" ? (view.pendingFirstMessage ?? null) : null
+                }
                 chatModels={chatModels}
                 modelOverrides={modelOverrides}
-                defaultModelId={DEFAULT_CHAT_MODEL_ID}
-                onSubmit={handleSubmitDraft}
+                onTitleAutoUpdated={handleTitleAutoUpdated}
+                onResourceChange={handleInstanceResourceChange}
               />
-            )}
 
-            {instanceProps && (
-              <InstanceView
-                instance={instanceProps.instance}
-                chats={instanceProps.chats}
-                chatModels={chatModels}
-                modelOverrides={modelOverrides}
-                pendingFirstMessage={instanceProps.pendingFirstMessage}
-                pending={instanceProps.pending}
-                creationError={instanceProps.creationError}
-                onTitleAutoUpdated={instanceProps.onTitleAutoUpdated}
-                onResourceChange={instanceProps.onResourceChange}
-              />
-            )}
+              {view.kind === "creating" && (
+                <div className="absolute inset-0 flex min-h-0">
+                  <InstanceView
+                    instanceId={view.synth.id}
+                    chats={[view.synthChat]}
+                    chatModels={chatModels}
+                    modelOverrides={modelOverrides}
+                    visible
+                    pendingFirstMessage={{
+                      chatId: view.synthChat.id,
+                      content: view.firstMessage,
+                      uploadIds: view.firstUploadIds,
+                    }}
+                    pending
+                    creationError={view.error}
+                    onTitleAutoUpdated={NOOP}
+                    onResourceChange={NOOP}
+                  />
+                </div>
+              )}
 
-            {view.kind === "instance" && !instanceProps && (
-              <div className="flex-1 flex items-center justify-center text-sm text-muted-foreground">
-                Chat not found
-              </div>
-            )}
+              {view.kind === "instance" && !activeInstance && (
+                <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
+                  Chat not found
+                </div>
+              )}
+            </div>
           </div>
 
           {panelOpen && activeInstanceId && (

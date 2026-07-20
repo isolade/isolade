@@ -5,17 +5,17 @@ import {
   appearanceSchema,
   authStatusSchema,
   type Chat,
-  type ChatEvent,
-  type ChatMessage,
+  type ChatBranchSwitch,
   type ChatModelsResponse,
   type ContextBreakdown,
   type CreateChatBody,
   type CreateInstanceBody,
   chatArraySchema,
-  chatEventArraySchema,
-  chatMessageArraySchema,
+  chatBranchSwitchSchema,
   chatModelsResponseSchema,
+  chatRenderBatchSchema,
   chatSchema,
+  chatViewPageSchema,
   contextBreakdownSchema,
   createChatBodySchema,
   createInstanceBodySchema,
@@ -29,6 +29,7 @@ import {
   type GitConfigStatus,
   gitConfigStatusSchema,
   type Instance,
+  inFlightChatRenderSchema,
   instanceArraySchema,
   instanceSchema,
   type LoginSession,
@@ -894,20 +895,23 @@ export async function updateChatModel(
 
 // Switch the chat's visible branch (version navigation on an edited
 // message). `leafId` may be any message on the target branch, and the server
-// descends to that branch's tip and re-points the provider session. Returns
-// the updated chat row (its activeLeafId is the resolved tip).
+// descends to that branch's tip and re-points the provider session. The
+// response includes the bounded branch tail, avoiding a second request and an
+// intermediate client/server branch mismatch.
 export async function setChatActiveLeaf(
   instanceId: string,
   chatId: string,
   leafId: string,
-): Promise<Chat> {
+  signal?: AbortSignal,
+): Promise<ChatBranchSwitch> {
   return parseResponse(
     await apiFetch(`${API_BASE}/api/instances/${instanceId}/chats/${chatId}/active-leaf`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(setActiveLeafBodySchema.parse({ leafId })),
+      signal,
     }),
-    chatSchema,
+    chatBranchSwitchSchema,
   );
 }
 
@@ -919,14 +923,19 @@ export async function deleteChat(instanceId: string, chatId: string): Promise<vo
   );
 }
 
-export async function listChatMessages(
+export async function listChatTranscript(
   instanceId: string,
   chatId: string,
-  signal?: AbortSignal,
-): Promise<ChatMessage[]> {
+  options: { before?: string; limit?: number; signal?: AbortSignal } = {},
+) {
+  const query = new URLSearchParams();
+  if (options.before) query.set("before", options.before);
+  query.set("limit", String(options.limit ?? 60));
   return parseResponse(
-    await apiFetch(`${API_BASE}/api/instances/${instanceId}/chats/${chatId}/messages`, { signal }),
-    chatMessageArraySchema,
+    await apiFetch(`${API_BASE}/api/instances/${instanceId}/chats/${chatId}/transcript?${query}`, {
+      signal: options.signal,
+    }),
+    chatViewPageSchema,
   );
 }
 
@@ -967,17 +976,54 @@ export function uploadUrl(
   return withAuthToken(opts?.download ? `${base}?download=1` : base);
 }
 
-// Returns every persisted SSE event for the chat, ordered by
-// (messageId, seq). Used by the chat UI on mount to rebuild tool calls,
-// thinking blocks, and per-turn usage snapshots for past assistant turns.
-export async function listChatEvents(
+export async function listChatRenderChunks(
   instanceId: string,
   chatId: string,
+  messageIds: string[],
+  includeDebug: boolean,
   signal?: AbortSignal,
-): Promise<ChatEvent[]> {
+) {
+  const query = new URLSearchParams({
+    ids: messageIds.join(","),
+    debug: includeDebug ? "1" : "0",
+  });
   return parseResponse(
-    await apiFetch(`${API_BASE}/api/instances/${instanceId}/chats/${chatId}/events`, { signal }),
-    chatEventArraySchema,
+    await apiFetch(`${API_BASE}/api/instances/${instanceId}/chats/${chatId}/render?${query}`, {
+      signal,
+    }),
+    chatRenderBatchSchema,
+  );
+}
+
+export async function getChatToolDetails(
+  instanceId: string,
+  chatId: string,
+  messageId: string,
+  toolId: string,
+  signal?: AbortSignal,
+) {
+  const query = new URLSearchParams({ ids: messageId, toolId });
+  return parseResponse(
+    await apiFetch(`${API_BASE}/api/instances/${instanceId}/chats/${chatId}/render?${query}`, {
+      signal,
+    }),
+    chatRenderBatchSchema,
+  );
+}
+
+export async function getInFlightChatRender(
+  instanceId: string,
+  chatId: string,
+  includeDebug: boolean,
+  signal?: AbortSignal,
+) {
+  const query = new URLSearchParams({ debug: includeDebug ? "1" : "0" });
+  return parseResponse(
+    await apiFetch(
+      `${API_BASE}/api/instances/${instanceId}/chats/${chatId}/events/in-flight?${query}`,
+      { signal },
+    ),
+    inFlightChatRenderSchema,
   );
 }
 

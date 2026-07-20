@@ -15,30 +15,11 @@ import {
   TriangleAlert,
   Wrench,
 } from "lucide-react";
-import { memo, useState } from "react";
+import { memo, useEffect, useState } from "react";
+import { summarizeChatToolInput } from "@/lib/contracts";
 import { cn } from "@/lib/utils";
-import Markdown from "../Markdown";
+import StreamingMarkdown from "../StreamingMarkdown";
 import type { StreamChunk, ToolChunk } from "./chunks";
-
-// Short one-line preview of a tool's input shown next to the tool name in the
-// collapsed header. Handles common Claude built-ins (Bash, Read, Edit, …) and
-// Codex item shapes (command arrays) generically.
-function summarizeToolInput(name: string, input: unknown): string {
-  if (!input || typeof input !== "object") return "";
-  const o = input as Record<string, unknown>;
-  if (name === "Bash" && typeof o.command === "string") {
-    return o.command.split("\n")[0] ?? "";
-  }
-  if (typeof o.file_path === "string") return o.file_path;
-  if (typeof o.path === "string") return o.path;
-  if (typeof o.url === "string") return o.url;
-  if (typeof o.query === "string") return o.query;
-  if (typeof o.pattern === "string") return o.pattern;
-  if (typeof o.description === "string") return o.description;
-  if (Array.isArray(o.command)) return (o.command as unknown[]).map(String).join(" ");
-  if (typeof o.command === "string") return o.command;
-  return "";
-}
 
 // Visual presentation per tool: icon + present/past verb. Verb-based naming
 // reads more naturally than the raw tool name ("Reading file.ts" vs "Read:
@@ -80,7 +61,7 @@ function presentationFor(name: string): ToolPresentation {
   );
 }
 
-function ThinkingBlock({ text }: { text: string }) {
+const ThinkingBlock = memo(function ThinkingBlock({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
   // Claude streams reasoning as natural language. Codex sends a full JSON
   // payload. Detect the latter so we render it as monospace block instead
@@ -108,9 +89,9 @@ function ThinkingBlock({ text }: { text: string }) {
         ))}
     </div>
   );
-}
+});
 
-function RawEventBox({
+const RawEventBox = memo(function RawEventBox({
   source,
   label,
   payload,
@@ -139,19 +120,28 @@ function RawEventBox({
       )}
     </div>
   );
-}
+});
 
-function ToolCallBlock({ chunk }: { chunk: ToolChunk }) {
+const ToolCallBlock = memo(function ToolCallBlock({
+  chunk,
+  onRequestDetails,
+}: {
+  chunk: ToolChunk;
+  onRequestDetails?: (toolId: string) => void;
+}) {
   const [open, setOpen] = useState(false);
-  const summary = summarizeToolInput(chunk.name, chunk.input);
+  const summary = chunk.summary ?? summarizeChatToolInput(chunk.input);
   const { icon: Icon, present, past } = presentationFor(chunk.name);
   const isRunning = chunk.status === "running";
   const verb = chunk.isError ? "Failed" : isRunning ? present : past;
+  useEffect(() => {
+    if (open && chunk.detailsAvailable) onRequestDetails?.(chunk.id);
+  }, [chunk, onRequestDetails, open]);
   return (
-    <div className="my-1.5 font-sans">
+    <div data-tool-id={chunk.id} className="my-1.5 font-sans">
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => setOpen((value) => !value)}
         className="group w-full flex items-center gap-2 text-left text-sm py-0.5 rounded transition-colors"
       >
         <Icon
@@ -217,7 +207,7 @@ function ToolCallBlock({ chunk }: { chunk: ToolChunk }) {
       </div>
     </div>
   );
-}
+});
 
 function ToolPayload({ label, body, tone }: { label: string; body: string; tone?: "error" }) {
   return (
@@ -242,7 +232,11 @@ function ToolPayload({ label, body, tone }: { label: string; body: string; tone?
 // dots. The most common failure mode in practice is a transport-level
 // error (DNS/TCP reset) where the SDK emits up to 10 retries spanning
 // minutes before either recovering or giving up with exit code 1.
-function RetryBlock({ chunk }: { chunk: Extract<StreamChunk, { kind: "api_retry" }> }) {
+const RetryBlock = memo(function RetryBlock({
+  chunk,
+}: {
+  chunk: Extract<StreamChunk, { kind: "api_retry" }>;
+}) {
   const reason = chunk.errorStatus
     ? `HTTP ${chunk.errorStatus}`
     : chunk.error && chunk.error !== "unknown"
@@ -262,7 +256,7 @@ function RetryBlock({ chunk }: { chunk: Extract<StreamChunk, { kind: "api_retry"
       </span>
     </div>
   );
-}
+});
 
 // Memoized so a re-render of Chat (e.g. a tab switch flipping `visible`, or a
 // streaming delta on a *different* message) doesn't reconcile every past
@@ -273,15 +267,29 @@ function RetryBlock({ chunk }: { chunk: Extract<StreamChunk, { kind: "api_retry"
 export const StreamView = memo(function StreamView({
   chunks,
   showDebug,
+  streaming = false,
+  onRequestToolDetails,
 }: {
   chunks: StreamChunk[];
   showDebug: boolean;
+  streaming?: boolean;
+  onRequestToolDetails?: (toolId: string) => void;
 }) {
   return (
     <>
       {chunks.map((chunk, i) => {
-        if (chunk.kind === "text") return <Markdown key={i} content={chunk.text} />;
-        if (chunk.kind === "tool") return <ToolCallBlock key={i} chunk={chunk} />;
+        if (chunk.kind === "text") {
+          return (
+            <StreamingMarkdown
+              key={i}
+              content={chunk.text}
+              streaming={streaming && i === chunks.length - 1}
+            />
+          );
+        }
+        if (chunk.kind === "tool") {
+          return <ToolCallBlock key={i} chunk={chunk} onRequestDetails={onRequestToolDetails} />;
+        }
         if (chunk.kind === "api_retry") return <RetryBlock key={i} chunk={chunk} />;
         if (!showDebug) return null;
         if (chunk.kind === "thinking") return <ThinkingBlock key={i} text={chunk.text} />;

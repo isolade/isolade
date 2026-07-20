@@ -121,27 +121,27 @@ svg.animate-spin {
   transform-origin: center;
 }
 
-/* Cheap, library-free virtualization for the chat history. Every chat tab of
-   an instance stays mounted and is hidden with `display:none` (see
-   InstanceView), so activating a tab flips it back to `display:block` and the
-   browser must lay out and paint the entire message list in one synchronous
-   frame. For a long chat — many messages, big highlighted code blocks — that
-   first layout is what makes the click feel sluggish.
-
-   `content-visibility:auto` lets the browser skip layout+paint for rows
-   outside (and not near) the viewport, so showing a tab only costs the handful
-   of messages actually on screen; the rest render lazily as they scroll in.
-   `contain-intrinsic-size: auto <fallback>` supplies a placeholder height for
-   skipped rows so the scrollbar stays sane, and the `auto` keyword makes the
-   browser remember each row's real size once it has been rendered, so scroll
-   position is stable after the first reveal. */
-.chat-message {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 100px;
+/* Each streaming fragment is its own React Markdown root, which makes every
+   top-level block appear first and last to Tailwind's structural variants.
+   Restore only those direct-child margins at internal fragment boundaries.
+   Nested blockquotes and loose lists retain the canonical Markdown classes. */
+.markdown-fragment[data-first-fragment="false"] > h1:first-child,
+.markdown-fragment[data-first-fragment="false"] > h2:first-child {
+  margin-top: 0.75rem;
 }
 
-/* Syntax-highlighting token colors for rehype-highlight (highlight.js
-   classes) in chat code blocks. Values are GitHub Primer's prettylights
+.markdown-fragment[data-first-fragment="false"] > h3:first-child {
+  margin-top: 0.5rem;
+}
+
+.markdown-fragment[data-last-fragment="false"] > p:last-child,
+.markdown-fragment[data-last-fragment="false"] > ul:last-child,
+.markdown-fragment[data-last-fragment="false"] > ol:last-child {
+  margin-bottom: 0.5rem;
+}
+
+/* Syntax-highlighting token colors for lowlight (highlight.js classes) in
+   chat code blocks. Values are GitHub Primer's prettylights
    syntax palette so highlighted code matches the GitHub Light / GitHub Dark
    themes above. Class→token mapping ported from highlight.js's github.css /
    github-dark.css. */

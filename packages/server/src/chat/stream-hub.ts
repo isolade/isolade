@@ -1,4 +1,5 @@
 import type { ChatManager } from "../chats";
+import { applyChatRenderEvent, boundChatRenderChunks, type ChatRenderChunk } from "../contracts";
 
 // One event published during an assistant turn. `seq` is monotonic and
 // per-turn (starts at 0). The wire form duplicates the seq into the SSE
@@ -9,6 +10,12 @@ export interface StreamEvent {
   type: string;
   payload: unknown;
 }
+
+type ResumeMetaEvent = StreamEvent & {
+  type: "usage" | "title" | "context_compacted";
+};
+
+const RESUME_META_TYPES = new Set<ResumeMetaEvent["type"]>(["usage", "title", "context_compacted"]);
 
 // Signals delivered to subscribers after the producer settles.
 export type StreamSignal =
@@ -21,18 +28,22 @@ export type Subscriber = (signal: StreamSignal) => void;
 interface Turn {
   chatId: string;
   messageId: string;
-  // In-memory event buffer for cheap mid-turn replay. Identical to the
-  // chat_events rows we persist alongside. We keep both so a server-side
-  // restart still recovers turns from disk.
-  events: StreamEvent[];
+  nextSeq: number;
+  discarded: boolean;
+  // Maintained as events publish, so an atomic resume snapshot clones compact
+  // state instead of replaying every token emitted so far.
+  renderChunks: ChatRenderChunk[];
+  renderToolIndex: Map<string, number>;
+  // Latest authoritative UI metadata for reconnect snapshots. Keeping one
+  // event per type makes snapshot creation independent of token count.
+  resumeMetaEvents: Map<ResumeMetaEvent["type"], ResumeMetaEvent>;
   subscribers: Set<Subscriber>;
   status: "running" | "done" | { error: string };
   // Producer's cancel token. Aborted when the last subscriber leaves and
   // the grace timer expires, or on explicit cancel().
   cancelController: AbortController;
-  // Holds a no-subscriber grace timer. Cleared when a new subscriber
-  // attaches. Fires the producer's cancel after `idleCancelMs` if nobody
-  // ever shows up.
+  // Bounded lifetime without a subscriber. Hidden chats and accidental
+  // disconnects share this one policy, while Stop and deletion cancel now.
   graceTimer: ReturnType<typeof setTimeout> | null;
   // Eviction timer scheduled after the producer settles. Keeps the turn
   // in memory for a short window so a slow reconnect can still tail the
@@ -56,10 +67,25 @@ export interface ProducerApi {
   signal: AbortSignal;
   // Persist + fan out an event. Returns the assigned seq.
   publish: (type: string, payload: unknown) => number;
+  // Full compact state produced by events that were durably published.
+  renderChunks: () => ChatRenderChunk[];
 }
 
 export interface SubscribeResult {
   unsubscribe: () => void;
+}
+
+export interface TurnRenderSnapshot {
+  messageId: string;
+  lastSeq: number;
+  chunks: ChatRenderChunk[];
+  status: "running" | "done" | "error";
+  error?: string;
+  metaEvents: ResumeMetaEvent[];
+}
+
+export interface SnapshotSubscribeResult extends SubscribeResult {
+  snapshot: TurnRenderSnapshot;
 }
 
 export interface HubOptions {
@@ -69,7 +95,7 @@ export interface HubOptions {
   // to span "user switched to another chat and came back", and a turn the
   // user left running is expected to keep going and complete in the
   // background (the sidebar's working/unread indicators depend on it). So
-  // it's deliberately generous (default 10m). It is NOT the primary
+  // it's deliberately generous (default 6h). It is NOT the primary
   // abandonment backstop: in the desktop app the API server is a sidecar
   // the launcher reaps on exit (see parent-watchdog), and an explicit Stop
   // cancels immediately. This timer only reaps turns orphaned in a plain
@@ -81,7 +107,7 @@ export interface HubOptions {
   evictionMs?: number;
 }
 
-const DEFAULT_IDLE_CANCEL_MS = 10 * 60_000;
+const DEFAULT_IDLE_CANCEL_MS = 6 * 60 * 60_000;
 const DEFAULT_EVICTION_MS = 5 * 60_000;
 
 // In-memory pub/sub for in-flight chat turns. The POST handler that
@@ -109,6 +135,22 @@ export class ChatStreamHub {
   // hub-tail vs DB-only replay.
   has(messageId: string): boolean {
     return this.turns.has(messageId);
+  }
+
+  hasForChat(chatId: string, messageId: string): boolean {
+    return this.turns.get(messageId)?.chatId === chatId;
+  }
+
+  renderChunksForChat(
+    chatId: string,
+    messageId: string,
+    includeDebug: boolean,
+  ): ChatRenderChunk[] | null {
+    const turn = this.turns.get(messageId);
+    if (!turn || turn.chatId !== chatId) return null;
+    return turn.renderChunks
+      .filter((chunk) => includeDebug || (chunk.kind !== "thinking" && chunk.kind !== "raw"))
+      .map((chunk) => ({ ...chunk }));
   }
 
   // Convenience for clients/UI that want to know if anything is currently
@@ -148,7 +190,11 @@ export class ChatStreamHub {
     const turn: Turn = {
       chatId: opts.chatId,
       messageId: opts.messageId,
-      events: [],
+      nextSeq: 0,
+      discarded: false,
+      renderChunks: [],
+      renderToolIndex: new Map(),
+      resumeMetaEvents: new Map(),
       subscribers: new Set(),
       status: "running",
       cancelController: new AbortController(),
@@ -160,31 +206,8 @@ export class ChatStreamHub {
     const api: ProducerApi = {
       signal: turn.cancelController.signal,
       publish: (type, payload) => this.publish(turn, type, payload),
+      renderChunks: () => turn.renderChunks.map((chunk) => ({ ...chunk })),
     };
-
-    // Write a marker row to chat_events the instant the turn is
-    // registered, BEFORE the producer fires. Without it there's a
-    // window between startTurn() and the producer's first publish()
-    // (CLI spawn / RPC handshake, easily hundreds of ms) where the
-    // table is empty for this messageId. A client that reconnects in
-    // that window sees the chat with a user message but no events,
-    // can't detect the in-flight assistant turn, and just sits idle.
-    //
-    // We bypass publish() because:
-    //   - the in-memory turn.events stays clean (producer seqs start at 0),
-    //   - there are no subscribers yet to fan out to, and
-    //   - seq=-1 is naturally filtered out by getEventsForMessage's
-    //     `seq > afterSeq` default, so resume replay never re-emits it.
-    // The client's listChatEvents (which returns every row) sees the
-    // marker and detects the in-flight turn from the messageId alone.
-    try {
-      this.chatManager.appendEvent(opts.chatId, opts.messageId, -1, "turn_started", null);
-    } catch (err) {
-      console.warn(
-        `[stream-hub] failed to write turn_started marker (chat=${opts.chatId} msg=${opts.messageId}):`,
-        err,
-      );
-    }
 
     // Kick off the producer. We deliberately don't await, since subscribers
     // attach before the producer makes any progress.
@@ -204,42 +227,70 @@ export class ChatStreamHub {
     this.armGraceTimer(turn);
   }
 
-  // Attach a subscriber that wants events with seq > afterSeq. The
-  // callback is invoked synchronously for replay, then asynchronously
-  // for live events. Returns null if the turn isn't in memory, so the caller
-  // should fall back to DB-only replay.
-  subscribe(messageId: string, afterSeq: number, cb: Subscriber): SubscribeResult | null {
+  // Atomically capture the current compact render and register for only later
+  // events. publish() and this method are synchronous, so no event can land
+  // between the snapshot boundary and subscriber registration.
+  subscribeSnapshot(
+    chatId: string,
+    messageId: string,
+    includeDebug: boolean,
+    cb: Subscriber,
+  ): SnapshotSubscribeResult | null {
     const turn = this.turns.get(messageId);
-    if (!turn) return null;
-
-    // Replay buffered events the caller hasn't seen.
-    for (const ev of turn.events) {
-      if (ev.seq > afterSeq) cb({ kind: "event", event: ev });
-    }
-
-    // If the turn already settled, emit the terminal signal and don't
-    // bother adding to the subscribers set.
-    if (turn.status === "done") {
-      cb({ kind: "done" });
-      return { unsubscribe: () => {} };
-    }
-    if (typeof turn.status === "object") {
-      cb({ kind: "error", message: turn.status.error });
-      return { unsubscribe: () => {} };
-    }
-
-    turn.subscribers.add(cb);
+    if (!turn || turn.chatId !== chatId) return null;
+    const snapshot = this.snapshot(turn, includeDebug);
     this.clearGraceTimer(turn);
-
+    if (turn.status !== "running") {
+      return { snapshot, unsubscribe: () => {} };
+    }
+    const filteredSubscriber: Subscriber = (signal) => {
+      if (signal.kind !== "event") {
+        cb(signal);
+        return;
+      }
+      const event = projectStreamEvent(signal.event, includeDebug);
+      if (event) cb({ kind: "event", event });
+    };
+    turn.subscribers.add(filteredSubscriber);
     return {
+      snapshot,
       unsubscribe: () => {
-        turn.subscribers.delete(cb);
-        // No subscribers left and the turn is still running, so start the
-        // grace timer. If nobody reconnects, the producer gets cancelled.
+        turn.subscribers.delete(filteredSubscriber);
         if (turn.subscribers.size === 0 && turn.status === "running") {
           this.armGraceTimer(turn);
         }
       },
+    };
+  }
+
+  // Read-only compact snapshot for the one-request transcript endpoint. Since
+  // both this method and publish() are synchronous, the route can pass the
+  // result into its synchronous SQLite transaction without a token event
+  // interleaving between the two operations.
+  snapshotForChat(
+    chatId: string,
+    messageId: string,
+    includeDebug: boolean,
+  ): TurnRenderSnapshot | null {
+    const turn = this.turns.get(messageId);
+    if (!turn || turn.chatId !== chatId) return null;
+    return this.snapshot(turn, includeDebug);
+  }
+
+  private snapshot(turn: Turn, includeDebug: boolean): TurnRenderSnapshot {
+    const full = turn.renderChunks.map((chunk) => ({ ...chunk }));
+    const visible = includeDebug
+      ? full
+      : full.filter((chunk) => chunk.kind !== "thinking" && chunk.kind !== "raw");
+    const status =
+      turn.status === "running" ? "running" : turn.status === "done" ? "done" : "error";
+    return {
+      messageId: turn.messageId,
+      lastSeq: turn.nextSeq - 1,
+      chunks: boundChatRenderChunks(visible),
+      metaEvents: [...turn.resumeMetaEvents.values()].toSorted((a, b) => a.seq - b.seq),
+      status,
+      ...(typeof turn.status === "object" ? { error: turn.status.error } : {}),
     };
   }
 
@@ -266,7 +317,14 @@ export class ChatStreamHub {
   cancelForChat(chatId: string): void {
     for (const turn of this.turns.values()) {
       if (turn.chatId === chatId) {
+        turn.discarded = true;
         if (turn.status === "running") turn.cancelController.abort();
+        for (const sub of [...turn.subscribers]) {
+          try {
+            sub({ kind: "error", message: "turn cancelled" });
+          } catch {}
+        }
+        turn.subscribers.clear();
         this.evictNow(turn);
       }
     }
@@ -295,13 +353,12 @@ export class ChatStreamHub {
   }
 
   private publish(turn: Turn, type: string, payload: unknown): number {
-    const seq = turn.events.length;
+    if (turn.discarded) throw new Error("turn cancelled");
+    const seq = turn.nextSeq;
     // Persist first so DB ordering exactly matches in-memory ordering.
-    // If persistence throws we still fan out. The live client sees the
-    // event, even though a future reconnect via the DB-only replay path
-    // will be missing it. We don't crash the turn over a transient
-    // sqlite hiccup, but the warn includes enough context (chat,
-    // message, seq, type) to make the gap diagnosable from logs alone.
+    // A persistence failure aborts the turn before fan-out because exposing
+    // an event that cannot be replayed would make reconnect correctness
+    // impossible.
     try {
       this.chatManager.appendEvent(turn.chatId, turn.messageId, seq, type, payload);
     } catch (err) {
@@ -309,9 +366,20 @@ export class ChatStreamHub {
         `[stream-hub] appendEvent failed (chat=${turn.chatId} msg=${turn.messageId} seq=${seq} type=${type}):`,
         err,
       );
+      // Continuing after a persistence gap makes reconnect correctness
+      // impossible and can turn one transient error into an unbounded memory
+      // buffer. Abort the producer and let its normal partial-finalize path
+      // persist the compact message projection transactionally.
+      turn.cancelController.abort();
+      throw err;
     }
+    turn.nextSeq += 1;
     const event: StreamEvent = { seq, type, payload };
-    turn.events.push(event);
+    if (RESUME_META_TYPES.has(type as ResumeMetaEvent["type"])) {
+      const metaEvent = event as ResumeMetaEvent;
+      turn.resumeMetaEvents.set(metaEvent.type, metaEvent);
+    }
+    applyChatRenderEvent(turn.renderChunks, turn.renderToolIndex, type, payload);
     for (const sub of [...turn.subscribers]) {
       try {
         sub({ kind: "event", event });
@@ -330,6 +398,7 @@ export class ChatStreamHub {
   }
 
   private settle(turn: Turn, signal: { kind: "done" } | { kind: "error"; message: string }): void {
+    if (turn.discarded) return;
     if (turn.status !== "running") return;
     turn.status = signal.kind === "done" ? "done" : { error: signal.message };
     for (const sub of [...turn.subscribers]) {
@@ -377,4 +446,40 @@ export class ChatStreamHub {
       this.turns.delete(turn.messageId);
     }
   }
+}
+
+export function projectStreamEvent(event: StreamEvent, includeDebug: boolean): StreamEvent | null {
+  if (!includeDebug && (event.type === "thinking" || event.type === "raw")) return null;
+  if (event.type !== "tool_call_input" && event.type !== "tool_call_result") return event;
+  const payload = event.payload as Record<string, unknown> | null;
+  if (!payload || typeof payload !== "object") return event;
+  const placeholder: ChatRenderChunk =
+    event.type === "tool_call_input"
+      ? {
+          kind: "tool",
+          id: typeof payload.id === "string" ? payload.id : "",
+          name: "tool",
+          input: payload.input,
+          status: "running",
+        }
+      : {
+          kind: "tool",
+          id: typeof payload.id === "string" ? payload.id : "",
+          name: "tool",
+          output: typeof payload.output === "string" ? payload.output : undefined,
+          isError: payload.isError === true,
+          status: "done",
+        };
+  const bounded = boundChatRenderChunks([placeholder])[0];
+  if (!bounded || bounded.kind !== "tool") return event;
+  return {
+    ...event,
+    payload: {
+      ...payload,
+      ...(event.type === "tool_call_input"
+        ? { input: bounded.input, summary: bounded.summary }
+        : { output: bounded.output }),
+      ...(bounded.detailsAvailable ? { detailsAvailable: true } : {}),
+    },
+  };
 }

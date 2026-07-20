@@ -17,7 +17,12 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import type { ChatEvent as BackendChatEvent } from "../src/chat/backend";
-import { DEFAULT_ANTHROPIC_MODEL_ID } from "../src/contracts";
+import {
+  type ChatResumeSnapshot,
+  DEFAULT_ANTHROPIC_MODEL_ID,
+  TOOL_INPUT_PREVIEW_CHARS,
+  TOOL_OUTPUT_PREVIEW_CHARS,
+} from "../src/contracts";
 import { createTestServer } from "./helpers";
 
 // A controllable fake backend. The constructor takes a "script": a
@@ -29,6 +34,9 @@ type Action =
   | { kind: "event"; event: BackendChatEvent }
   | { kind: "meta"; meta: { sessionId?: string; anchorId?: string } }
   | { kind: "wait"; promise: Promise<void> }
+  // Simulates a provider that ignores cancellation while one callback is
+  // already in progress, then invokes it after the owning chat was deleted.
+  | { kind: "late_delta"; promise: Promise<void>; text: string }
   | { kind: "throw"; message: string }
   | { kind: "abortable" }; // returns once abort signal fires
 
@@ -51,13 +59,23 @@ class FakeBackend {
   private script: Action[] = [];
   public lastSignal: AbortSignal | null = null;
   public lastOpts: FakeSendOpts | null = null;
+  public lastCompletion: Promise<void> = Promise.resolve();
   public callCount = 0;
 
   setScript(actions: Action[]) {
     this.script = actions;
   }
 
-  sendMessage = async (opts: FakeSendOpts): Promise<{ content: string; sessionId?: string }> => {
+  sendMessage = (opts: FakeSendOpts): Promise<{ content: string; sessionId?: string }> => {
+    const result = this.runScript(opts);
+    this.lastCompletion = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  };
+
+  private async runScript(opts: FakeSendOpts): Promise<{ content: string; sessionId?: string }> {
     this.callCount++;
     this.lastSignal = opts.signal ?? null;
     this.lastOpts = opts;
@@ -68,11 +86,15 @@ class FakeBackend {
         content += action.text;
         opts.onDelta(action.text);
       } else if (action.kind === "event") {
-        await opts.onEvent?.(action.event);
+        opts.onEvent?.(action.event);
       } else if (action.kind === "meta") {
         opts.onMeta?.(action.meta);
       } else if (action.kind === "wait") {
         await action.promise;
+      } else if (action.kind === "late_delta") {
+        await action.promise;
+        content += action.text;
+        opts.onDelta(action.text);
       } else if (action.kind === "throw") {
         throw new Error(action.message);
       } else if (action.kind === "abortable") {
@@ -84,7 +106,7 @@ class FakeBackend {
       }
     }
     return { content };
-  };
+  }
 
   probeContext = async (): Promise<{ available: false; reason: string }> => {
     return { available: false, reason: "fake" };
@@ -159,6 +181,12 @@ async function readAllSse(res: Response): Promise<{
   }
 }
 
+function resumeSnapshot(events: { event: string; data: string }[]): ChatResumeSnapshot {
+  const frame = events.find((event) => event.event === "snapshot");
+  if (!frame) throw new Error("missing resume snapshot");
+  return JSON.parse(frame.data) as ChatResumeSnapshot;
+}
+
 describe("chat streaming resilience", () => {
   let baseUrl: string;
   let seedInstance: () => string;
@@ -199,7 +227,23 @@ describe("chat streaming resilience", () => {
     return { instanceId, chatId: id };
   }
 
-  it("POST /messages emits user_message, message_id, deltas, then done", async () => {
+  async function waitForInFlight(chatId: string): Promise<string> {
+    for (let i = 0; i < 50; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const messageId = chatStreamHub.inFlightFor(chatId);
+      if (messageId) return messageId;
+    }
+    throw new Error(`turn for chat ${chatId} did not start`);
+  }
+
+  async function waitForLateProducer(): Promise<void> {
+    await backend.lastCompletion;
+    // The fake backend resolves immediately before ChatTurnService performs
+    // its final persistence and the hub settles its producer promise.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  it("POST /messages emits user_message, message_id, snapshot, then done", async () => {
     const { instanceId, chatId } = await makeChat();
     backend.setScript([
       { kind: "delta", text: "hello " },
@@ -229,13 +273,13 @@ describe("chat streaming resilience", () => {
     const messageId = JSON.parse(events[1]!.data) as string;
     expect(messageId).toMatch(/^[0-9a-f-]{36}$/);
 
-    const deltaEvents = events.filter((e) => e.event === "delta");
-    expect(deltaEvents.length).toBe(2);
-    expect(JSON.parse(deltaEvents[0]!.data)).toBe("hello ");
-    expect(JSON.parse(deltaEvents[1]!.data)).toBe("world");
-    // Each event carries an SSE id with the server-assigned seq.
-    expect(deltaEvents[0]!.id).toBe("0");
-    expect(deltaEvents[1]!.id).toBe("1");
+    expect(events[2]!.event).toBe("snapshot");
+    const snapshot = JSON.parse(events[2]!.data) as {
+      lastSeq: number;
+      chunks: Array<{ kind: string; text?: string }>;
+    };
+    expect(snapshot.lastSeq).toBe(1);
+    expect(snapshot.chunks).toEqual([{ kind: "text", text: "hello world" }]);
 
     expect(events[events.length - 1]!.event).toBe("done");
 
@@ -245,6 +289,162 @@ describe("chat streaming resilience", () => {
     expect(msgs[1]!.role).toBe("assistant");
     expect(msgs[1]!.content).toBe("hello world");
     expect(msgs[1]!.id).toBe(messageId);
+  });
+
+  it("finalizes only the durable prefix when an event-log write fails", async () => {
+    const { instanceId, chatId } = await makeChat();
+    backend.setScript([
+      { kind: "delta", text: "durable prefix" },
+      { kind: "delta", text: " lost suffix" },
+    ]);
+    const appendEvent = chatManager.appendEvent.bind(chatManager);
+    chatManager.appendEvent = (...args: Parameters<typeof appendEvent>) => {
+      const [, , , type, payload] = args;
+      if (type === "delta" && payload === " lost suffix") throw new Error("disk full");
+      return appendEvent(...args);
+    };
+
+    try {
+      const response = await fetch(
+        `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: "persist safely" }),
+        },
+      );
+      const { events } = await readAllSse(response);
+      const snapshot = resumeSnapshot(events);
+      expect(snapshot.chunks).toEqual([{ kind: "text", text: "durable prefix" }]);
+      expect(events.at(-1)?.event).toBe("error");
+      expect(events.some((event) => event.data.includes("lost suffix"))).toBe(false);
+
+      const transcript = (await (
+        await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chatId}/transcript`)
+      ).json()) as {
+        messages: { content: string; role: string }[];
+        inFlight: unknown;
+      };
+      expect(transcript.inFlight).toBeNull();
+      expect(transcript.messages.map((message) => [message.role, message.content])).toEqual([
+        ["user", "persist safely"],
+        ["assistant", "durable prefix"],
+      ]);
+      expect(chatStreamHub.inFlightFor(chatId)).toBeNull();
+    } finally {
+      chatManager.appendEvent = appendEvent;
+    }
+  });
+
+  it("projects the initial POST stream for debug visibility and bounded tool payloads", async () => {
+    const oversizedInput = { command: "x".repeat(TOOL_INPUT_PREVIEW_CHARS * 4) };
+    const oversizedOutput = "y".repeat(TOOL_OUTPUT_PREVIEW_CHARS * 4);
+    const script: Action[] = [
+      { kind: "event", event: { type: "thinking", text: "private reasoning" } },
+      {
+        kind: "event",
+        event: { type: "raw", source: "claude", payload: { private: true } },
+      },
+      { kind: "event", event: { type: "tool_call_start", id: "tool-large", name: "Bash" } },
+      {
+        kind: "event",
+        event: { type: "tool_call_input", id: "tool-large", input: oversizedInput },
+      },
+      {
+        kind: "event",
+        event: { type: "tool_call_result", id: "tool-large", output: oversizedOutput },
+      },
+      { kind: "delta", text: "finished" },
+    ];
+
+    const run = async (debug: boolean) => {
+      const { instanceId, chatId } = await makeChat();
+      backend.setScript(script);
+      const response = await fetch(
+        `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages${debug ? "?debug=1" : ""}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: "inspect" }),
+        },
+      );
+      expect(response.status).toBe(200);
+      return (await readAllSse(response)).events;
+    };
+
+    const snapshotChunks = (events: Awaited<ReturnType<typeof run>>) =>
+      (
+        JSON.parse(events.find((event) => event.event === "snapshot")!.data) as {
+          chunks: Array<{
+            kind: string;
+            summary?: string;
+            input?: unknown;
+            output?: string;
+            detailsAvailable?: boolean;
+          }>;
+        }
+      ).chunks;
+
+    const visibleChunks = snapshotChunks(await run(false));
+    expect(visibleChunks.some((chunk) => chunk.kind === "thinking")).toBe(false);
+    expect(visibleChunks.some((chunk) => chunk.kind === "raw")).toBe(false);
+    const visibleTool = visibleChunks.find((chunk) => chunk.kind === "tool")!;
+    expect(visibleTool.summary).toStartWith("x");
+    expect(typeof visibleTool.input).toBe("string");
+    expect((visibleTool.input as string).length).toBeLessThanOrEqual(TOOL_INPUT_PREVIEW_CHARS + 1);
+    expect(visibleTool.output!.length).toBeLessThanOrEqual(TOOL_OUTPUT_PREVIEW_CHARS + 1);
+    expect(visibleTool.detailsAvailable).toBe(true);
+
+    const debugChunks = snapshotChunks(await run(true));
+    expect(debugChunks.some((chunk) => chunk.kind === "thinking")).toBe(true);
+    expect(debugChunks.some((chunk) => chunk.kind === "raw")).toBe(true);
+    const debugTool = debugChunks.find((chunk) => chunk.kind === "tool")!;
+    expect((debugTool.input as string).length).toBeLessThanOrEqual(TOOL_INPUT_PREVIEW_CHARS + 1);
+    expect(debugTool.output!.length).toBeLessThanOrEqual(TOOL_OUTPUT_PREVIEW_CHARS + 1);
+    expect(debugTool.detailsAvailable).toBe(true);
+  });
+
+  it("publishes usage before done when the backend does not await onEvent", async () => {
+    const { instanceId, chatId } = await makeChat();
+    const usage = {
+      inputTokens: 11,
+      cachedInputTokens: 3,
+      cacheCreationInputTokens: 2,
+      outputTokens: 5,
+      reasoningOutputTokens: 1,
+      totalTokens: 22,
+    };
+    backend.setScript([
+      { kind: "event", event: { type: "usage", last: usage, total: usage, costUsd: 0.01 } },
+      { kind: "delta", text: "answer" },
+    ]);
+
+    const response = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "measure" }),
+      },
+    );
+    const { events } = await readAllSse(response);
+    const snapshotIndex = events.findIndex((event) => event.event === "snapshot");
+    const doneIndex = events.findIndex((event) => event.event === "done");
+    expect(snapshotIndex).toBeGreaterThan(-1);
+    expect(doneIndex).toBeGreaterThan(snapshotIndex);
+    const snapshot = JSON.parse(events[snapshotIndex]!.data) as {
+      metaEvents: Array<{ type: string; payload: unknown }>;
+    };
+    expect(snapshot.metaEvents.find((event) => event.type === "usage")?.payload).toMatchObject({
+      total: usage,
+      last: usage,
+    });
+    expect(chatManager.get(chatId)).toMatchObject({
+      inputTokens: usage.inputTokens,
+      cachedInputTokens: usage.cachedInputTokens,
+      outputTokens: usage.outputTokens,
+      costUsd: 0.01,
+    });
   });
 
   it("GET /messages/:id/stream replays a completed turn from the DB", async () => {
@@ -269,14 +469,86 @@ describe("chat streaming resilience", () => {
     const { events: getEvents } = await readAllSse(getRes);
     expect(getEvents[0]!.event).toBe("message_id");
     expect(JSON.parse(getEvents[0]!.data)).toBe(messageId);
-    const replayedDeltas = getEvents
-      .filter((e) => e.event === "delta")
-      .map((e) => JSON.parse(e.data));
-    expect(replayedDeltas).toEqual(["one", "two"]);
+    const snapshot = resumeSnapshot(getEvents);
+    expect(snapshot.status).toBe("done");
+    expect(snapshot.message?.content).toBe("onetwo");
+    expect(snapshot.chunks).toEqual([{ kind: "text", text: "onetwo" }]);
+    expect(getEvents.filter((event) => event.event === "delta")).toHaveLength(0);
     expect(getEvents[getEvents.length - 1]!.event).toBe("done");
   });
 
-  it("GET resume with afterSeq skips already-applied events", async () => {
+  it("folds structural turn events into one completed render row", async () => {
+    const { instanceId, chatId } = await makeChat();
+    backend.setScript([
+      { kind: "event", event: { type: "tool_call_start", id: "tool-1", name: "Read" } },
+      {
+        kind: "event",
+        event: { type: "tool_call_result", id: "tool-1", output: "ok" },
+      },
+      { kind: "delta", text: "finished" },
+    ]);
+
+    const response = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "run it" }),
+      },
+    );
+    const { events } = await readAllSse(response);
+    const messageId = JSON.parse(events.find((event) => event.event === "message_id")!.data);
+    const rows = chatManager.getMessageRenders(chatId, [messageId]);
+
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.chunks).map((chunk: { kind: string }) => chunk.kind)).toEqual([
+      "tool",
+      "text",
+    ]);
+    expect(JSON.parse(rows[0]!.debugChunks).map((chunk: { kind: string }) => chunk.kind)).toEqual([
+      "tool",
+      "text",
+    ]);
+  });
+
+  it("persists structural output when a turn fails before producing text", async () => {
+    const { instanceId, chatId } = await makeChat();
+    backend.setScript([
+      { kind: "event", event: { type: "tool_call_start", id: "tool-1", name: "Read" } },
+      {
+        kind: "event",
+        event: { type: "tool_call_result", id: "tool-1", output: "partial result" },
+      },
+      { kind: "throw", message: "provider failed" },
+    ]);
+
+    const response = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "run it" }),
+      },
+    );
+    const { events } = await readAllSse(response);
+    const messageId = JSON.parse(events.find((event) => event.event === "message_id")!.data);
+
+    expect(events.at(-1)?.event).toBe("error");
+    expect(chatManager.getMessage(messageId)?.content).toBe("");
+    const rows = chatManager.getMessageRenders(chatId, [messageId]);
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.chunks)).toEqual([
+      {
+        kind: "tool",
+        id: "tool-1",
+        name: "Read",
+        output: "partial result",
+        status: "done",
+      },
+    ]);
+  });
+
+  it("GET resume replaces raw replay with one bounded current snapshot", async () => {
     const { instanceId, chatId } = await makeChat();
     backend.setScript([
       { kind: "delta", text: "a" },
@@ -291,13 +563,16 @@ describe("chat streaming resilience", () => {
     const { events: postEvents } = await readAllSse(postRes);
     const messageId = JSON.parse(postEvents.find((e) => e.event === "message_id")!.data) as string;
 
-    // Resume with afterSeq=0: should only see "b" and "c".
+    // The snapshot supersedes the old cursor-based raw replay protocol.
     const getRes = await fetch(
       `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages/${messageId}/stream?afterSeq=0`,
     );
     const { events } = await readAllSse(getRes);
-    const deltas = events.filter((e) => e.event === "delta").map((e) => JSON.parse(e.data));
-    expect(deltas).toEqual(["b", "c"]);
+    const snapshot = resumeSnapshot(events);
+    expect(snapshot.lastSeq).toBeGreaterThanOrEqual(2);
+    expect(snapshot.message?.content).toBe("abc");
+    expect(snapshot.chunks).toEqual([{ kind: "text", text: "abc" }]);
+    expect(events.filter((event) => event.event === "delta")).toHaveLength(0);
   });
 
   it("GET resume tails an in-flight turn without re-running the backend", async () => {
@@ -340,8 +615,10 @@ describe("chat streaming resilience", () => {
     resolveBackend();
 
     const { events } = await readAllSse(getRes);
+    const snapshot = resumeSnapshot(events);
     const deltas = events.filter((e) => e.event === "delta").map((e) => JSON.parse(e.data));
-    expect(deltas).toEqual(["first", "second"]);
+    expect(snapshot.chunks).toEqual([{ kind: "text", text: "first" }]);
+    expect(deltas).toEqual(["second"]);
     expect(events[events.length - 1]!.event).toBe("done");
 
     // The backend was invoked exactly once even though there were two
@@ -350,6 +627,60 @@ describe("chat streaming resilience", () => {
 
     // Drain the POST body so the fetch doesn't dangle.
     await readAllSse(await postPromise);
+  });
+
+  it("GET transcript returns the compact active turn and then its committed message", async () => {
+    const { instanceId, chatId } = await makeChat();
+    let releaseBackend: () => void = () => {};
+    const backendHold = new Promise<void>((resolve) => {
+      releaseBackend = resolve;
+    });
+    backend.setScript([
+      { kind: "delta", text: "first" },
+      { kind: "wait", promise: backendHold },
+      { kind: "delta", text: " second" },
+    ]);
+
+    const postPromise = fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: "question" }),
+    });
+    const messageId = await waitForInFlight(chatId);
+
+    const activeResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/transcript`,
+    );
+    expect(activeResponse.status).toBe(200);
+    const active = (await activeResponse.json()) as {
+      messages: { id: string; role: string; content: string }[];
+      inFlight: { messageId: string; lastSeq: number; chunks: unknown[] } | null;
+    };
+    expect(active.messages.map((message) => [message.role, message.content])).toEqual([
+      ["user", "question"],
+    ]);
+    expect(active.inFlight).toMatchObject({
+      messageId,
+      chunks: [{ kind: "text", text: "first" }],
+    });
+    expect(active.inFlight!.lastSeq).toBeGreaterThanOrEqual(0);
+
+    releaseBackend();
+    const { events } = await readAllSse(await postPromise);
+    expect(events.at(-1)?.event).toBe("done");
+
+    const completed = (await (
+      await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chatId}/transcript`)
+    ).json()) as {
+      messages: { id: string; role: string; content: string }[];
+      inFlight: unknown;
+    };
+    expect(completed.inFlight).toBeNull();
+    expect(completed.messages.map((message) => [message.role, message.content])).toEqual([
+      ["user", "question"],
+      ["assistant", "first second"],
+    ]);
+    expect(completed.messages.at(-1)?.id).toBe(messageId);
   });
 
   it("DELETE /messages/:id cancels an in-flight turn", async () => {
@@ -376,10 +707,11 @@ describe("chat streaming resilience", () => {
     expect(delRes.status).toBe(200);
 
     const { events } = await readAllSse(await postPromise);
-    // Partial delta was sent, terminal event is `error` ("aborted").
-    expect(events.filter((e) => e.event === "delta").map((e) => JSON.parse(e.data))).toEqual([
-      "before-cancel",
-    ]);
+    // The initial snapshot contains the partial output, then error terminates.
+    const snapshot = JSON.parse(events.find((event) => event.event === "snapshot")!.data) as {
+      chunks: Array<{ kind: string; text?: string }>;
+    };
+    expect(snapshot.chunks).toEqual([{ kind: "text", text: "before-cancel" }]);
     expect(events[events.length - 1]!.event).toBe("error");
     expect(events[events.length - 1]!.data).toMatch(/aborted/i);
 
@@ -389,12 +721,112 @@ describe("chat streaming resilience", () => {
     expect(assistant?.content).toBe("before-cancel");
   });
 
+  it("deleting an in-flight chat discards callbacks that arrive after deletion", async () => {
+    const { instanceId, chatId } = await makeChat();
+    let releaseLateCallback: () => void = () => {};
+    const lateCallback = new Promise<void>((resolve) => {
+      releaseLateCallback = resolve;
+    });
+    backend.setScript([
+      { kind: "delta", text: "before-delete" },
+      { kind: "late_delta", promise: lateCallback, text: "-too-late" },
+    ]);
+
+    const postResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "delete this chat" }),
+      },
+    );
+    const messageId = await waitForInFlight(chatId);
+
+    const deleteResponse = await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chatId}`, {
+      method: "DELETE",
+    });
+    expect(deleteResponse.status).toBe(200);
+    releaseLateCallback();
+    await readAllSse(postResponse);
+    await waitForLateProducer();
+    expect(chatManager.get(chatId)).toBeUndefined();
+    expect(chatManager.getMessages(chatId)).toEqual([]);
+    expect(chatManager.getEvents(chatId)).toEqual([]);
+    expect(chatManager.getEventsForMessage(messageId, -2)).toEqual([]);
+    expect(chatManager.getMessageRenders(chatId, [messageId])).toEqual([]);
+  });
+
+  it("deleting an instance discards late callbacks from all of its in-flight chats", async () => {
+    const { instanceId, chatId } = await makeChat();
+    let releaseLateCallback: () => void = () => {};
+    const lateCallback = new Promise<void>((resolve) => {
+      releaseLateCallback = resolve;
+    });
+    backend.setScript([
+      { kind: "delta", text: "before-instance-delete" },
+      { kind: "late_delta", promise: lateCallback, text: "-too-late" },
+    ]);
+
+    const postResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "delete this instance" }),
+      },
+    );
+    const messageId = await waitForInFlight(chatId);
+
+    const deleteResponse = await fetch(`${baseUrl}/api/instances/${instanceId}`, {
+      method: "DELETE",
+    });
+    expect(deleteResponse.status).toBe(200);
+    releaseLateCallback();
+    await readAllSse(postResponse);
+    await waitForLateProducer();
+    expect((await fetch(`${baseUrl}/api/instances/${instanceId}`)).status).toBe(404);
+    expect(chatManager.get(chatId)).toBeUndefined();
+    expect(chatManager.getMessages(chatId)).toEqual([]);
+    expect(chatManager.getEvents(chatId)).toEqual([]);
+    expect(chatManager.getEventsForMessage(messageId, -2)).toEqual([]);
+    expect(chatManager.getMessageRenders(chatId, [messageId])).toEqual([]);
+  });
+
   it("returns 404 when resuming a totally unknown messageId", async () => {
     const { instanceId, chatId } = await makeChat();
     const res = await fetch(
       `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages/00000000-0000-0000-0000-000000000000/stream?afterSeq=-1`,
     );
     expect(res.status).toBe(404);
+  });
+
+  it("does not resume or cancel an in-memory turn through another chat", async () => {
+    const owner = await makeChat();
+    const other = await makeChat();
+    const messageId = crypto.randomUUID();
+    chatStreamHub.startTurn({
+      chatId: owner.chatId,
+      messageId,
+      run: async (api) =>
+        new Promise<void>((_, reject) => {
+          api.signal.addEventListener("abort", () => reject(new Error("aborted")), {
+            once: true,
+          });
+        }),
+    });
+
+    const resume = await fetch(
+      `${baseUrl}/api/instances/${other.instanceId}/chats/${other.chatId}/messages/${messageId}/stream`,
+    );
+    expect(resume.status).toBe(404);
+    const cancel = await fetch(
+      `${baseUrl}/api/instances/${other.instanceId}/chats/${other.chatId}/messages/${messageId}`,
+      { method: "DELETE" },
+    );
+    expect(cancel.status).toBe(404);
+    expect(chatStreamHub.hasForChat(owner.chatId, messageId)).toBe(true);
+    chatStreamHub.cancel(messageId);
+    await chatStreamHub.drain();
   });
 
   it("returns 409 when a second POST races an in-flight turn", async () => {
@@ -500,8 +932,10 @@ describe("chat streaming resilience", () => {
     const [e1, e2] = await Promise.all([readAllSse(r1), readAllSse(r2)]);
     const d1 = e1.events.filter((e) => e.event === "delta").map((e) => JSON.parse(e.data));
     const d2 = e2.events.filter((e) => e.event === "delta").map((e) => JSON.parse(e.data));
-    expect(d1).toEqual(["alpha", "beta"]);
-    expect(d2).toEqual(["alpha", "beta"]);
+    expect(resumeSnapshot(e1.events).chunks).toEqual([{ kind: "text", text: "alpha" }]);
+    expect(resumeSnapshot(e2.events).chunks).toEqual([{ kind: "text", text: "alpha" }]);
+    expect(d1).toEqual(["beta"]);
+    expect(d2).toEqual(["beta"]);
     await readAllSse(await post);
   });
 
@@ -523,9 +957,11 @@ describe("chat streaming resilience", () => {
     );
     expect(res.status).toBe(200);
     const { events } = await readAllSse(res);
-    const deltas = events.filter((e) => e.event === "delta").map((e) => JSON.parse(e.data));
-    expect(deltas).toEqual(["partial-", "content"]);
-    expect(events[events.length - 1]!.event).toBe("done");
+    const snapshot = resumeSnapshot(events);
+    expect(snapshot.message?.content).toBe("partial-content");
+    expect(snapshot.status).toBe("error");
+    expect(events.filter((event) => event.event === "delta")).toHaveLength(0);
+    expect(events[events.length - 1]!.event).toBe("error");
 
     // Row was backfilled.
     const msg = chatManager.getMessages(chatId).find((m) => m.id === orphanId);
@@ -654,8 +1090,10 @@ describe("chat streaming resilience", () => {
     );
     resolveBackend();
     const { events } = await readAllSse(getRes);
+    const snapshot = resumeSnapshot(events);
     const deltas = events.filter((e) => e.event === "delta").map((e) => JSON.parse(e.data));
-    expect(deltas).toEqual(["before", "after"]);
+    expect(snapshot.chunks).toEqual([{ kind: "text", text: "before" }]);
+    expect(deltas).toEqual(["after"]);
     expect(events[events.length - 1]!.event).toBe("done");
   });
 
@@ -840,12 +1278,17 @@ describe("chat streaming resilience", () => {
       body: JSON.stringify({ leafId: turn2.userMessageId }),
     });
     expect(res.status).toBe(200);
-    const updated = (await res.json()) as { activeLeafId: string; claudeSessionId: string | null };
+    const updated = (await res.json()) as {
+      activeLeafId: string;
+      claudeSessionId: string | null;
+      transcript: { messages: { id: string }[] };
+    };
     const originalAssistant = chatManager
       .getMessages(chatId)
       .find((m) => m.parentId === turn2.userMessageId)!;
     expect(updated.activeLeafId).toBe(originalAssistant.id);
     expect(updated.claudeSessionId).toBe("sess-1");
+    expect(updated.transcript.messages.at(-1)?.id).toBe(originalAssistant.id);
     expect(chatManager.get(chatId)?.activeLeafId).toBe(originalAssistant.id);
 
     const unknown = await fetch(

@@ -2,564 +2,351 @@ import { beforeEach, describe, expect, it } from "bun:test";
 import { randomUUID } from "crypto";
 import { ChatStreamHub, type StreamSignal } from "../src/chat/stream-hub";
 import { ChatManager } from "../src/chats";
-import { createDb } from "../src/db";
+import { createDb, schema } from "../src/db";
 
-function makeDb() {
-  return createDb(":memory:");
-}
-
-function makeInstanceId(db: ReturnType<typeof makeDb>) {
-  const { schema } = require("../src/db");
-  const id = randomUUID();
-  db.insert(schema.instances)
-    .values({
-      id,
-      vmId: `vm-${id.slice(0, 8)}`,
-      status: "running",
-      image: "test-image",
-      profileId: "default",
-    })
-    .run();
-  return id;
-}
-
-// Capture every signal a subscriber sees so we can assert on the
-// sequence after the test runs.
-function captureSubscriber(): {
-  signals: StreamSignal[];
-  cb: (s: StreamSignal) => void;
-  awaitTerminal: () => Promise<void>;
-} {
+function captureSubscriber() {
   const signals: StreamSignal[] = [];
   let resolve: () => void = () => {};
-  const done = new Promise<void>((r) => {
-    resolve = r;
+  const terminal = new Promise<void>((done) => {
+    resolve = done;
   });
   return {
     signals,
-    cb: (s) => {
-      signals.push(s);
-      if (s.kind === "done" || s.kind === "error") resolve();
+    cb(signal: StreamSignal) {
+      signals.push(signal);
+      if (signal.kind !== "event") resolve();
     },
-    awaitTerminal: () => done,
+    terminal,
   };
 }
 
 describe("ChatStreamHub", () => {
-  let db: ReturnType<typeof makeDb>;
-  let cm: ChatManager;
+  let db: ReturnType<typeof createDb>;
+  let chatManager: ChatManager;
   let hub: ChatStreamHub;
   let chatId: string;
   let messageId: string;
 
   beforeEach(() => {
-    db = makeDb();
-    cm = new ChatManager(db);
-    hub = new ChatStreamHub(cm, { idleCancelMs: 60_000, evictionMs: 60_000 });
-    const instanceId = makeInstanceId(db);
-    const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
-    chatId = chat.id;
+    db = createDb(":memory:");
+    chatManager = new ChatManager(db);
+    const instanceId = randomUUID();
+    db.insert(schema.instances)
+      .values({
+        id: instanceId,
+        vmId: `vm-${instanceId}`,
+        status: "running",
+        image: "test-image",
+        profileId: "default",
+      })
+      .run();
+    chatId = chatManager.create(instanceId, "claude-sonnet-4-5", "anthropic", "high").id;
     messageId = randomUUID();
+    hub = new ChatStreamHub(chatManager, { idleCancelMs: 60_000, evictionMs: 60_000 });
   });
 
-  describe("happy path", () => {
-    it("fans out producer events to a single subscriber", async () => {
-      const sub = captureSubscriber();
-      hub.startTurn({
-        chatId,
-        messageId,
-        run: async (api) => {
-          api.publish("delta", "hello ");
-          api.publish("delta", "world");
-        },
-      });
-      hub.subscribe(messageId, -1, sub.cb);
-      await sub.awaitTerminal();
-      expect(sub.signals.length).toBe(3);
-      expect(sub.signals[0]).toEqual({
-        kind: "event",
-        event: { seq: 0, type: "delta", payload: "hello " },
-      });
-      expect(sub.signals[1]).toEqual({
-        kind: "event",
-        event: { seq: 1, type: "delta", payload: "world" },
-      });
-      expect(sub.signals[2]).toEqual({ kind: "done" });
+  it("captures compact state atomically and delivers only later events", async () => {
+    let release: () => void = () => {};
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    hub.startTurn({
+      chatId,
+      messageId,
+      run: async (api) => {
+        api.publish("delta", "before");
+        expect(api.renderChunks()).toEqual([{ kind: "text", text: "before" }]);
+        await hold;
+        api.publish("delta", "after");
+      },
     });
 
-    it("persists events to chat_events as they fan out", async () => {
-      hub.startTurn({
-        chatId,
-        messageId,
-        run: async (api) => {
-          api.publish("delta", "abc");
-          api.publish("delta", "def");
-        },
-      });
-      await hub.drain();
-      const events = cm.getEventsForMessage(messageId);
-      expect(
-        events.map((e) => ({
-          seq: e.seq,
-          type: e.type,
-          payload: JSON.parse(e.payload),
-        })),
-      ).toEqual([
-        { seq: 0, type: "delta", payload: "abc" },
-        { seq: 1, type: "delta", payload: "def" },
-      ]);
+    const tail = captureSubscriber();
+    const subscription = hub.subscribeSnapshot(chatId, messageId, false, tail.cb);
+    expect(subscription?.snapshot).toMatchObject({
+      messageId,
+      lastSeq: 0,
+      status: "running",
+      chunks: [{ kind: "text", text: "before" }],
     });
+    expect(tail.signals).toEqual([]);
 
-    it("emits error signal when the producer throws", async () => {
-      const sub = captureSubscriber();
-      hub.startTurn({
-        chatId,
-        messageId,
-        run: async () => {
-          throw new Error("oops");
-        },
-      });
-      hub.subscribe(messageId, -1, sub.cb);
-      await sub.awaitTerminal();
-      expect(sub.signals).toEqual([{ kind: "error", message: "oops" }]);
-    });
+    release();
+    await tail.terminal;
+    expect(tail.signals).toEqual([
+      { kind: "event", event: { seq: 1, type: "delta", payload: "after" } },
+      { kind: "done" },
+    ]);
   });
 
-  describe("resume / replay", () => {
-    it("replays buffered events to a late subscriber", async () => {
-      // Producer publishes immediately but we don't subscribe until
-      // after they've all landed. Use a delay to ensure publish() has
-      // happened before subscribe().
-      let resolveProducer: () => void = () => {};
-      const producerHold = new Promise<void>((r) => {
-        resolveProducer = r;
-      });
-      hub.startTurn({
-        chatId,
-        messageId,
-        run: async (api) => {
-          api.publish("delta", "a");
-          api.publish("delta", "b");
-          api.publish("delta", "c");
-          await producerHold;
-        },
-      });
-      // Subscribe NOW, and it should get replay of all 3 events.
-      const sub = captureSubscriber();
-      hub.subscribe(messageId, -1, sub.cb);
-      // Sanity: replay is synchronous within subscribe().
-      expect(sub.signals.length).toBe(3);
-      expect(sub.signals.map((s) => (s.kind === "event" ? s.event.payload : null))).toEqual([
-        "a",
-        "b",
-        "c",
-      ]);
-      // Now let producer finish.
-      resolveProducer();
-      await sub.awaitTerminal();
-      // Done arrives after the producer settles.
-      expect(sub.signals[sub.signals.length - 1]).toEqual({ kind: "done" });
+  it("persists before fanout", async () => {
+    let release: () => void = () => {};
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
     });
-
-    it("skips events the subscriber has already seen", async () => {
-      let resolveProducer: () => void = () => {};
-      const producerHold = new Promise<void>((r) => {
-        resolveProducer = r;
-      });
-      hub.startTurn({
-        chatId,
-        messageId,
-        run: async (api) => {
-          api.publish("delta", "a"); // seq 0
-          api.publish("delta", "b"); // seq 1
-          api.publish("delta", "c"); // seq 2
-          await producerHold;
-        },
-      });
-      const sub = captureSubscriber();
-      // Subscribe asking for events after seq 0, and it should only get b, c.
-      hub.subscribe(messageId, 0, sub.cb);
-      expect(sub.signals.map((s) => (s.kind === "event" ? s.event.seq : null))).toEqual([1, 2]);
-      resolveProducer();
-      await sub.awaitTerminal();
+    hub.startTurn({
+      chatId,
+      messageId,
+      run: async (api) => {
+        await hold;
+        api.publish("delta", "durable");
+      },
     });
-
-    it("delivers settled status synchronously to late subscribers", async () => {
-      hub.startTurn({
-        chatId,
-        messageId,
-        run: async (api) => {
-          api.publish("delta", "done");
-        },
-      });
-      await hub.drain();
-      const sub = captureSubscriber();
-      hub.subscribe(messageId, -1, sub.cb);
-      // Both replay event and terminal signal arrive synchronously.
-      expect(sub.signals).toEqual([
-        { kind: "event", event: { seq: 0, type: "delta", payload: "done" } },
-        { kind: "done" },
-      ]);
+    const subscriber = captureSubscriber();
+    hub.subscribeSnapshot(chatId, messageId, false, (signal) => {
+      if (signal.kind === "event") {
+        expect(chatManager.getEventsForMessage(messageId)).toHaveLength(1);
+      }
+      subscriber.cb(signal);
     });
-
-    it("late subscribers after error see the error", async () => {
-      hub.startTurn({
-        chatId,
-        messageId,
-        run: async () => {
-          throw new Error("boom");
-        },
-      });
-      await hub.drain();
-      const sub = captureSubscriber();
-      hub.subscribe(messageId, -1, sub.cb);
-      expect(sub.signals).toEqual([{ kind: "error", message: "boom" }]);
-    });
+    release();
+    await subscriber.terminal;
+    expect(JSON.parse(chatManager.getEventsForMessage(messageId)[0]!.payload)).toBe("durable");
   });
 
-  describe("multi-subscriber", () => {
-    it("delivers the same events to two subscribers in order", async () => {
-      let resolveProducer: () => void = () => {};
-      const producerHold = new Promise<void>((r) => {
-        resolveProducer = r;
-      });
-      hub.startTurn({
-        chatId,
-        messageId,
-        run: async (api) => {
-          api.publish("delta", "x");
-          await producerHold;
-          api.publish("delta", "y");
-        },
-      });
-      const a = captureSubscriber();
-      const b = captureSubscriber();
-      hub.subscribe(messageId, -1, a.cb);
-      hub.subscribe(messageId, -1, b.cb);
-      // Both saw the first replay.
-      expect(a.signals.length).toBe(1);
-      expect(b.signals.length).toBe(1);
-      resolveProducer();
-      await Promise.all([a.awaitTerminal(), b.awaitTerminal()]);
-      const aPayloads = a.signals
-        .filter((s) => s.kind === "event")
-        .map((s) => (s as Extract<StreamSignal, { kind: "event" }>).event.payload);
-      const bPayloads = b.signals
-        .filter((s) => s.kind === "event")
-        .map((s) => (s as Extract<StreamSignal, { kind: "event" }>).event.payload);
-      expect(aPayloads).toEqual(["x", "y"]);
-      expect(bPayloads).toEqual(["x", "y"]);
+  it("keeps only the latest resume metadata", () => {
+    hub.startTurn({
+      chatId,
+      messageId,
+      run: async (api) => {
+        api.publish("usage", { total: 1 });
+        api.publish("title", "Title");
+        api.publish("usage", { total: 2 });
+        api.publish("context_compacted", null);
+        await new Promise(() => {});
+      },
     });
 
-    it("unsubscribe stops delivery without affecting other subscribers", async () => {
-      let resolveProducer: () => void = () => {};
-      const producerHold = new Promise<void>((r) => {
-        resolveProducer = r;
-      });
-      hub.startTurn({
-        chatId,
-        messageId,
-        run: async (api) => {
-          api.publish("delta", "first");
-          await producerHold;
-          api.publish("delta", "second");
-        },
-      });
-      const a = captureSubscriber();
-      const b = captureSubscriber();
-      const subA = hub.subscribe(messageId, -1, a.cb)!;
-      hub.subscribe(messageId, -1, b.cb);
-      subA.unsubscribe();
-      resolveProducer();
-      await b.awaitTerminal();
-      // A only saw "first"; B saw both.
-      const aPayloads = a.signals
-        .filter((s) => s.kind === "event")
-        .map((s) => (s as Extract<StreamSignal, { kind: "event" }>).event.payload);
-      const bPayloads = b.signals
-        .filter((s) => s.kind === "event")
-        .map((s) => (s as Extract<StreamSignal, { kind: "event" }>).event.payload);
-      expect(aPayloads).toEqual(["first"]);
-      expect(bPayloads).toEqual(["first", "second"]);
-    });
+    expect(hub.snapshotForChat(chatId, messageId, false)?.metaEvents).toEqual([
+      { seq: 1, type: "title", payload: "Title" },
+      { seq: 2, type: "usage", payload: { total: 2 } },
+      { seq: 3, type: "context_compacted", payload: null },
+    ]);
+    hub.cancel(messageId);
   });
 
-  describe("cancellation", () => {
-    it("cancel aborts the producer signal", async () => {
-      const sub = captureSubscriber();
-      // Captured inside the producer callback. A plain `let` would be
-      // flow-narrowed to its initializer (TS doesn't track assignments made
-      // inside nested closures), so use a holder object whose property type
-      // is preserved.
-      const captured: { signal: AbortSignal | null } = { signal: null };
-      hub.startTurn({
-        chatId,
-        messageId,
-        run: async (api) => {
-          captured.signal = api.signal;
-          await new Promise<void>((_resolve, reject) => {
-            api.signal.addEventListener("abort", () => reject(new Error("aborted")), {
-              once: true,
-            });
-          });
-        },
-      });
-      hub.subscribe(messageId, -1, sub.cb);
-      const cancelled = hub.cancel(messageId);
-      expect(cancelled).toBe(true);
-      await sub.awaitTerminal();
-      expect(captured.signal?.aborted).toBe(true);
-      expect(sub.signals[sub.signals.length - 1]).toEqual({
-        kind: "error",
-        message: "aborted",
-      });
+  it("filters debug events and bounds live tool payloads", async () => {
+    let release: () => void = () => {};
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
     });
-
-    it("cancel returns false for unknown messageId", () => {
-      expect(hub.cancel("nonexistent")).toBe(false);
-    });
-
-    it("cancelForChat tears down every turn for the chat", async () => {
-      const otherChatId = cm.create(
-        makeInstanceId(db),
-        "claude-sonnet-4-5",
-        "anthropic",
-        "high",
-      ).id;
-      const otherMsgId = randomUUID();
-      const subA = captureSubscriber();
-      const subB = captureSubscriber();
-      hub.startTurn({
-        chatId,
-        messageId,
-        run: async (api) => {
-          await new Promise<void>((_, reject) => {
-            api.signal.addEventListener("abort", () => reject(new Error("aborted")), {
-              once: true,
-            });
-          });
-        },
-      });
-      hub.startTurn({
-        chatId: otherChatId,
-        messageId: otherMsgId,
-        run: async (api) => {
-          await new Promise<void>((_, reject) => {
-            api.signal.addEventListener("abort", () => reject(new Error("aborted")), {
-              once: true,
-            });
-          });
-        },
-      });
-      hub.subscribe(messageId, -1, subA.cb);
-      hub.subscribe(otherMsgId, -1, subB.cb);
-      hub.cancelForChat(chatId);
-      // Subscriber A should see error and be evicted.
-      // Subscriber B keeps going.
-      await new Promise((r) => setTimeout(r, 50));
-      expect(subA.signals[subA.signals.length - 1]?.kind).toBe("error");
-      expect(subB.signals.length).toBe(0); // still running
-      hub.cancel(otherMsgId);
-      await subB.awaitTerminal();
-    });
-  });
-
-  describe("idle cancel", () => {
-    it("cancels the producer when no subscriber attaches before grace", async () => {
-      const fastHub = new ChatStreamHub(cm, {
-        idleCancelMs: 50,
-        evictionMs: 60_000,
-      });
-      const result = new Promise<unknown>((resolve) => {
-        fastHub.startTurn({
-          chatId,
-          messageId,
-          run: async (api) => {
-            try {
-              await new Promise<void>((_, reject) => {
-                api.signal.addEventListener("abort", () => reject(new Error("aborted")), {
-                  once: true,
-                });
-              });
-              resolve(null);
-            } catch (err) {
-              resolve(err);
-            }
-          },
+    hub.startTurn({
+      chatId,
+      messageId,
+      run: async (api) => {
+        await hold;
+        api.publish("thinking", { text: "secret" });
+        api.publish("raw", { source: "claude", payload: { value: "z".repeat(20_000) } });
+        api.publish("tool_call_start", { id: "tool", name: "Bash" });
+        api.publish("tool_call_input", {
+          id: "tool",
+          input: { command: `echo ${"x".repeat(20_000)}` },
         });
-      });
-      // Don't subscribe. Wait > idleCancelMs.
-      await new Promise((r) => setTimeout(r, 150));
-      const err = await result;
-      expect((err as Error)?.message).toBe("aborted");
+        api.publish("tool_call_result", { id: "tool", output: "y".repeat(20_000) });
+      },
     });
+    const subscriber = captureSubscriber();
+    hub.subscribeSnapshot(chatId, messageId, false, subscriber.cb);
+    release();
+    await subscriber.terminal;
 
-    it("attaching a subscriber clears the grace timer", async () => {
-      const fastHub = new ChatStreamHub(cm, {
-        idleCancelMs: 50,
-        evictionMs: 60_000,
-      });
-      let producerAlive = true;
-      let resolveProducer: () => void = () => {};
-      fastHub.startTurn({
-        chatId,
-        messageId,
-        run: async (api) => {
-          await new Promise<void>((resolve, reject) => {
-            resolveProducer = resolve;
-            api.signal.addEventListener(
-              "abort",
-              () => {
-                producerAlive = false;
-                reject(new Error("aborted"));
-              },
-              { once: true },
-            );
-          });
-        },
-      });
-      const sub = captureSubscriber();
-      // Subscribe inside the grace window so it cancels the timer.
-      await new Promise((r) => setTimeout(r, 10));
-      fastHub.subscribe(messageId, -1, sub.cb);
-      // Wait well past the grace window.
-      await new Promise((r) => setTimeout(r, 150));
-      expect(producerAlive).toBe(true);
-      resolveProducer();
-      await sub.awaitTerminal();
-    });
-
-    it("unsubscribing the last subscriber restarts the grace timer", async () => {
-      const fastHub = new ChatStreamHub(cm, {
-        idleCancelMs: 50,
-        evictionMs: 60_000,
-      });
-      let aborted = false;
-      fastHub.startTurn({
-        chatId,
-        messageId,
-        run: async (api) => {
-          await new Promise<void>((_, reject) => {
-            api.signal.addEventListener(
-              "abort",
-              () => {
-                aborted = true;
-                reject(new Error("aborted"));
-              },
-              { once: true },
-            );
-          });
-        },
-      });
-      const sub = captureSubscriber();
-      const handle = fastHub.subscribe(messageId, -1, sub.cb)!;
-      handle.unsubscribe();
-      await new Promise((r) => setTimeout(r, 150));
-      expect(aborted).toBe(true);
-    });
+    const events = subscriber.signals.filter(
+      (signal): signal is Extract<StreamSignal, { kind: "event" }> => signal.kind === "event",
+    );
+    expect(events.map((signal) => signal.event.type)).toEqual([
+      "tool_call_start",
+      "tool_call_input",
+      "tool_call_result",
+    ]);
+    const input = events[1]!.event.payload as {
+      input: unknown;
+      summary?: string;
+      detailsAvailable?: boolean;
+    };
+    const result = events[2]!.event.payload as { output: string; detailsAvailable?: boolean };
+    expect(JSON.stringify(input.input).length).toBeLessThan(1_200);
+    expect(input.summary).toStartWith("echo ");
+    expect(input.summary!.length).toBeLessThan(600);
+    expect(input.detailsAvailable).toBe(true);
+    expect(result.output.length).toBeLessThan(2_100);
+    expect(result.detailsAvailable).toBe(true);
   });
 
-  describe("invariants", () => {
-    it("rejects starting two turns with the same messageId", () => {
-      hub.startTurn({
-        chatId,
-        messageId,
-        run: async () => new Promise(() => {}),
-      });
-      expect(() => hub.startTurn({ chatId, messageId, run: async () => {} })).toThrow();
+  it("fans out the same tail to multiple subscribers", async () => {
+    let release: () => void = () => {};
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
     });
-
-    it("has() reports running turns", async () => {
-      expect(hub.has(messageId)).toBe(false);
-      let resolveProducer: () => void = () => {};
-      hub.startTurn({
-        chatId,
-        messageId,
-        run: async () =>
-          new Promise<void>((r) => {
-            resolveProducer = r;
-          }),
-      });
-      expect(hub.has(messageId)).toBe(true);
-      resolveProducer();
-      await hub.drain();
-      // Still in memory until evictionMs elapses.
-      expect(hub.has(messageId)).toBe(true);
+    hub.startTurn({
+      chatId,
+      messageId,
+      run: async (api) => {
+        api.publish("delta", "snapshot");
+        await hold;
+        api.publish("delta", "tail");
+      },
     });
-
-    it("inFlightFor returns the active messageId for a chat", async () => {
-      expect(hub.inFlightFor(chatId)).toBe(null);
-      let resolveProducer: () => void = () => {};
-      hub.startTurn({
-        chatId,
-        messageId,
-        run: async () =>
-          new Promise<void>((r) => {
-            resolveProducer = r;
-          }),
-      });
-      expect(hub.inFlightFor(chatId)).toBe(messageId);
-      resolveProducer();
-      await hub.drain();
-      // Done turns aren't reported as in flight.
-      expect(hub.inFlightFor(chatId)).toBe(null);
-    });
-
-    it("subscribe returns null for unknown messageId", () => {
-      expect(hub.subscribe("nonexistent", -1, () => {})).toBe(null);
-    });
-
-    it("eviction removes settled turns from memory", async () => {
-      const fastHub = new ChatStreamHub(cm, {
-        idleCancelMs: 60_000,
-        evictionMs: 30,
-      });
-      fastHub.startTurn({
-        chatId,
-        messageId,
-        run: async (api) => {
-          api.publish("delta", "x");
-        },
-      });
-      await fastHub.drain();
-      expect(fastHub.has(messageId)).toBe(true);
-      await new Promise((r) => setTimeout(r, 80));
-      expect(fastHub.has(messageId)).toBe(false);
-    });
+    const first = captureSubscriber();
+    const second = captureSubscriber();
+    expect(hub.subscribeSnapshot(chatId, messageId, false, first.cb)?.snapshot.chunks).toEqual([
+      { kind: "text", text: "snapshot" },
+    ]);
+    hub.subscribeSnapshot(chatId, messageId, false, second.cb);
+    release();
+    await Promise.all([first.terminal, second.terminal]);
+    expect(first.signals).toEqual(second.signals);
   });
 
-  describe("persistence resilience", () => {
-    it("publishing survives a failing appendEvent", async () => {
-      // Spy/stub: replace appendEvent with one that throws to simulate
-      // a transient DB hiccup. The hub should still fan out the event.
-      const originalAppend = cm.appendEvent.bind(cm);
-      let calls = 0;
-      cm.appendEvent = (chat, msg, seq, type, payload) => {
-        calls++;
-        if (calls === 1) throw new Error("disk full");
-        return originalAppend(chat, msg, seq, type, payload);
-      };
-      const sub = captureSubscriber();
-      hub.startTurn({
-        chatId,
-        messageId,
-        run: async (api) => {
-          api.publish("delta", "first"); // appendEvent throws
-          api.publish("delta", "second"); // appendEvent succeeds
-        },
-      });
-      hub.subscribe(messageId, -1, sub.cb);
-      await sub.awaitTerminal();
-      // Both events fanned out.
-      expect(sub.signals.length).toBe(3);
-      expect(sub.signals[0]).toEqual({
-        kind: "event",
-        event: { seq: 0, type: "delta", payload: "first" },
-      });
-      expect(sub.signals[1]).toEqual({
-        kind: "event",
-        event: { seq: 1, type: "delta", payload: "second" },
-      });
+  it("unsubscribing one listener does not affect another", async () => {
+    let release: () => void = () => {};
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    hub.startTurn({
+      chatId,
+      messageId,
+      run: async (api) => {
+        await hold;
+        api.publish("delta", "tail");
+      },
+    });
+    const first = captureSubscriber();
+    const second = captureSubscriber();
+    const firstHandle = hub.subscribeSnapshot(chatId, messageId, false, first.cb)!;
+    hub.subscribeSnapshot(chatId, messageId, false, second.cb);
+    firstHandle.unsubscribe();
+    release();
+    await second.terminal;
+    expect(first.signals).toEqual([]);
+    expect(second.signals.at(-1)).toEqual({ kind: "done" });
+  });
+
+  it("cancels explicitly and tears down every turn for a deleted chat", async () => {
+    const subscriber = captureSubscriber();
+    hub.startTurn({
+      chatId,
+      messageId,
+      run: async (api) =>
+        new Promise<void>((_, reject) => {
+          api.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        }),
+    });
+    hub.subscribeSnapshot(chatId, messageId, false, subscriber.cb);
+    expect(hub.cancel(messageId)).toBe(true);
+    await subscriber.terminal;
+    expect(subscriber.signals.at(-1)).toEqual({ kind: "error", message: "aborted" });
+
+    const deletedMessageId = randomUUID();
+    const deletedSubscriber = captureSubscriber();
+    hub.startTurn({
+      chatId,
+      messageId: deletedMessageId,
+      run: async (api) =>
+        new Promise<void>((_, reject) => {
+          api.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        }),
+    });
+    hub.subscribeSnapshot(chatId, deletedMessageId, false, deletedSubscriber.cb);
+    hub.cancelForChat(chatId);
+    await deletedSubscriber.terminal;
+    expect(deletedSubscriber.signals.at(-1)?.kind).toBe("error");
+    expect(hub.has(deletedMessageId)).toBe(false);
+  });
+
+  it("uses one bounded no-subscriber lifetime", async () => {
+    const abandonedHub = new ChatStreamHub(chatManager, {
+      idleCancelMs: 40,
+      evictionMs: 60_000,
+    });
+    let abandonedTurnAborted = false;
+    abandonedHub.startTurn({
+      chatId,
+      messageId: randomUUID(),
+      run: async (api) =>
+        new Promise<void>((_, reject) => {
+          api.signal.addEventListener(
+            "abort",
+            () => {
+              abandonedTurnAborted = true;
+              reject(new Error("aborted"));
+            },
+            { once: true },
+          );
+        }),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(abandonedTurnAborted).toBe(true);
+
+    const fastHub = new ChatStreamHub(chatManager, { idleCancelMs: 40, evictionMs: 60_000 });
+    let aborted = false;
+    fastHub.startTurn({
+      chatId,
+      messageId,
+      run: async (api) =>
+        new Promise<void>((_, reject) => {
+          api.signal.addEventListener(
+            "abort",
+            () => {
+              aborted = true;
+              reject(new Error("aborted"));
+            },
+            { once: true },
+          );
+        }),
+    });
+    const handle = fastHub.subscribeSnapshot(chatId, messageId, false, () => {})!;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(aborted).toBe(false);
+    handle.unsubscribe();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(aborted).toBe(true);
+  });
+
+  it("reports ownership, running state, and eviction", async () => {
+    const fastHub = new ChatStreamHub(chatManager, {
+      idleCancelMs: 60_000,
+      evictionMs: 20,
+    });
+    fastHub.startTurn({
+      chatId,
+      messageId,
+      run: async (api) => {
+        api.publish("delta", "done");
+      },
+    });
+    expect(fastHub.hasForChat(chatId, messageId)).toBe(true);
+    expect(fastHub.hasForChat("other", messageId)).toBe(false);
+    expect(fastHub.inFlightFor(chatId)).toBe(messageId);
+    expect(fastHub.subscribeSnapshot(chatId, "missing", false, () => {})).toBe(null);
+    expect(() => fastHub.startTurn({ chatId, messageId, run: async () => {} })).toThrow();
+    await fastHub.drain();
+    expect(fastHub.inFlightFor(chatId)).toBe(null);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(fastHub.has(messageId)).toBe(false);
+  });
+
+  it("aborts without exposing a non-durable event", async () => {
+    chatManager.appendEvent = () => {
+      throw new Error("disk full");
+    };
+    let aborted = false;
+    hub.startTurn({
+      chatId,
+      messageId,
+      run: async (api) => {
+        try {
+          api.publish("delta", "lost");
+        } finally {
+          aborted = api.signal.aborted;
+        }
+      },
+    });
+    await hub.drain();
+    expect(aborted).toBe(true);
+    expect(hub.snapshotForChat(chatId, messageId, false)).toMatchObject({
+      lastSeq: -1,
+      chunks: [],
+      status: "error",
     });
   });
 });

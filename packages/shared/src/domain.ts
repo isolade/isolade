@@ -237,6 +237,20 @@ export const chatMessageSchema = z.object({
 });
 export const chatMessageArraySchema = z.array(chatMessageSchema);
 
+// A bounded page of the active branch used by the high-performance chat
+// renderer. Version metadata is computed server-side from lightweight tree
+// metadata, so the client never has to download every inactive branch merely
+// to render a pager for the visible path.
+export const chatMessageVersionSchema = z.object({
+  index: z.number().int().positive(),
+  count: z.number().int().positive(),
+  previousId: z.string().nullable(),
+  nextId: z.string().nullable(),
+});
+export const transcriptMessageSchema = chatMessageSchema.extend({
+  version: chatMessageVersionSchema.nullable(),
+});
+
 // One persisted SSE event. The payload is the JSON-encoded body of the
 // event as it was forwarded to the live client. Replaying these in
 // (messageId, seq) order through the chunk reducer reconstructs the
@@ -250,8 +264,7 @@ export const chatEventSchema = z.object({
   // moment a turn is registered, so chat_events is never empty
   // before the producer's first publish. Resume queries default to
   // `afterSeq=-1`, so the `seq > afterSeq` filter naturally excludes
-  // the marker. Only mount-time `listChatEvents` (which returns
-  // everything) sees it, and that path treats unknown types as no-ops.
+  // the marker. The diagnostic event endpoint still exposes it.
   seq: z.number().int().min(-1),
   type: z.string(),
   // JSON-encoded payload. The shape depends on `type` and matches the
@@ -466,6 +479,8 @@ export type Terminal = z.infer<typeof terminalSchema>;
 export type Chat = z.infer<typeof chatSchema>;
 export type SubscriptionShare = z.infer<typeof subscriptionShareSchema>;
 export type ChatMessage = z.infer<typeof chatMessageSchema>;
+export type ChatMessageVersion = z.infer<typeof chatMessageVersionSchema>;
+export type TranscriptMessage = z.infer<typeof transcriptMessageSchema>;
 export type ChatEvent = z.infer<typeof chatEventSchema>;
 export type ChatModelDefinition = z.infer<typeof chatModelSchema>;
 export type ChatModelsResponse = z.infer<typeof chatModelsResponseSchema>;

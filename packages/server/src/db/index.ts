@@ -47,8 +47,11 @@ function defaultDbPath(): string {
  *
  * Version 5 adds the `message_uploads` junction table so edited versions can
  * retain a file without removing it from the original message.
+ *
+ * Version 6 adds indexed bounded transcript pagination, an O(1) in-flight
+ * turn pointer, and persisted full and bounded structural render projections.
  */
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 /**
  * The complete, current schema: one CREATE TABLE (plus indexes) per table in
@@ -175,6 +178,7 @@ function createSchema(sqlite: Database): void {
       compacted INTEGER,
       cost_usd REAL,
       active_leaf_id TEXT,
+      in_flight_message_id TEXT,
       created_at INTEGER NOT NULL DEFAULT (unixepoch())
     )
   `);
@@ -196,7 +200,6 @@ function createSchema(sqlite: Database): void {
       created_at INTEGER NOT NULL DEFAULT (unixepoch())
     )
   `);
-
   // Append-only log of structured SSE events for each assistant turn. Lets the
   // UI reconstruct tool calls, thinking blocks, raw debug events, and per-turn
   // usage snapshots after a reload. chat_messages stores only the final
@@ -222,6 +225,19 @@ function createSchema(sqlite: Database): void {
   sqlite.run(`
     CREATE INDEX IF NOT EXISTS idx_chat_events_message
     ON chat_events (message_id, seq)
+  `);
+  sqlite.run(`
+    CREATE TABLE IF NOT EXISTS chat_message_renders (
+      message_id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      chunks TEXT NOT NULL,
+      debug_chunks TEXT NOT NULL,
+      preview_chunks TEXT NOT NULL
+    )
+  `);
+  sqlite.run(`
+    CREATE INDEX IF NOT EXISTS idx_chat_message_renders_chat
+    ON chat_message_renders (chat_id)
   `);
 
   // Raw usage event log: one append-only row per metrics event, the source of
@@ -393,6 +409,53 @@ const migrations: Record<number, (sqlite: Database) => void> = {
       WHERE chat_id IS NOT NULL AND message_id IS NOT NULL
     `);
   },
+  6: (sqlite) => {
+    sqlite.run(`
+      CREATE INDEX IF NOT EXISTS idx_chat_messages_parent
+      ON chat_messages (chat_id, parent_id)
+    `);
+    const inFlightColumn = sqlite
+      .query("SELECT name FROM pragma_table_info('chats') WHERE name = 'in_flight_message_id'")
+      .get();
+    if (!inFlightColumn) sqlite.run(`ALTER TABLE chats ADD COLUMN in_flight_message_id TEXT`);
+    sqlite.run(`
+      CREATE TABLE IF NOT EXISTS chat_message_renders (
+        message_id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        chunks TEXT NOT NULL,
+        debug_chunks TEXT NOT NULL,
+        preview_chunks TEXT NOT NULL
+      )
+    `);
+    sqlite.run(`
+      CREATE INDEX IF NOT EXISTS idx_chat_message_renders_chat
+      ON chat_message_renders (chat_id)
+    `);
+    // Preserve only the newest event group when it has no committed row. A
+    // newer committed group proves that any older orphan is stale failed work.
+    sqlite.run(`
+      UPDATE chats
+      SET in_flight_message_id = (
+        SELECT event.message_id
+        FROM chat_events AS event
+        WHERE event.chat_id = chats.id
+        ORDER BY event.rowid DESC
+        LIMIT 1
+      )
+      WHERE NOT EXISTS (
+        SELECT 1 FROM chat_messages AS message
+        WHERE message.id = (
+          SELECT event.message_id
+          FROM chat_events AS event
+          WHERE event.chat_id = chats.id
+          ORDER BY event.rowid DESC
+          LIMIT 1
+        )
+      ) AND EXISTS (
+        SELECT 1 FROM chat_events AS event WHERE event.chat_id = chats.id
+      )
+    `);
+  },
 };
 
 function migrate(sqlite: Database): void {
@@ -419,6 +482,10 @@ function migrate(sqlite: Database): void {
     // Fresh database: createSchema already produced the latest schema, so stamp
     // it as current and skip the ladder, since those steps only bring databases from
     // older builds forward and would collide with the tables just created.
+    sqlite.run(`
+      CREATE INDEX IF NOT EXISTS idx_chat_messages_parent
+      ON chat_messages (chat_id, parent_id)
+    `);
     sqlite.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     return;
   }

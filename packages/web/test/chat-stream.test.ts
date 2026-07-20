@@ -244,6 +244,42 @@ describe("runChatTurn", () => {
     }
   });
 
+  it("keeps debug mode on automatic reconnects", async () => {
+    const mock = installMockFetch({
+      routes: [
+        {
+          method: "POST",
+          pathRegex: /\/messages\?debug=1$/,
+          respond: sseBody([
+            { event: "message_id", data: JSON.stringify("m-debug") },
+            { id: "0", event: "thinking", data: JSON.stringify("first") },
+          ]),
+        },
+        {
+          method: "GET",
+          pathRegex: /\/messages\/m-debug\/stream/,
+          respond: sseBody([{ event: "done", data: "" }]),
+        },
+      ],
+    });
+    try {
+      await runChatTurn({
+        apiBase: "http://test",
+        instanceId: "instance",
+        chatId: "chat",
+        content: "hello",
+        includeDebug: true,
+        signal: new AbortController().signal,
+        onEvent: () => {},
+        backoffBaseMs: 0,
+      });
+      expect(mock.calls[0]?.url).toContain("debug=1");
+      expect(mock.calls[1]?.url).toContain("debug=1");
+    } finally {
+      mock.restore();
+    }
+  });
+
   it("idempotent: applies the same event only once across reconnects", async () => {
     // The server replays seq 0 again (poorly behaved), but the client
     // should still pass it through onEvent. The application-level
@@ -486,9 +522,8 @@ describe("runChatTurn", () => {
         {
           method: "GET",
           pathRegex: /\/messages\/msg-long\/stream/,
-          respond: (req) => {
+          respond: () => {
             const seq = ++resumeCount; // 1, 2, 3, ...
-            const after = Number(new URL(req.url).searchParams.get("afterSeq"));
             return streamedResponse((controller) => {
               const enc = new TextEncoder();
               controller.enqueue(
@@ -497,17 +532,13 @@ describe("runChatTurn", () => {
               if (seq < TOTAL) {
                 // Emit the next delta then drop again, real progress.
                 controller.enqueue(
-                  enc.encode(
-                    `id: ${after + 1}\nevent: delta\ndata: ${JSON.stringify("p" + seq)}\n\n`,
-                  ),
+                  enc.encode(`id: ${seq}\nevent: delta\ndata: ${JSON.stringify("p" + seq)}\n\n`),
                 );
                 controller.close();
               } else {
                 // Final reconnect completes the turn.
                 controller.enqueue(
-                  enc.encode(
-                    `id: ${after + 1}\nevent: delta\ndata: ${JSON.stringify("p" + seq)}\n\n`,
-                  ),
+                  enc.encode(`id: ${seq}\nevent: delta\ndata: ${JSON.stringify("p" + seq)}\n\n`),
                 );
                 controller.enqueue(enc.encode(`event: done\ndata: \n\n`));
                 controller.close();
@@ -546,20 +577,27 @@ describe("runChatTurn", () => {
 });
 
 describe("resumeChatTurn", () => {
-  it("subscribes to an existing turn and replays from afterSeq", async () => {
+  it("subscribes to an existing turn through a compact snapshot", async () => {
     const mock = installMockFetch({
       routes: [
         {
           method: "GET",
           pathRegex: /\/messages\/msg-r\/stream/,
-          respond: (req) => {
-            const url = new URL(req.url);
-            const after = Number(url.searchParams.get("afterSeq"));
-            expect(after).toBe(5);
+          respond: () => {
             return new Response(
               sseBody([
                 { event: "message_id", data: JSON.stringify("msg-r") },
-                { id: 6, event: "delta", data: JSON.stringify("tail") },
+                {
+                  event: "snapshot",
+                  data: JSON.stringify({
+                    messageId: "msg-r",
+                    lastSeq: 6,
+                    chunks: [{ kind: "text", text: "tail" }],
+                    metaEvents: [],
+                    status: "running",
+                    message: null,
+                  }),
+                },
                 { event: "done", data: "" },
               ]),
               { status: 200, headers: { "Content-Type": "text/event-stream" } },
@@ -581,7 +619,7 @@ describe("resumeChatTurn", () => {
         backoffBaseMs: 1,
         backoffCapMs: 5,
       });
-      expect(events.filter((e) => e.kind === "event").length).toBe(1);
+      expect(events.filter((event) => event.kind === "snapshot")).toHaveLength(1);
       expect(events[events.length - 1].kind).toBe("done");
     } finally {
       mock.restore();

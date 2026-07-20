@@ -139,8 +139,14 @@ export class ChatTurnService {
           : (chat.codexThreadId ?? undefined);
     }
 
-    const userMessage = chatManager.addMessage(chatId, "user", content, { parentId });
-    chatManager.setActiveLeaf(chatId, userMessage.id);
+    // Reserve the assistant message id up front so every chat_events
+    // row can link to it (even though the chat_messages row only gets
+    // inserted on producer success). The client receives this as the
+    // first SSE event and uses it both as the React key for the
+    // streaming bubble and as the lookup key for replayed events on a
+    // future reload or reconnect.
+    const assistantMessageId = randomUUID();
+    const userMessage = chatManager.beginTurn(chatId, assistantMessageId, content, parentId);
     instances.touch(instanceId);
 
     // Claim the staged uploads for this message. Their bytes are already in the
@@ -156,14 +162,6 @@ export class ChatTurnService {
     // bubble reconciles with the persisted attachments (id + preview).
     const userMessageWithUploads: ChatMessage & { uploads?: Upload[] } =
       uploads.length > 0 ? { ...userMessage, uploads: uploadRows.map(toUpload) } : userMessage;
-
-    // Reserve the assistant message id up front so every chat_events
-    // row can link to it (even though the chat_messages row only gets
-    // inserted on producer success). The client receives this as the
-    // first SSE event and uses it both as the React key for the
-    // streaming bubble and as the lookup key for replayed events on a
-    // future reload or reconnect.
-    const assistantMessageId = randomUUID();
     // Kick off auto-titling on the first user message of an untitled
     // chat. Runs in parallel with the assistant response. The SSE
     // stream emits a `title` event when it completes so the sidebar
@@ -202,6 +200,7 @@ export class ChatTurnService {
               return generated && generated.length > 0 ? generated : fallback;
             })
             .then((title) => {
+              if (api.signal.aborted) return;
               instances.setTitle(instanceId, title);
               api.publish("title", title);
             })
@@ -209,6 +208,10 @@ export class ChatTurnService {
         }
 
         let assistantContent = "";
+        const pendingEventWork = new Set<Promise<void>>();
+        const waitForPendingEvents = async () => {
+          await Promise.allSettled([...pendingEventWork]);
+        };
         // Provider-session snapshot for this turn, reported by the backend
         // as facts become known and stamped onto the assistant row on both
         // the success and abort paths, so even an interrupted turn stays
@@ -245,50 +248,79 @@ export class ChatTurnService {
             fork,
             signal: api.signal,
             onDelta: (text) => {
-              assistantContent += text;
               api.publish("delta", text);
+              assistantContent += text;
             },
             onMeta: (meta) => {
               if (meta.sessionId !== undefined) turnMeta.sessionId = meta.sessionId;
               if (meta.anchorId !== undefined) turnMeta.anchorId = meta.anchorId;
             },
-            onEvent: async (event) => {
+            onEvent: (event) => {
               // Persist the full usage snapshot onto the chat row so
               // the next mount of the chat UI can rehydrate UsageState
               // without waiting for a new turn.
               if (event.type === "usage") {
+                // Publish before mutating any other durable or compact state.
+                // If the event log write fails, the turn aborts without
+                // finalizing data that no live client or reconnect could see.
+                api.publish(event.type, event);
                 chatManager.updateUsage(chatId, {
                   total: event.total,
                   last: event.last,
                   modelContextWindow: event.modelContextWindow,
                   costUsd: event.costUsd,
                 });
+                // Publish the durable base snapshot synchronously. Backends
+                // intentionally expose a synchronous callback and do not await
+                // it, so awaiting enrichment here would let `done` overtake the
+                // final usage update.
                 if (instance.profileId) {
-                  event.subscriptionShare = await computeSubscriptionShare({
-                    provider: chat.provider,
-                    modelId: chat.model,
-                    total: event.total,
-                    stats: await profileUsageStats(instance.profileId),
-                    authStore: profiles.auth(instance.profileId),
-                  });
+                  const baseEvent = { ...event };
+                  const work = (async () => {
+                    try {
+                      const subscriptionShare = await computeSubscriptionShare({
+                        provider: chat.provider,
+                        modelId: chat.model,
+                        total: baseEvent.total,
+                        stats: await profileUsageStats(instance.profileId!),
+                        authStore: profiles.auth(instance.profileId!),
+                      });
+                      if (api.signal.aborted) return;
+                      if (subscriptionShare) {
+                        api.publish("usage", { ...baseEvent, subscriptionShare });
+                      }
+                    } catch (error) {
+                      console.warn(`[chat] usage enrichment failed (chat=${chatId}):`, error);
+                    }
+                  })();
+                  pendingEventWork.add(work);
+                  void work.finally(() => pendingEventWork.delete(work));
                 }
-              } else if (event.type === "tool_call_result") {
+                return;
+              }
+              api.publish(event.type, event);
+              if (event.type === "tool_call_result") {
                 // A finished tool call is the moment the VM's filesystem
                 // may have changed, so refresh the sidebar diff stats.
                 diffStatsPoller.nudge(instanceId);
               } else if (event.type === "context_compacted") {
                 chatManager.markCompacted(chatId);
               }
-              api.publish(event.type, event);
             },
           });
           assistantContent = result.content || assistantContent;
-          chatManager.addMessageWithId(chatId, assistantMessageId, "assistant", assistantContent, {
-            parentId: userMessage.id,
-            sessionId: turnMeta.sessionId ?? result.sessionId ?? null,
-            anchorId: turnMeta.anchorId ?? null,
-          });
-          chatManager.setActiveLeaf(chatId, assistantMessageId);
+          await waitForPendingEvents();
+          chatManager.finalizeTurn(
+            chatId,
+            assistantMessageId,
+            assistantContent,
+            {
+              parentId: userMessage.id,
+              sessionId: turnMeta.sessionId ?? result.sessionId ?? null,
+              anchorId: turnMeta.anchorId ?? null,
+            },
+            api.renderChunks(),
+          );
           // Turn finished: float the instance up and flag it unread. The client
           // clears the flag immediately if the user is viewing this instance, so
           // it only sticks for turns that complete in the background.
@@ -298,31 +330,32 @@ export class ChatTurnService {
           diffStatsPoller.nudge(instanceId);
           if (titlePromise) await titlePromise.catch(() => {});
         } catch (err) {
-          // Cancellation (Stop button, idle grace, chat-delete) lands
-          // here as an aborted signal. We persist whatever assistant
-          // text we already streamed so the transcript shows the
-          // partial turn instead of dropping it, then re-throw so the
-          // hub emits the standard `error` signal (clients render it
-          // as "cancelled").
-          if (api.signal.aborted) {
-            if (assistantContent.length > 0) {
-              try {
-                chatManager.addMessageWithId(
-                  chatId,
-                  assistantMessageId,
-                  "assistant",
-                  assistantContent,
-                  {
-                    parentId: userMessage.id,
-                    sessionId: turnMeta.sessionId ?? null,
-                    anchorId: turnMeta.anchorId ?? null,
-                  },
-                );
-                chatManager.setActiveLeaf(chatId, assistantMessageId);
-              } catch (e) {
-                console.warn("[chat] failed to persist aborted assistant message", e);
-              }
+          await waitForPendingEvents();
+          // Persist any partial text for both cancellation and provider
+          // failures. The live client commits that same partial before showing
+          // an error, so durable history must agree after a reload.
+          const renderChunks = api.renderChunks();
+          if (assistantContent.length > 0 || renderChunks.length > 0) {
+            try {
+              chatManager.finalizeTurn(
+                chatId,
+                assistantMessageId,
+                assistantContent,
+                {
+                  parentId: userMessage.id,
+                  sessionId: turnMeta.sessionId ?? null,
+                  anchorId: turnMeta.anchorId ?? null,
+                },
+                renderChunks,
+              );
+            } catch (persistError) {
+              console.warn("[chat] failed to persist partial assistant message", persistError);
             }
+          }
+          if (assistantContent.length === 0 && renderChunks.length === 0) {
+            chatManager.clearInFlightTurn(chatId, assistantMessageId);
+          }
+          if (api.signal.aborted) {
             instances.touch(instanceId);
             if (titlePromise) await titlePromise.catch(() => {});
           }
