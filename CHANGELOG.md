@@ -27,6 +27,9 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Fixed
 
+- Fixed chats getting permanently stuck in an error state (`has no agent
+  endpoint`) after an unclean shutdown. Startup and "Restart VM" now repair
+  such VMs automatically.
 - Fixed streamed Claude output corrupting multibyte characters when a UTF-8
   sequence spans transport chunks.
 - Fixed the chat Stop button for OpenAI models so it properly stops the active
