@@ -29,7 +29,10 @@ export class CodexConnection {
   constructor(vmId: string, sandboxClient: SandboxApi) {
     this.exitPromise = sandboxClient.execStream(
       vmId,
-      "codex app-server --listen stdio:// --disable apps -c features.memories=false -c approval_policy=never -c sandbox_mode=danger-full-access",
+      // `agents.enabled=false` hides codex's built-in subagent tools so chats
+      // can't spawn subagents. We plan to replace this with our own custom
+      // subagents tool later.
+      "codex app-server --listen stdio:// --disable apps -c features.memories=false -c approval_policy=never -c sandbox_mode=danger-full-access -c agents.enabled=false",
       {
         stdin: this.stdin,
         stdout: (chunk) => this._handleStdout(chunk),
