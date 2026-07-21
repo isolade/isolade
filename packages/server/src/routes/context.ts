@@ -17,6 +17,7 @@ import type { SecretsStore } from "../secrets-store";
 import type { PersistentSessionManager } from "../session-manager";
 import type { TerminalManager } from "../terminals";
 import type { ActiveProfileTracker, TitleVmManager } from "../title-vm-manager";
+import type { UploadStore } from "../uploads";
 import type { WorkspaceDiffReader } from "../workspace-diff";
 
 // The dependency bundle every per-domain router receives. Built once in
@@ -38,6 +39,7 @@ export interface RouteContext {
   sessionManager: PersistentSessionManager;
   terminalManager: TerminalManager;
   chatManager: ChatManager;
+  uploadStore: UploadStore;
   chatStreamHub: ChatStreamHub;
   codexManager: CodexManager;
   diffStatsPoller: DiffStatsPoller;

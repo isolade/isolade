@@ -140,15 +140,22 @@ export const updateChatBodySchema = z
     message: "model or effort is required",
   });
 
+// `content` may be empty when the message carries only attachments (e.g. the
+// user pastes a screenshot and hits send with no text). `uploadIds` reference
+// files previously staged via the upload endpoint; the server associates them
+// with the created message. At least one of content/uploads must be present,
+// enforced in the route so the error message is specific.
 export const createChatMessageBodySchema = z.object({
-  content: z.string().min(1),
+  content: z.string(),
+  uploadIds: z.array(z.string()).optional(),
 });
 
 // Edit a user message: inserts a sibling version and recomputes the assistant
 // answer from that point (the response is the same SSE turn stream as a
 // normal send). The original branch stays navigable.
 export const editChatMessageBodySchema = z.object({
-  content: z.string().min(1),
+  content: z.string(),
+  uploadIds: z.array(z.string()).optional(),
 });
 
 // Switch the chat's visible branch. `leafId` may be any message on the target

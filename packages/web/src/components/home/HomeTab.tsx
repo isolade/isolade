@@ -62,12 +62,13 @@ type View =
       synth: Instance;
       synthChat: Chat;
       firstMessage: string;
+      firstUploadIds: string[];
       error: string | null;
     }
   | {
       kind: "instance";
       id: string;
-      pendingFirstMessage?: { chatId: string; content: string };
+      pendingFirstMessage?: { chatId: string; content: string; uploadIds?: string[] };
     };
 
 // Pathname-based routing: /c/<id> deep-links to a specific instance. Relies
@@ -497,11 +498,13 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     modelId,
     effort,
     firstMessage,
+    uploadIds = [],
   }: {
     instancePromise: Promise<Instance>;
     modelId: string;
     effort: ChatEffort;
     firstMessage: string;
+    uploadIds?: string[];
   }) => {
     const sid = ++submissionIdRef.current;
     const now = new Date();
@@ -551,6 +554,7 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
       synth,
       synthChat,
       firstMessage,
+      firstUploadIds: uploadIds,
       error: null,
     });
 
@@ -591,7 +595,7 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
       setView({
         kind: "instance",
         id: instance.id,
-        pendingFirstMessage: { chatId: chat.id, content: firstMessage },
+        pendingFirstMessage: { chatId: chat.id, content: firstMessage, uploadIds },
       });
       void refreshInstances();
     })();
@@ -814,6 +818,7 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
         pendingFirstMessage: {
           chatId: view.synthChat.id,
           content: view.firstMessage,
+          uploadIds: view.firstUploadIds,
         },
         pending: true,
         creationError: view.error,

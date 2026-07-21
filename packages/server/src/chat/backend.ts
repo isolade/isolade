@@ -91,6 +91,17 @@ export interface TurnMeta {
   anchorId?: string;
 }
 
+// A file attached to the outgoing user message. The bytes already live at
+// `guestPath` inside the VM, so the turn service cites the path and the agent
+// loads the file with its normal tools. `guestPath` is absolute so it resolves
+// unambiguously across a multi-repo workspace.
+export interface UploadAttachment {
+  id: string;
+  filename: string;
+  mediaType: string;
+  guestPath: string;
+}
+
 export interface ChatBackend {
   sendMessage(opts: {
     vmId: string;

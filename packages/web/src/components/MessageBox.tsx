@@ -1,5 +1,5 @@
-import { ArrowUp, Loader2, Square } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { ArrowUp, Loader2, Paperclip, Square } from "lucide-react";
+import { useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -12,22 +12,29 @@ interface MessageBoxProps {
   placeholder?: string;
   autoFocus?: boolean;
   loading?: boolean;
+  // Right-hand controls (the model/effort picker), sitting just left of the
+  // send button on the bottom row.
   leftToolbar?: React.ReactNode;
   rightToolbar?: React.ReactNode;
+  // Opens the file picker. When provided, the paperclip button is shown on the
+  // bottom-left of the composer.
+  onAttachClick?: () => void;
+  // Preview strip for staged attachments, rendered between the textarea and the
+  // control row. Owned by the parent (it holds the attachment state).
+  attachments?: React.ReactNode;
+  // Forwarded to the textarea so the parent can intercept pasted images.
+  onPaste?: (e: React.ClipboardEvent<HTMLTextAreaElement>) => void;
+  // Send is allowed on attachments alone (empty text), so the parent tells us
+  // when there's something to send beyond the trimmed textarea value.
+  hasAttachments?: boolean;
   className?: string;
 }
 
-// Two layouts share the same composer:
-// - "compact" (flex row): the textarea shares a single line with the model
-//   picker and the send button. The cursor lives to the left of the controls.
-// - "expanded" (flex column): the textarea spans the full width with the
-//   controls dropped to a row below. Triggered as soon as the typed text
-//   needs more than one line at the compact-mode width.
-//
-// We only auto-collapse back to compact when the value goes empty. At the
-// wider expanded width the same text that overflowed compact often fits on
-// one line again, so re-evaluating on each keystroke would flicker between
-// the two layouts.
+// The composer is a single column: the textarea on top, an optional attachment
+// preview strip, then a control row with the attach button on the left and the
+// model picker + send button on the right. (It used to collapse onto one line
+// with the controls while short; that inline mode is gone so the layout is
+// stable regardless of how much has been typed.)
 export function MessageBox({
   value,
   onChange,
@@ -39,38 +46,29 @@ export function MessageBox({
   loading,
   leftToolbar,
   rightToolbar,
+  onAttachClick,
+  attachments,
+  onPaste,
+  hasAttachments,
   className,
 }: MessageBoxProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
-
     // Manual auto-grow: reset to 0 to read the natural scrollHeight at the
     // current width, then clamp to a sane max. `field-sizing: content` would
     // be neater but browsers (Safari notably) ignore max-height when it's on.
     const maxHeight = Math.min(window.innerHeight * 0.6, 640);
     el.style.height = "0px";
     el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`;
-
-    if (!value) {
-      setExpanded(false);
-      return;
-    }
-    if (expanded) return;
-    if (value.includes("\n")) {
-      setExpanded(true);
-      return;
-    }
-    const lineHeight = parseFloat(getComputedStyle(el).lineHeight) || 20;
-    if (el.scrollHeight > lineHeight * 1.5) setExpanded(true);
-  }, [value, expanded]);
+  }, [value]);
 
   // `loading` blocks submission but leaves the textarea editable, so the user
-  // can compose the next message while the agent is still streaming.
-  const canSubmit = !disabled && !loading && value.trim().length > 0;
+  // can compose the next message while the agent is still streaming. Sending is
+  // allowed with empty text as long as there's at least one attachment.
+  const canSubmit = !disabled && !loading && (value.trim().length > 0 || !!hasAttachments);
   // While loading, the trailing button swaps from Send → Stop and acts as an
   // interrupt for the in-flight turn. We only show Stop when the parent
   // wired an `onStop` handler. Without it the button falls back to a
@@ -95,27 +93,38 @@ export function MessageBox({
   return (
     <div
       className={cn(
-        "border border-input bg-background shadow-xs transition-colors focus-within:border-ring/60 dark:bg-input/30 py-2 pr-2",
-        expanded ? "rounded-2xl pl-3" : "rounded-full pl-4",
+        "flex flex-col gap-2 rounded-2xl border border-input bg-background px-3 py-2 shadow-xs transition-colors focus-within:border-ring/60 dark:bg-input/30",
         className,
       )}
     >
-      <div className={cn("flex gap-2", expanded ? "flex-col" : "items-center")}>
-        <textarea
-          ref={textareaRef}
-          autoFocus={autoFocus}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          onKeyDown={handleKeyDown}
-          rows={1}
-          placeholder={placeholder}
-          disabled={disabled}
-          className={cn(
-            "resize-none bg-transparent py-1 text-base leading-relaxed outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50 md:text-sm",
-            expanded ? "w-full" : "flex-1 min-w-0",
-          )}
-        />
-        <div className={cn("flex items-center gap-1 flex-shrink-0", expanded && "self-end")}>
+      <textarea
+        ref={textareaRef}
+        autoFocus={autoFocus}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onKeyDown={handleKeyDown}
+        onPaste={onPaste}
+        rows={1}
+        placeholder={placeholder}
+        disabled={disabled}
+        className="w-full resize-none bg-transparent py-1 text-base leading-relaxed outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50 md:text-sm"
+      />
+      {attachments}
+      <div className="flex items-center gap-1">
+        {onAttachClick && (
+          <Button
+            type="button"
+            size="icon"
+            variant="ghost"
+            className="size-8 rounded-full text-muted-foreground"
+            onClick={onAttachClick}
+            disabled={disabled}
+            aria-label="Attach files"
+          >
+            <Paperclip className="size-4" />
+          </Button>
+        )}
+        <div className="ml-auto flex items-center gap-1">
           {leftToolbar}
           {rightToolbar}
           {showStop ? (

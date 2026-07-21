@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AttachmentStrip } from "@/components/chat/AttachmentStrip";
 import { MessageBox } from "@/components/MessageBox";
 import { ModelEffortPicker } from "@/components/ModelEffortPicker";
 import { beaconDeleteInstance, createInstance, deleteInstance } from "../../lib/api";
@@ -12,6 +13,7 @@ import {
   type ModelOverrides,
   splitModelsByTier,
 } from "../../lib/contracts";
+import { useAttachments } from "../../lib/use-attachments";
 
 const MODEL_STORAGE_KEY = "isolade.lastModelId";
 const EFFORT_STORAGE_KEY = "isolade.lastEffort";
@@ -44,6 +46,7 @@ interface NewInstancePaneProps {
     modelId: string;
     effort: ChatEffort;
     firstMessage: string;
+    uploadIds: string[];
   }) => void;
 }
 
@@ -121,6 +124,19 @@ export default function NewInstancePane({
       });
   }, [profileId]);
 
+  // Attachments in the empty-state pane need an instance to upload against, but
+  // one only exists once the eager spawn lands. This resolver nudges the spawn
+  // and awaits its id, so attaching a file (or pasting one) transparently
+  // brings the VM up. The uploads are staged against the same instance the
+  // submit later hands to the parent, so their ids stay valid for the send.
+  const resolveInstanceId = useCallback(async (): Promise<string | null> => {
+    if (!spawnPromiseRef.current) fireSpawn();
+    const instance = await spawnPromiseRef.current;
+    return instance?.id ?? null;
+  }, [fireSpawn]);
+  const attachments = useAttachments(resolveInstanceId);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   const cleanupPending = useCallback(() => {
     const id = pendingInstanceIdRef.current;
     pendingInstanceIdRef.current = null;
@@ -155,9 +171,13 @@ export default function NewInstancePane({
     };
   }, [cleanupPending]);
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     const content = input.trim();
-    if (!content) return;
+    // Await any in-flight uploads first. A submit is allowed with empty text as
+    // long as there's at least one attachment.
+    const uploads = await attachments.resolveUploads();
+    const uploadIds = uploads.map((u) => u.id);
+    if (!content && uploadIds.length === 0) return;
     if (!spawnPromiseRef.current) fireSpawn();
     const promise = spawnPromiseRef.current;
     if (!promise) return;
@@ -167,7 +187,19 @@ export default function NewInstancePane({
       modelId,
       effort,
       firstMessage: content,
+      uploadIds,
     });
+  };
+
+  // Pull image (and any file) blobs out of a paste and stage them.
+  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = Array.from(e.clipboardData.items)
+      .filter((it) => it.kind === "file")
+      .map((it) => it.getAsFile())
+      .filter((f): f is File => f !== null);
+    if (files.length === 0) return;
+    e.preventDefault();
+    attachments.add(files);
   };
 
   return (
@@ -176,6 +208,18 @@ export default function NewInstancePane({
         <h1 className="text-center text-2xl font-medium text-foreground/90 mb-4">
           What do you want to do?
         </h1>
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={(e) => {
+            if (e.target.files && e.target.files.length > 0) {
+              attachments.add(Array.from(e.target.files));
+            }
+            e.target.value = "";
+          }}
+        />
         <MessageBox
           autoFocus
           value={input}
@@ -184,8 +228,12 @@ export default function NewInstancePane({
             setInput(next);
             if (wasEmpty && next.length > 0) fireSpawn();
           }}
-          onSubmit={handleSubmit}
+          onSubmit={() => void handleSubmit()}
           placeholder="Ask anything…"
+          onAttachClick={() => fileInputRef.current?.click()}
+          onPaste={handlePaste}
+          hasAttachments={attachments.items.length > 0}
+          attachments={<AttachmentStrip items={attachments.items} onRemove={attachments.remove} />}
           leftToolbar={
             <ModelEffortPicker
               models={chatModels}

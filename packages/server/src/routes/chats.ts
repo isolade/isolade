@@ -21,6 +21,7 @@ import type { RouteContext } from "./context";
 export function createChatsRouter(ctx: RouteContext): Hono {
   const {
     chatManager,
+    uploadStore,
     instances,
     profiles,
     chatStreamHub,
@@ -355,6 +356,7 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     // Shut down the chat's persistent `claude` process (and its background
     // tasks). The chat is gone, so the warm process has nothing to serve.
     realClaudeBackend.disposeChat(chatId);
+    uploadStore.removeForChat(chatId);
     chatManager.remove(chatId);
     return c.json({ ok: true });
   });
@@ -407,7 +409,14 @@ export function createChatsRouter(ctx: RouteContext): Hono {
   app.get("/api/instances/:id/chats/:chatId/messages", (c) => {
     const chatId = c.req.param("chatId");
     if (!chatManager.get(chatId)) return c.json({ error: "not found" }, 404);
-    return c.json(chatManager.getMessages(chatId));
+    // Decorate each message with its attachments in one grouped query, so the
+    // transcript rehydrates previews after a reload without an N+1 fetch.
+    const byMessage = uploadStore.byMessageForChat(chatId);
+    const messages = chatManager.getMessages(chatId).map((m) => {
+      const uploads = byMessage.get(m.id);
+      return uploads && uploads.length > 0 ? { ...m, uploads } : m;
+    });
+    return c.json(messages);
   });
 
   // Structured event log for the chat. The client groups by `messageId`
@@ -429,8 +438,10 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     if (instance.archived) return archivedError(c);
     const chat = chatManager.get(chatId);
     if (!chat) return c.json({ error: "chat not found" }, 404);
-    const { content } = createChatMessageBodySchema.parse(await c.req.json());
-    if (!content) return c.json({ error: "content is required" }, 400);
+    const { content, uploadIds } = createChatMessageBodySchema.parse(await c.req.json());
+    if (!content && (!uploadIds || uploadIds.length === 0)) {
+      return c.json({ error: "content or an attachment is required" }, 400);
+    }
 
     // Hold the turn until the environment's sync initializers finish. They kick
     // off at VM create, usually while the user was still typing this first
@@ -464,6 +475,7 @@ export function createChatsRouter(ctx: RouteContext): Hono {
       instance,
       chat,
       content,
+      uploadIds,
     });
 
     return pumpHub(c, chatId, assistantMessageId, -1, userMessage);
@@ -489,7 +501,10 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     const edited = chatManager.getMessage(c.req.param("messageId"));
     if (!edited || edited.chatId !== chatId) return c.json({ error: "message not found" }, 404);
     if (edited.role !== "user") return c.json({ error: "only user messages can be edited" }, 400);
-    const { content } = editChatMessageBodySchema.parse(await c.req.json());
+    const { content, uploadIds } = editChatMessageBodySchema.parse(await c.req.json());
+    if (!content && (!uploadIds || uploadIds.length === 0)) {
+      return c.json({ error: "content or an attachment is required" }, 400);
+    }
 
     // Same readiness gates as a normal send: wait out initialization,
     // refuse on a failed environment, and never run two turns at once.
@@ -518,6 +533,7 @@ export function createChatsRouter(ctx: RouteContext): Hono {
       instance,
       chat,
       content,
+      uploadIds,
       edit: edited,
     });
 

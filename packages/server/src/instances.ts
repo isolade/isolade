@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { and, asc, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import { AUTH_MOUNT, seedVmAuth } from "./auth-sync";
 import type { PortProbe } from "./contracts";
 import type { Db } from "./db";
@@ -27,6 +27,7 @@ import { removeSeedStaging, SEED_MOUNT, type SeedProfileEntry, stageSeed } from 
 import { shellQuote } from "./shell";
 import { runSignerStream, SIGN_SOCK } from "./sign-broker";
 import { buildSignShimScript } from "./sign-shim";
+import { removeUploadsForInstance } from "./uploads";
 
 type CommitterIdentity = { name: string; email: string };
 
@@ -535,6 +536,15 @@ export class InstanceManager {
     else this.portForwards.delete(id);
     this.db.delete(schema.portForwards).where(eq(schema.portForwards.instanceId, id)).run();
     this.prs.removeForInstance(id);
+    const uploadIds = this.db
+      .select({ id: schema.uploads.id })
+      .from(schema.uploads)
+      .where(eq(schema.uploads.instanceId, id));
+    this.db
+      .delete(schema.messageUploads)
+      .where(inArray(schema.messageUploads.uploadId, uploadIds))
+      .run();
+    this.db.delete(schema.uploads).where(eq(schema.uploads.instanceId, id)).run();
     this.initRuns.delete(id);
     // Drop the generation: an in-flight run reads `undefined` here, which never
     // equals its captured generation, so it sees itself superseded and stops
@@ -548,6 +558,10 @@ export class InstanceManager {
       const destroyed = this.sandboxClient.destroyVm(instance.vmId).catch((err) => {
         console.warn(`[instance-remove ${id} vmId=${instance.vmId}] destroyVm failed:`, err);
       });
+      // Drop the host-side uploads dir after the VM's destroy settles: it backs
+      // a live bind mount until then, and deleting it under a running VM can
+      // wedge teardown (same ordering constraint as the seed staging dir).
+      void destroyed.then(() => removeUploadsForInstance(id));
       // An expose_sandbox VM was a sandbox CLIENT (its nested isolade created
       // VMs and registered an image keep-set under this instance's id).
       // Cascade its removal: destroy its leftover VMs, drop its keep-set, and

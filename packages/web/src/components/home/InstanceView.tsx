@@ -25,7 +25,7 @@ interface InstanceViewProps {
   modelOverrides: ModelOverrides;
   // First message to auto-send when this chat was just created. Keyed by
   // chatId so we only fire it for the right chat tab.
-  pendingFirstMessage: { chatId: string; content: string } | null;
+  pendingFirstMessage: { chatId: string; content: string; uploadIds?: string[] } | null;
   // True while the backing VM/chat resources haven't landed yet. The chat tab
   // still mounts (showing the optimistic user message + dots) but defers any
   // server I/O until the real ids are swapped in.
@@ -244,10 +244,9 @@ export default function InstanceView({
           const inOpen = openTabs.includes(chat.id);
           if (!inOpen) return null;
           const isActive = activeKey === chat.id;
-          const initialMessage =
-            pendingFirstMessage && pendingFirstMessage.chatId === chat.id
-              ? pendingFirstMessage.content
-              : undefined;
+          const isPendingChat = pendingFirstMessage && pendingFirstMessage.chatId === chat.id;
+          const initialMessage = isPendingChat ? pendingFirstMessage.content : undefined;
+          const initialUploadIds = isPendingChat ? pendingFirstMessage.uploadIds : undefined;
           return (
             <div
               key={chat.id}
@@ -264,6 +263,7 @@ export default function InstanceView({
                 modelOverrides={modelOverrides}
                 visible={isActive}
                 initialMessage={initialMessage}
+                initialUploadIds={initialUploadIds}
                 pending={pending}
                 creationError={creationError}
                 onTitle={handleTitle}

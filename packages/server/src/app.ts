@@ -30,6 +30,7 @@ import { createNetworkRouter } from "./routes/network";
 import { createProfilesRouter } from "./routes/profiles";
 import { createPromptRouter } from "./routes/prompt";
 import { createRuntimeRouter } from "./routes/runtime";
+import { createUploadsRouter } from "./routes/uploads";
 import { type SandboxApi, SandboxClient } from "./sandbox-client";
 import { SecretsStore } from "./secrets-store";
 import { importSeedProfiles, sweepSeedStaging } from "./seed";
@@ -37,6 +38,7 @@ import { PersistentSessionManager } from "./session-manager";
 import { TerminalManager } from "./terminals";
 import { ActiveProfileTracker, TitleVmManager } from "./title-vm-manager";
 import { getUpdateStatus, initUpdateChecks } from "./update-check";
+import { sweepUploads, UploadStore } from "./uploads";
 import { fetchCodexUsageFromAppServer, getUsageStats } from "./usage";
 import { WorkspaceDiffReader } from "./workspace-diff";
 import { cacheDir, dataDir } from "./xdg";
@@ -221,9 +223,12 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
   // Reclaim seed staging dirs orphaned by a crash between staging and the
   // instance insert (or a missed removal). Local filesystem only, never blocks.
   try {
-    sweepSeedStaging(new Set(instances.list().map((i) => i.id)));
+    const liveIds = new Set(instances.list().map((i) => i.id));
+    sweepSeedStaging(liveIds);
+    // Same idea for message-attachment dirs orphaned by a missed removal.
+    sweepUploads(liveIds);
   } catch (err) {
-    console.warn("[server] seed staging sweep failed:", err);
+    console.warn("[server] staging sweep failed:", err);
   }
   // Per-profile always-warm titling VMs + the reference-counter that decides,
   // from window activate/heartbeat/deactivate signals, when to warm one and
@@ -283,6 +288,7 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
   // broker, started by InstanceManager at create/restart/re-attach.
   const terminalManager = new TerminalManager(db);
   const chatManager = new ChatManager(db);
+  const uploadStore = new UploadStore(db);
   const realClaudeBackend = new ClaudeBackend(sandboxClient, chatManager);
   const codexManager = new CodexManager(sandboxClient);
   const realCodexBackend = new CodexBackend(sandboxClient, chatManager, codexManager);
@@ -503,6 +509,7 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
   // profile-scoped usage cache as /api/usage and the chat-list enrichment.
   const chatTurnService = new ChatTurnService({
     chatManager,
+    uploadStore,
     instances,
     profiles,
     titleVmManager,
@@ -526,6 +533,7 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
     sessionManager,
     terminalManager,
     chatManager,
+    uploadStore,
     chatStreamHub,
     codexManager,
     diffStatsPoller,
@@ -547,6 +555,7 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
   app.route("/", createProfilesRouter(routeContext));
   app.route("/", createInstancesRouter(routeContext));
   app.route("/", createFilesRouter(routeContext));
+  app.route("/", createUploadsRouter(routeContext));
   app.route("/", createChatsRouter(routeContext));
   app.route("/", createAuthRouter(routeContext));
   app.route("/", createGitRouter(routeContext));

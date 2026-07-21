@@ -98,10 +98,65 @@ describe("db migration 3 (message tree)", () => {
       const empty = db.select().from(schema.chats).where(eq(schema.chats.id, emptyChatId)).get();
       expect(empty?.activeLeafId).toBeNull();
 
-      const version = (
-        new Database(path).query("PRAGMA user_version").get() as { user_version: number }
-      ).user_version;
-      expect(version).toBe(3);
+      // A v2 database migrates all the way to the current shape, applying every
+      // step in the ladder (3 = message tree, 4 = uploads, 5 = reusable
+      // message/upload associations).
+      const raw = new Database(path);
+      const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
+        .user_version;
+      expect(version).toBe(5);
+      // Migration 4 installed the uploads table.
+      const uploadsTable = raw
+        .query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'uploads'`)
+        .get();
+      expect(uploadsTable).not.toBeNull();
+      const messageUploadsTable = raw
+        .query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'message_uploads'`)
+        .get();
+      expect(messageUploadsTable).not.toBeNull();
+    } finally {
+      rmSync(path, { force: true });
+      rmSync(`${path}-wal`, { force: true });
+      rmSync(`${path}-shm`, { force: true });
+    }
+  });
+});
+
+describe("db migration 5 (message upload associations)", () => {
+  it("keeps attachments made before the junction table existed", () => {
+    const path = join(tmpdir(), `isolade-mig5-${randomUUID()}.db`);
+    try {
+      const raw = new Database(path);
+      raw.run(`
+        CREATE TABLE uploads (
+          id TEXT PRIMARY KEY,
+          instance_id TEXT NOT NULL,
+          chat_id TEXT,
+          message_id TEXT,
+          filename TEXT NOT NULL,
+          media_type TEXT NOT NULL,
+          size INTEGER NOT NULL,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        )
+      `);
+      raw.run(
+        `INSERT INTO uploads
+          (id, instance_id, chat_id, message_id, filename, media_type, size)
+         VALUES ('upload-1', 'instance-1', 'chat-1', 'message-1', 'image.png', 'image/png', 3)`,
+      );
+      raw.run(`PRAGMA user_version = 4`);
+      raw.close();
+
+      const db = createDb(path);
+      const associations = db.select().from(schema.messageUploads).all();
+      expect(associations).toEqual([
+        {
+          chatId: "chat-1",
+          messageId: "message-1",
+          uploadId: "upload-1",
+          position: 0,
+        },
+      ]);
     } finally {
       rmSync(path, { force: true });
       rmSync(`${path}-wal`, { force: true });

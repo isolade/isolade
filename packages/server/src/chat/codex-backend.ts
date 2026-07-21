@@ -456,6 +456,9 @@ export class CodexBackend implements ChatBackend {
       turnStartPromise = conn.send("turn/start", {
         threadId,
         model: opts.model,
+        // The text carries the user's message plus an attachments preamble
+        // that cites every file's path. The agent opens images with view_image
+        // and other files with its shell tools when it needs them.
         input: [{ type: "text", text: opts.message }],
         summary: "detailed",
         // (The turn id this resolves to is reported through onMeta below: it
