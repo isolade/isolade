@@ -6,6 +6,10 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+### Fixed
+
+- VMs now inherit the host's timezone instead of defaulting to UTC.
+
 ## [0.2.0] - 2026-07-19
 
 ### Added

@@ -2,7 +2,9 @@ import { describe, expect, it } from "bun:test";
 import { ESSENTIAL_NETWORK_DOMAINS, type NetworkConfig } from "@isolade/shared";
 import {
   buildNetworkPolicy,
+  buildVmEnvironment,
   collectVolumeParentDirs,
+  getHostTimezone,
   getVmMemoryMib,
   isInsecureRegistryRef,
 } from "../src/vms";
@@ -82,6 +84,24 @@ describe("VM sizing", () => {
   it("keeps a positive memory size for tiny host values", () => {
     expect(getVmMemoryMib(1)).toBe(1);
     expect(getVmMemoryMib(2)).toBe(1);
+  });
+});
+
+describe("VM timezone", () => {
+  it("injects the host timezone into the guest environment", () => {
+    expect(buildVmEnvironment({}, "America/Los_Angeles")).toMatchObject({
+      TERM: "xterm-256color",
+      IS_SANDBOX: "1",
+      TZ: "America/Los_Angeles",
+    });
+  });
+
+  it("allows an explicitly supplied timezone to override the host default", () => {
+    expect(buildVmEnvironment({ TZ: "Asia/Tokyo" }, "America/Los_Angeles").TZ).toBe("Asia/Tokyo");
+  });
+
+  it("detects a non-empty timezone on the supported test host", () => {
+    expect(getHostTimezone()).toBeTruthy();
   });
 });
 

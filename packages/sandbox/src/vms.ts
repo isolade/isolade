@@ -118,6 +118,36 @@ export function getVmMemoryMib(hostMemoryMib = getHostMemoryMib()) {
   return Math.max(1, Math.floor((hostMemoryMib * 3) / 4));
 }
 
+/** The host's canonical IANA timezone, as seen by the sandbox process. */
+export function getHostTimezone(): string | undefined {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || undefined;
+  } catch {
+    // A missing Intl implementation should not prevent VM creation. The
+    // /etc/localtime rootfs patch below still carries the host's UTC offset
+    // and daylight-saving rules into native guest programs.
+    return undefined;
+  }
+}
+
+export function buildVmEnvironment(
+  extra: Record<string, string> = {},
+  hostTimezone = getHostTimezone(),
+): Record<string, string> {
+  return {
+    TERM: "xterm-256color",
+    // Claude Code reads $IS_SANDBOX to allow --dangerously-skip-permissions
+    // when the runtime user is root. Without it, claude refuses to start
+    // in our default dev image. Cheap to set even for non-root images.
+    IS_SANDBOX: "1",
+    // Give runtimes such as Node and Bun the named zone as well as patching
+    // /etc/localtime below. They may use bundled timezone data rather than
+    // consulting libc's system timezone file.
+    ...(hostTimezone ? { TZ: hostTimezone } : {}),
+    ...extra,
+  };
+}
+
 // Maps `~/foo`, `$HOME/foo`, or an absolute path to an absolute guest path.
 // HOME is the image's runtime $HOME (from inspectImageConfig / deriveHome).
 export function resolveGuestHomePath(input: string, home: string): string {
@@ -319,14 +349,8 @@ export class VmManager {
     const home = deriveHome(imageConfig);
     const runtimeUser = imageUserName(imageConfig);
 
-    const env: Record<string, string> = {
-      TERM: "xterm-256color",
-      // Claude Code reads $IS_SANDBOX to allow --dangerously-skip-permissions
-      // when the runtime user is root. Without it, claude refuses to start
-      // in our default dev image. Cheap to set even for non-root images.
-      IS_SANDBOX: "1",
-      ...opts.env,
-    };
+    const hostTimezone = getHostTimezone();
+    const env = buildVmEnvironment(opts.env, hostTimezone);
 
     // `env`-mode secrets put their REAL value straight into the guest
     // environment with no proxy and no substitution. This opts the secret out of the
@@ -379,7 +403,7 @@ export class VmManager {
       .network((n) => n.policy(networkPolicy))
       .patch((p) => {
         const t = performance.now();
-        const { builder: out, homePaths } = this.addPatches(p, home);
+        const { builder: out, homePaths } = this.addPatches(p, home, hostTimezone);
         patchedHomePaths = homePaths;
         patchesMs += performance.now() - t;
         return out;
@@ -551,6 +575,7 @@ export class VmManager {
   private addPatches(
     p: PatchBuilderInstance,
     home: string,
+    hostTimezone: string | undefined,
   ): { builder: PatchBuilderInstance; homePaths: string[] } {
     const homePrefix = home.endsWith("/") ? home : `${home}/`;
     const dirs = new Set<string>();
@@ -590,6 +615,28 @@ export class VmManager {
     // Dockerfile already creates it. Not added to homePaths, since the
     // build fragment owns /workspace as AGENT_USER at image build time.
     p.mkdir("/workspace");
+
+    // A microVM otherwise inherits the image's timezone, which is generally
+    // UTC. Copying the host tzfile makes libc-based programs follow the host
+    // even in minimal images without tzdata. Also install that same file under
+    // the detected IANA name for programs that honor $TZ by looking it up in
+    // /usr/share/zoneinfo. /etc/timezone covers tools that read the Debian-style
+    // name file directly. The host file exists on both supported platforms.
+    try {
+      if (statSync("/etc/localtime").isFile()) {
+        p.copyFile("/etc/localtime", "/etc/localtime", { mode: 0o644, replace: true });
+        if (hostTimezone) {
+          p.copyFile("/etc/localtime", `/usr/share/zoneinfo/${hostTimezone}`, {
+            mode: 0o644,
+            replace: true,
+          });
+          p.text("/etc/timezone", `${hostTimezone}\n`, { replace: true });
+        }
+      }
+    } catch {
+      // Nonstandard hosts may not have /etc/localtime. $TZ still gives guests
+      // with their own timezone database the host's named zone.
+    }
 
     // Credentials injected from host always overwrite whatever the image
     // pre-populated (e.g. `claude install` creates ~/.claude.json).
