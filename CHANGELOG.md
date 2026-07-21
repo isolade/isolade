@@ -6,6 +6,11 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+### Changed
+
+- Codex chats no longer expose Codex's built-in subagent tools, so a chat can
+  no longer spawn subagents. A custom subagents tool will replace this later.
+
 ## [0.2.0] - 2026-07-19
 
 ### Added
