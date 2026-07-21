@@ -1,26 +1,20 @@
 // The chat turn's pure data model: the renderable chunk stream an assistant
 // turn reduces to, the event->chunk reducer shared by live streaming and
-// mount-time replay, the typewriter-reveal projection over it, and the
-// usage-state rehydration helpers. No React in here. Chat.tsx owns the
-// stateful machinery, this module owns the shapes and folds it runs on.
-import type { ChatEvent, Chat as ChatRow } from "../../lib/contracts";
+// server-side history compaction, and usage-state rehydration helpers. No
+// React in here. Chat.tsx owns the stateful machinery.
+import {
+  applyChatRenderEvent,
+  type ChatRenderChunk,
+  type Chat as ChatRow,
+  type SubscriptionShare,
+  summarizeChatToolInput,
+  TOOL_INPUT_PREVIEW_CHARS,
+  TOOL_OUTPUT_PREVIEW_CHARS,
+  type TokenUsage,
+  type ToolRenderChunk,
+} from "../../lib/contracts";
 
-export interface TokenUsage {
-  inputTokens: number;
-  cachedInputTokens: number;
-  cacheCreationInputTokens: number;
-  outputTokens: number;
-  reasoningOutputTokens: number;
-  totalTokens: number;
-}
-
-export interface SubscriptionShare {
-  plan: { id: string; label: string };
-  fiveHourPct: number | null;
-  sevenDayPct: number | null;
-  fiveHourCurrentPct: number | null;
-  sevenDayCurrentPct: number | null;
-}
+export type { SubscriptionShare, TokenUsage };
 
 export interface UsageState {
   last: TokenUsage;
@@ -38,277 +32,148 @@ export interface UsageState {
 //   a collapsible card with a one-line summary
 // - raw: any other provider event (unknown shapes) shown as a collapsible
 //   labelled box with full JSON payload (debug only)
-export type ToolChunk = {
-  kind: "tool";
-  id: string;
-  name: string;
-  input?: unknown;
-  output?: string;
-  isError?: boolean;
-  status: "running" | "done";
-};
-export type StreamChunk =
-  | { kind: "text"; text: string }
-  | { kind: "thinking"; text: string }
-  | ToolChunk
-  // Consecutive `api_retry` events from the CLI coalesce into a single
-  // chunk so a 10-retry burst doesn't stack 10 banners. Reset whenever a
-  // non-retry event lands, so a successful recovery turns into one
-  // historical banner followed by the real response.
-  | {
-      kind: "api_retry";
-      attempt: number;
-      maxRetries: number;
-      retryDelayMs: number;
-      errorStatus: number | null;
-      error: string | null;
-    }
-  | {
-      kind: "raw";
-      source: "claude" | "codex";
-      label: string;
-      payload: unknown;
-    };
+export type ToolChunk = ToolRenderChunk;
+export type StreamChunk = ChatRenderChunk;
 
 // Reduce one persisted SSE event into a chunk stream, mutating in place.
 // Shared between live streaming (where the live reducer wraps it with state
 // updates + scroll calls) and mount-time replay (which just folds the array).
 // Per-id tool index passed in so callers can keep state across events.
-export function applyEvent(
+export const applyEvent = applyChatRenderEvent;
+
+/** Merge a focused full-detail response into a live reducer without replacing
+ * text or tool state that may have advanced while the request was in flight. */
+export interface ToolDetailsMergeResult {
+  matched: boolean;
+  changed: boolean;
+  complete: boolean;
+}
+
+export function mergeToolDetails(
+  current: StreamChunk[],
+  fetched: readonly StreamChunk[],
+  toolId: string,
+): ToolDetailsMergeResult {
+  const index = current.findIndex((chunk) => chunk.kind === "tool" && chunk.id === toolId);
+  const chunk = current[index];
+  const full = fetched.find(
+    (candidate): candidate is ToolChunk => candidate.kind === "tool" && candidate.id === toolId,
+  );
+  if (index < 0 || chunk?.kind !== "tool" || !full) {
+    return { matched: false, changed: false, complete: false };
+  }
+  const inputIsPreview =
+    typeof chunk.input === "string" &&
+    chunk.input.length === TOOL_INPUT_PREVIEW_CHARS + 1 &&
+    chunk.input.endsWith("…");
+  const outputIsPreview =
+    typeof chunk.output === "string" &&
+    chunk.output.length === TOOL_OUTPUT_PREVIEW_CHARS + 1 &&
+    chunk.output.endsWith("…");
+  const input =
+    (chunk.input === undefined || inputIsPreview) && full.input !== undefined
+      ? full.input
+      : chunk.input;
+  const output =
+    (chunk.output === undefined || outputIsPreview) && full.output !== undefined
+      ? full.output
+      : chunk.output;
+  const summary = full.summary ?? chunk.summary ?? summarizeChatToolInput(full.input);
+  const detailsAvailable =
+    (typeof input === "string" &&
+      input.length === TOOL_INPUT_PREVIEW_CHARS + 1 &&
+      input.endsWith("…")) ||
+    (typeof output === "string" &&
+      output.length === TOOL_OUTPUT_PREVIEW_CHARS + 1 &&
+      output.endsWith("…"));
+  const changed =
+    summary !== chunk.summary ||
+    input !== chunk.input ||
+    output !== chunk.output ||
+    detailsAvailable !== chunk.detailsAvailable;
+  if (!changed) return { matched: true, changed: false, complete: !detailsAvailable };
+  current[index] = {
+    ...chunk,
+    summary,
+    ...(input !== undefined ? { input } : {}),
+    ...(output !== undefined ? { output } : {}),
+    detailsAvailable,
+  };
+  return { matched: true, changed: true, complete: !detailsAvailable };
+}
+
+// Atomically replace a live reducer from a server snapshot, then apply events
+// that arrived while the snapshot request was in flight. Used when debug is
+// enabled mid-turn so earlier reasoning/raw frames appear without reconnecting
+// or losing newer deltas.
+export function replaceChunksFromSnapshot(
   chunks: StreamChunk[],
   toolIndex: Map<string, number>,
-  type: string,
-  payload: unknown,
+  snapshot: StreamChunk[],
+  snapshotLastSeq: number,
+  bufferedEvents: Iterable<{ seq: number; type: string; payload: unknown }>,
 ): void {
-  switch (type) {
-    case "delta": {
-      const text = typeof payload === "string" ? payload : String(payload ?? "");
-      const last = chunks[chunks.length - 1];
-      if (last?.kind === "text") last.text += text;
-      else chunks.push({ kind: "text", text });
-      return;
-    }
-    case "thinking": {
-      const p = payload as { text?: string } | null;
-      chunks.push({ kind: "thinking", text: p?.text ?? "" });
-      return;
-    }
-    case "tool_call_start": {
-      const p = payload as { id?: string; name?: string };
-      if (!p?.id) return;
-      const idx = toolIndex.get(p.id);
-      if (idx !== undefined) {
-        const cur = chunks[idx];
-        if (cur?.kind === "tool")
-          chunks[idx] = { ...cur, name: p.name ?? cur.name, status: "running" };
-      } else {
-        toolIndex.set(p.id, chunks.length);
-        chunks.push({
-          kind: "tool",
-          id: p.id,
-          name: p.name ?? "tool",
-          status: "running",
-        });
-      }
-      return;
-    }
-    case "tool_call_input": {
-      const p = payload as { id?: string; input?: unknown };
-      if (!p?.id) return;
-      const idx = toolIndex.get(p.id);
-      if (idx === undefined) return;
-      const cur = chunks[idx];
-      if (cur?.kind === "tool") chunks[idx] = { ...cur, input: p.input };
-      return;
-    }
-    case "tool_call_result": {
-      const p = payload as { id?: string; output?: string; isError?: boolean };
-      if (!p?.id) return;
-      const idx = toolIndex.get(p.id);
-      if (idx === undefined) return;
-      const cur = chunks[idx];
-      if (cur?.kind === "tool") {
-        chunks[idx] = {
-          ...cur,
-          output: p.output,
-          isError: p.isError,
-          status: "done",
-        };
-      }
-      return;
-    }
-    case "raw": {
-      const p = payload as { source?: "claude" | "codex"; payload?: unknown };
-      const source = p?.source ?? "claude";
-      chunks.push({
-        kind: "raw",
-        source,
-        label: rawLabel(source, p?.payload),
-        payload: p?.payload,
-      });
-      return;
-    }
-    case "api_retry": {
-      const p = payload as {
-        attempt?: number;
-        maxRetries?: number;
-        retryDelayMs?: number;
-        errorStatus?: number | null;
-        error?: string | null;
-      };
-      const last = chunks[chunks.length - 1];
-      const next = {
-        kind: "api_retry" as const,
-        attempt: p?.attempt ?? 0,
-        maxRetries: p?.maxRetries ?? 0,
-        retryDelayMs: p?.retryDelayMs ?? 0,
-        errorStatus: p?.errorStatus ?? null,
-        error: p?.error ?? null,
-      };
-      if (last?.kind === "api_retry") chunks[chunks.length - 1] = next;
-      else chunks.push(next);
-      return;
-    }
-    // usage / context_compacted / title / message_id don't produce chunks.
-    // They update the chat-level usage panel or the parent's title.
-    // turn_started is a DB-only marker (seq=-1) used purely for
-    // in-flight detection during hydration. Resume replay filters it
-    // out, but mount-time event hydration via listChatEvents still
-    // sees it, so we no-op it here.
-    default:
-      return;
+  chunks.splice(0, chunks.length, ...snapshot);
+  toolIndex.clear();
+  for (const [index, chunk] of chunks.entries()) {
+    if (chunk.kind === "tool") toolIndex.set(chunk.id, index);
+  }
+  for (const event of bufferedEvents) {
+    if (event.seq <= snapshotLastSeq) continue;
+    applyEvent(chunks, toolIndex, event.type, event.payload);
   }
 }
 
-// Total number of "readable" characters across the chunk stream: the text
-// and reasoning the typewriter reveal animates. Structural chunks (tools,
-// retries, raw) carry no reveal cost, and they're gated only by the text that
-// precedes them.
-export function revealableLen(chunks: StreamChunk[]): number {
-  let n = 0;
-  for (const c of chunks) {
-    if (c.kind === "text" || c.kind === "thinking") n += c.text.length;
+/** Number of readable UTF-16 code units in a live chunk stream. Structural
+ * chunks have no reveal cost and appear after the readable content before
+ * them has become visible. */
+export function revealableLength(chunks: readonly StreamChunk[]): number {
+  let length = 0;
+  for (const chunk of chunks) {
+    if (chunk.kind === "text" || chunk.kind === "thinking") length += chunk.text.length;
   }
-  return n;
+  return length;
 }
 
-// Project the target chunk stream down to the first `budget` readable
-// characters, in order. Text/thinking chunks are sliced at the boundary.
-// Structural chunks ride along only once the text before them is fully
-// revealed, so tool calls never appear ahead of the prose that introduced
-// them. This is what the typewriter renders mid-reveal. Once `budget`
-// reaches revealableLen() it returns the full stream unchanged.
-export function truncateChunks(chunks: StreamChunk[], budget: number): StreamChunk[] {
-  const out: StreamChunk[] = [];
-  for (const c of chunks) {
-    if (c.kind === "text" || c.kind === "thinking") {
-      if (budget >= c.text.length) {
-        out.push(c);
-        budget -= c.text.length;
-      } else {
-        if (budget > 0) out.push({ ...c, text: c.text.slice(0, budget) });
-        return out;
-      }
-    } else {
-      out.push(c);
+function safeSliceEnd(text: string, requested: number): number {
+  const end = Math.min(text.length, requested);
+  if (end <= 0 || end >= text.length) return end;
+  const previous = text.charCodeAt(end - 1);
+  const next = text.charCodeAt(end);
+  const splitsSurrogatePair =
+    previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff;
+  return splitsSurrogatePair ? end - 1 : end;
+}
+
+/** Project a live stream down to a readable-character budget. The returned
+ * array is always a new snapshot because the reducer mutates its target array
+ * in place, while memoized React children depend on a new array identity. */
+export function revealChunks(chunks: readonly StreamChunk[], budget: number): StreamChunk[] {
+  const revealed: StreamChunk[] = [];
+  let remaining = Math.max(0, budget);
+  for (const chunk of chunks) {
+    if (chunk.kind !== "text" && chunk.kind !== "thinking") {
+      revealed.push(chunk);
+      continue;
     }
-  }
-  return out;
-}
-
-// Typewriter reveal cadence (see pumpReveal in drainTurn). The animation
-// drains the received-but-unshown text at a CONSTANT characters-per-second so
-// it reads as even typing, not the burst-then-stall of a backlog-proportional
-// rate. REVEAL_CPS is the speed you see almost all the time, and the catch-up only
-// engages once more than REVEAL_LAG_CHARS is buffered (a big Claude block
-// landed, or generation outran the animation), ramping up to clear the excess
-// over ~REVEAL_CATCHUP_SEC, capped at REVEAL_MAX_CPS so it never looks like a
-// paste. Tune REVEAL_CPS for feel. Raise REVEAL_MAX_CPS / lower the lag budget
-// to track real-time output more tightly at the cost of a less even cadence.
-// Master switch for the typewriter reveal. Temporarily false to restore the
-// previous behaviour where streamed text renders immediately as it arrives.
-// Flip back to true to re-enable the animation. The machinery below stays in
-// place either way.
-export const REVEAL_ANIMATION: boolean = true;
-export const REVEAL_CPS = 320;
-export const REVEAL_LAG_CHARS = 200;
-export const REVEAL_CATCHUP_SEC = 0.3;
-export const REVEAL_MAX_CPS = 700;
-
-// Replay a chronological list of events for a single assistant message
-// into its final StreamChunk[]. Used by the mount-time replay path.
-export function chunksFromEvents(events: ChatEvent[]): StreamChunk[] {
-  const chunks: StreamChunk[] = [];
-  const toolIndex = new Map<string, number>();
-  for (const ev of events) {
-    let payload: unknown;
-    try {
-      payload = JSON.parse(ev.payload);
-    } catch (err) {
-      // Server-side invariant: chat_events.payload is always
-      // JSON.stringify-d. A parse failure here indicates a corrupt
-      // row, so log it so the cause is debuggable from console.
-      console.warn(`[chat] event payload not JSON (seq=${ev.seq} type=${ev.type}):`, err);
-      payload = ev.payload;
+    if (remaining >= chunk.text.length) {
+      revealed.push(chunk);
+      remaining -= chunk.text.length;
+      continue;
     }
-    applyEvent(chunks, toolIndex, ev.type, payload);
+    const end = safeSliceEnd(chunk.text, remaining);
+    if (end > 0) revealed.push({ ...chunk, text: chunk.text.slice(0, end) });
+    return revealed;
   }
-  return chunks;
+  return revealed;
 }
 
-// Pick the most recent usage event across all messages. That's what the
-// live stream would have left in UsageState. The chat row already carries
-// totals/cost/window for Tier-1 hydration, and the event log is the authority
-// for `subscriptionShare` (server-computed, not stored on the row).
-// Returns nulls for chats that have never streamed.
-export function latestUsageFromEvents(events: ChatEvent[]): {
-  payload: {
-    last: TokenUsage;
-    total: TokenUsage;
-    modelContextWindow?: number;
-    costUsd?: number;
-    subscriptionShare?: SubscriptionShare;
-  } | null;
-  compacted: boolean;
-} {
-  let latest: ChatEvent | undefined;
-  let compacted = false;
-  for (const ev of events) {
-    if (ev.type === "usage") {
-      // createdAt is a Date thanks to the dateLikeSchema in shared.
-      const ts = new Date(ev.createdAt).getTime();
-      const cur = latest ? new Date(latest.createdAt).getTime() : -Infinity;
-      if (ts >= cur) latest = ev;
-    } else if (ev.type === "context_compacted") {
-      compacted = true;
-    }
-  }
-  if (!latest) return { payload: null, compacted };
-  try {
-    return { payload: JSON.parse(latest.payload), compacted };
-  } catch (err) {
-    console.warn(`[chat] usage event payload not JSON (seq=${latest.seq}):`, err);
-    return { payload: null, compacted };
-  }
-}
-
-// Best-effort label for a raw provider event. We don't need to be exhaustive
-// here, since the goal is just to make the collapsed card more informative than
-// "unknown event".
-function rawLabel(source: "claude" | "codex", payload: unknown): string {
-  if (payload && typeof payload === "object") {
-    const o = payload as Record<string, unknown>;
-    if (typeof o.method === "string") return o.method;
-    if (typeof o.type === "string") {
-      if (o.type === "stream_event" && o.event && typeof o.event === "object") {
-        const inner = o.event as Record<string, unknown>;
-        if (typeof inner.type === "string") return inner.type;
-      }
-      return o.type;
-    }
-  }
-  return source === "claude" ? "claude event" : "codex event";
-}
+// Visible live output advances at a steady cadence. A bounded catch-up rate
+// prevents large provider deltas from leaving the rendered response far behind.
+export const REVEAL_CHARACTERS_PER_SECOND = 320;
+export const REVEAL_LAG_CHARACTERS = 200;
+export const REVEAL_CATCHUP_SECONDS = 0.3;
+export const REVEAL_MAX_CHARACTERS_PER_SECOND = 700;
 
 // Rebuild a UsageState snapshot from the persisted chat row. Returns null
 // when the chat has never streamed (cumulative totals are null). In that

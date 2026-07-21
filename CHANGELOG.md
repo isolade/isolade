@@ -23,6 +23,10 @@ _Changes landed on `main` that haven't shipped in a release yet._
 - Codex chats no longer unintentionally expose the built-in subagent tools.
   A custom subagents tool will replace this later.
 - VMs now inherit the host's timezone instead of defaulting to UTC.
+- Chat rendering is faster and smoother, especially when switching between
+  long chats. Chats preserve their scroll position, streamed responses render
+  as proper Markdown with a live typing effect, and new output only scrolls the
+  view when the reader is already at the bottom.
 
 ## [0.2.0] - 2026-07-19
 

@@ -1,17 +1,23 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { eq } from "drizzle-orm";
 import { DEFAULT_ANTHROPIC_MODEL_ID } from "../src/contracts";
+import { schema } from "../src/db";
 import { createTestServer } from "./helpers";
 
 describe("chat API", () => {
   let baseUrl: string;
   let seedInstance: () => string;
   let cleanup: () => Promise<void>;
+  let chatManager: ReturnType<typeof createTestServer>["chatManager"];
+  let db: ReturnType<typeof createTestServer>["db"];
 
   beforeAll(() => {
     const server = createTestServer();
     baseUrl = server.baseUrl;
     seedInstance = server.seedInstance;
     cleanup = server.cleanup;
+    chatManager = server.chatManager;
+    db = server.db;
   });
 
   afterAll(async () => {
@@ -185,30 +191,301 @@ describe("chat API", () => {
       });
       expect(res.status).toBe(404);
     });
-  });
 
-  // ── messages ───────────────────────────────────────────────────────────────
+    it("does not expose a chat through another instance id", async () => {
+      const ownerId = seedInstance();
+      const otherId = seedInstance();
+      const chat = chatManager.create(ownerId, DEFAULT_ANTHROPIC_MODEL_ID, "anthropic", "high");
+      chatManager.addMessage(chat.id, "user", "private");
 
-  describe("GET /api/instances/:id/chats/:chatId/messages", () => {
-    it("returns empty array for a new chat", async () => {
-      const instanceId = seedInstance();
-      const { id: chatId } = (await (
-        await fetch(`${baseUrl}/api/instances/${instanceId}/chats`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ model: DEFAULT_ANTHROPIC_MODEL_ID }),
-        })
-      ).json()) as { id: string };
-
-      const res = await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`);
-      expect(res.status).toBe(200);
-      expect(await res.json()).toEqual([]);
+      for (const suffix of ["messages", "transcript", "events", "render?ids=unknown"]) {
+        const response = await fetch(
+          `${baseUrl}/api/instances/${otherId}/chats/${chat.id}/${suffix}`,
+        );
+        expect(response.status).toBe(404);
+      }
+      const deleteResponse = await fetch(`${baseUrl}/api/instances/${otherId}/chats/${chat.id}`, {
+        method: "DELETE",
+      });
+      expect(deleteResponse.status).toBe(404);
+      expect(chatManager.get(chat.id)).toBeDefined();
     });
 
-    it("returns 404 for nonexistent chat", async () => {
+    it("rejects a transcript cursor from another chat", async () => {
       const instanceId = seedInstance();
-      const res = await fetch(`${baseUrl}/api/instances/${instanceId}/chats/nonexistent/messages`);
-      expect(res.status).toBe(404);
+      const first = chatManager.create(instanceId, DEFAULT_ANTHROPIC_MODEL_ID, "anthropic", "high");
+      const second = chatManager.create(
+        instanceId,
+        DEFAULT_ANTHROPIC_MODEL_ID,
+        "anthropic",
+        "high",
+      );
+      const foreign = chatManager.addMessage(second.id, "user", "foreign");
+      const response = await fetch(
+        `${baseUrl}/api/instances/${instanceId}/chats/${first.id}/transcript?before=${foreign.id}`,
+      );
+      expect(response.status).toBe(400);
+    });
+  });
+
+  describe("bounded chat transcript", () => {
+    it("returns a bounded transcript page and compact visible render chunks", async () => {
+      const instanceId = seedInstance();
+      const chat = chatManager.create(instanceId, DEFAULT_ANTHROPIC_MODEL_ID, "anthropic", "high");
+      const user = chatManager.addMessage(chat.id, "user", "hello");
+      const assistant = chatManager.addMessage(chat.id, "assistant", "done", {
+        parentId: user.id,
+      });
+      chatManager.setActiveLeaf(chat.id, assistant.id);
+      chatManager.appendEvent(chat.id, assistant.id, 0, "raw", {
+        source: "claude",
+        payload: { type: "cached" },
+      });
+      chatManager.appendEvent(chat.id, assistant.id, 1, "tool_call_start", {
+        id: "tool-1",
+        name: "Read",
+      });
+      chatManager.appendEvent(chat.id, assistant.id, 2, "tool_call_result", {
+        id: "tool-1",
+        output: "ok",
+      });
+      chatManager.appendEvent(chat.id, assistant.id, 3, "delta", "done");
+      const transcriptRes = await fetch(
+        `${baseUrl}/api/instances/${instanceId}/chats/${chat.id}/transcript?limit=1`,
+      );
+      expect(transcriptRes.status).toBe(200);
+      const transcript = (await transcriptRes.json()) as {
+        messages: { id: string }[];
+        hasMore: boolean;
+      };
+      expect(transcript.messages.map((message) => message.id)).toEqual([assistant.id]);
+      expect(transcript.hasMore).toBe(true);
+
+      const plain = chatManager.addMessage(chat.id, "assistant", "plain", {
+        parentId: assistant.id,
+      });
+      chatManager.appendEvent(chat.id, plain.id, 0, "delta", "plain");
+
+      const renderRes = await fetch(
+        `${baseUrl}/api/instances/${instanceId}/chats/${chat.id}/render?ids=${assistant.id},${plain.id}`,
+      );
+      expect(renderRes.status).toBe(200);
+      const render = (await renderRes.json()) as {
+        chunksByMessage: Record<string, { kind: string }[]>;
+      };
+      expect(render.chunksByMessage[assistant.id]?.map((chunk) => chunk.kind)).toEqual([
+        "tool",
+        "text",
+      ]);
+      expect(render.chunksByMessage[plain.id]).toEqual([]);
+      expect(chatManager.getMessageRenders(chat.id, [assistant.id, plain.id])).toHaveLength(2);
+
+      const debugRenderRes = await fetch(
+        `${baseUrl}/api/instances/${instanceId}/chats/${chat.id}/render?debug=1&ids=${assistant.id}`,
+      );
+      const debugRender = (await debugRenderRes.json()) as {
+        chunksByMessage: Record<string, { kind: string }[]>;
+      };
+      expect(debugRender.chunksByMessage[assistant.id]?.map((chunk) => chunk.kind)).toEqual([
+        "raw",
+        "tool",
+        "text",
+      ]);
+
+      chatManager.beginInFlightTurn(chat.id, "running-message");
+      chatManager.appendEvent(chat.id, "running-message", 0, "raw", {
+        source: "claude",
+        payload: { type: "live-debug" },
+      });
+      chatManager.appendEvent(chat.id, "running-message", 1, "delta", "partial");
+      const inFlightRes = await fetch(
+        `${baseUrl}/api/instances/${instanceId}/chats/${chat.id}/events/in-flight`,
+      );
+      expect(inFlightRes.status).toBe(200);
+      const inFlight = (await inFlightRes.json()) as {
+        messageId: string;
+        lastSeq: number;
+        chunks: { kind: string; text?: string }[];
+      };
+      expect(inFlight).toEqual({
+        messageId: "running-message",
+        lastSeq: 1,
+        chunks: [{ kind: "text", text: "partial" }],
+      });
+
+      const debugInFlightRes = await fetch(
+        `${baseUrl}/api/instances/${instanceId}/chats/${chat.id}/events/in-flight?debug=1`,
+      );
+      const debugInFlight = (await debugInFlightRes.json()) as {
+        chunks: { kind: string }[];
+      };
+      expect(debugInFlight.chunks.map((chunk) => chunk.kind)).toEqual(["raw", "text"]);
+
+      const inFlightRenderResponse = await fetch(
+        `${baseUrl}/api/instances/${instanceId}/chats/${chat.id}/render?ids=running-message`,
+      );
+      const inFlightRender = (await inFlightRenderResponse.json()) as {
+        chunksByMessage: Record<string, { kind: string; text?: string }[]>;
+      };
+      expect(inFlightRender.chunksByMessage["running-message"]).toEqual([
+        { kind: "text", text: "partial" },
+      ]);
+    });
+
+    it("does not cache user, unknown, or another chat's message ids", async () => {
+      const instanceId = seedInstance();
+      const chat = chatManager.create(instanceId, DEFAULT_ANTHROPIC_MODEL_ID, "anthropic", "high");
+      const user = chatManager.addMessage(chat.id, "user", "hello");
+      const otherChat = chatManager.create(
+        instanceId,
+        DEFAULT_ANTHROPIC_MODEL_ID,
+        "anthropic",
+        "high",
+      );
+      const otherAssistant = chatManager.addMessage(otherChat.id, "assistant", "done");
+      chatManager.saveMessageRender(otherChat.id, otherAssistant.id, [
+        { kind: "tool", id: "tool-1", name: "Read", status: "done", output: "ok" },
+      ]);
+      const before = chatManager.getMessageRenders(otherChat.id, [otherAssistant.id])[0]!;
+      const unknownId = crypto.randomUUID();
+
+      const response = await fetch(
+        `${baseUrl}/api/instances/${instanceId}/chats/${chat.id}/render?ids=${otherAssistant.id},${user.id},${unknownId}`,
+      );
+      expect(response.status).toBe(200);
+      const render = (await response.json()) as {
+        chunksByMessage: Record<string, { kind: string }[]>;
+      };
+
+      expect(render.chunksByMessage).toEqual({
+        [otherAssistant.id]: [],
+        [user.id]: [],
+        [unknownId]: [],
+      });
+      expect(chatManager.getMessageRenders(otherChat.id, [otherAssistant.id])[0]).toEqual(before);
+      expect(chatManager.getMessageRenders(chat.id, [user.id, unknownId])).toHaveLength(0);
+    });
+
+    it("bounds multi-megabyte tool payloads in transcript pages and loads full details on demand", async () => {
+      const instanceId = seedInstance();
+      const chat = chatManager.create(instanceId, DEFAULT_ANTHROPIC_MODEL_ID, "anthropic", "high");
+      const user = chatManager.addMessage(chat.id, "user", "run it");
+      const assistant = chatManager.addMessage(chat.id, "assistant", "finished", {
+        parentId: user.id,
+      });
+      chatManager.setActiveLeaf(chat.id, assistant.id);
+      const largeInput = { command: "x".repeat(1_500_000) };
+      const largeOutput = "y".repeat(2_000_000);
+      chatManager.appendEvent(chat.id, assistant.id, 0, "tool_call_start", {
+        id: "large-tool",
+        name: "Bash",
+      });
+      chatManager.appendEvent(chat.id, assistant.id, 1, "tool_call_input", {
+        id: "large-tool",
+        input: largeInput,
+      });
+      chatManager.appendEvent(chat.id, assistant.id, 2, "tool_call_result", {
+        id: "large-tool",
+        output: largeOutput,
+      });
+      chatManager.appendEvent(chat.id, assistant.id, 3, "tool_call_start", {
+        id: "sibling-tool",
+        name: "Read",
+      });
+      chatManager.appendEvent(chat.id, assistant.id, 4, "tool_call_input", {
+        id: "sibling-tool",
+        input: { file_path: "/workspace/sibling.txt" },
+      });
+
+      const transcriptResponse = await fetch(
+        `${baseUrl}/api/instances/${instanceId}/chats/${chat.id}/transcript`,
+      );
+      const transcriptBody = await transcriptResponse.text();
+      expect(transcriptResponse.status).toBe(200);
+      expect(transcriptBody.length).toBeLessThan(20_000);
+      const transcript = JSON.parse(transcriptBody) as {
+        chunksByMessage: Record<
+          string,
+          {
+            kind: string;
+            summary?: string;
+            input?: unknown;
+            output?: string;
+            detailsAvailable?: boolean;
+          }[]
+        >;
+      };
+      const preview = transcript.chunksByMessage[assistant.id]?.[0];
+      expect(preview?.detailsAvailable).toBe(true);
+      expect(preview?.summary).toStartWith("x");
+      expect(preview?.summary?.length).toBeLessThan(600);
+      expect(JSON.stringify(preview?.input).length).toBeLessThan(1_200);
+      expect(preview?.output?.length).toBeLessThan(2_100);
+
+      const detailResponse = await fetch(
+        `${baseUrl}/api/instances/${instanceId}/chats/${chat.id}/render?ids=${assistant.id}`,
+      );
+      const details = (await detailResponse.json()) as {
+        chunksByMessage: Record<string, { input?: unknown; output?: string }[]>;
+      };
+      const full = details.chunksByMessage[assistant.id]?.[0];
+      expect(full?.input).toEqual(largeInput);
+      expect(full?.output).toBe(largeOutput);
+
+      const focusedResponse = await fetch(
+        `${baseUrl}/api/instances/${instanceId}/chats/${chat.id}/render?ids=${assistant.id}&toolId=large-tool`,
+      );
+      const focused = (await focusedResponse.json()) as {
+        chunksByMessage: Record<string, { id?: string; input?: unknown; output?: string }[]>;
+      };
+      expect(focused.chunksByMessage[assistant.id]).toHaveLength(1);
+      expect(focused.chunksByMessage[assistant.id]?.[0]).toMatchObject({
+        id: "large-tool",
+        input: largeInput,
+        output: largeOutput,
+      });
+    });
+
+    it("lazily heals bounded tool previews written before summaries", async () => {
+      const instanceId = seedInstance();
+      const chat = chatManager.create(instanceId, DEFAULT_ANTHROPIC_MODEL_ID, "anthropic", "high");
+      const assistant = chatManager.addMessage(chat.id, "assistant", "finished");
+      chatManager.setActiveLeaf(chat.id, assistant.id);
+      chatManager.saveMessageRender(chat.id, assistant.id, [
+        {
+          kind: "tool",
+          id: "legacy-tool",
+          name: "Shell",
+          input: { command: `echo legacy ${"x".repeat(2_000)}` },
+          status: "done",
+        },
+      ]);
+      const legacyPreview = [
+        {
+          kind: "tool",
+          id: "legacy-tool",
+          name: "Shell",
+          input: `${"x".repeat(1_024)}…`,
+          status: "done",
+          detailsAvailable: true,
+        },
+      ];
+      db.update(schema.chatMessageRenders)
+        .set({ previewChunks: JSON.stringify(legacyPreview) })
+        .where(eq(schema.chatMessageRenders.messageId, assistant.id))
+        .run();
+
+      const response = await fetch(
+        `${baseUrl}/api/instances/${instanceId}/chats/${chat.id}/transcript`,
+      );
+      const transcript = (await response.json()) as {
+        chunksByMessage: Record<string, { summary?: string }[]>;
+      };
+      expect(transcript.chunksByMessage[assistant.id]?.[0]?.summary).toStartWith("echo legacy ");
+      const healed = JSON.parse(
+        chatManager.getMessageRenders(chat.id, [assistant.id])[0]!.previewChunks,
+      ) as { summary?: string }[];
+      expect(healed[0]?.summary).toStartWith("echo legacy ");
     });
   });
 

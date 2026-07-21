@@ -3,9 +3,10 @@ import type { ComponentProps, ReactNode } from "react";
 import { createContext, memo, useContext, useEffect, useRef, useState } from "react";
 import type { Components } from "react-markdown";
 import ReactMarkdown from "react-markdown";
-import rehypeHighlight from "rehype-highlight";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
+import { highlightCode } from "@/lib/highlight";
+import { RENDER_METRICS_ENABLED, recordRenderMetric } from "@/lib/render-metrics";
 import { onExternalLinkClick } from "../lib/tauri";
 
 // True while rendering inside a fenced code block's <pre>. react-markdown
@@ -24,9 +25,8 @@ type HastNode = {
   properties?: { className?: unknown };
 };
 
-// Raw text of a (possibly highlighted) hast subtree. After rehype-highlight
-// runs, a code element's children are nested hljs spans rather than a single
-// text node, so the copy payload needs a recursive walk.
+// Raw text of a hast subtree. Keep the recursive walk so the copy payload does
+// not depend on how react-markdown represents a future nested code child.
 function hastText(node: HastNode | undefined): string {
   if (!node) return "";
   if (node.type === "text") return node.value ?? "";
@@ -66,8 +66,8 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-// Fenced code block: rehype-highlight output with a copy button floating
-// in the top-right corner. Replaces react-markdown's default <pre> so we
+// Fenced code block: memoized lowlight output with a copy button floating in
+// the top-right corner. Replaces react-markdown's default <pre> so we
 // don't end up with our card div nested inside a <pre>. The button sits
 // outside the overflow wrapper so it stays put when the code scrolls
 // horizontally. The translucent backdrop keeps it legible when a long
@@ -91,7 +91,7 @@ function PreBlock({ node, children }: { node?: unknown; children?: ReactNode }) 
   );
 }
 
-function CodeRenderer({
+const CodeRenderer = memo(function CodeRenderer({
   className,
   children,
   ...props
@@ -99,11 +99,14 @@ function CodeRenderer({
   delete props.node;
   const inPre = useContext(PreContext);
   if (inPre) {
-    // Block code inside PreBlock: keep the hljs classes from
-    // rehype-highlight so the token CSS in index.css colors them.
+    const text = typeof children === "string" ? children : String(children ?? "");
+    const language = className?.match(/(?:^|\s)language-([^\s]+)/)?.[1] ?? null;
+    const highlighted = language ? highlightCode(text, language) : text;
+    const codeClassName = [className, language ? "hljs" : null].filter(Boolean).join(" ");
+    if (language && RENDER_METRICS_ENABLED) recordRenderMetric("codeHighlightRuns");
     return (
-      <code className={className} {...props}>
-        {children}
+      <code className={codeClassName || undefined} {...props}>
+        {highlighted}
       </code>
     );
   }
@@ -112,15 +115,27 @@ function CodeRenderer({
       {children}
     </code>
   );
+}, codePropsEqual);
+
+function codePropsEqual(
+  previous: ComponentProps<"code"> & { node?: unknown },
+  next: ComponentProps<"code"> & { node?: unknown },
+): boolean {
+  return previous.className === next.className && previous.children === next.children;
 }
+
+const Paragraph = memo(
+  function Paragraph({ children }: { children?: ReactNode }) {
+    return <p className="mb-2 last:mb-0 leading-relaxed">{children}</p>;
+  },
+  (previous, next) => previous.children === next.children,
+);
 
 const components: Components = {
   pre: PreBlock,
   code: CodeRenderer,
   // Block elements
-  p({ children }) {
-    return <p className="mb-2 last:mb-0 leading-relaxed">{children}</p>;
-  },
+  p: Paragraph,
   ul({ children }) {
     return <ul className="mb-2 last:mb-0 pl-4 list-disc space-y-1">{children}</ul>;
   },
@@ -219,11 +234,7 @@ interface MarkdownProps {
 
 function Markdown({ content }: MarkdownProps) {
   return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkBreaks]}
-      rehypePlugins={[rehypeHighlight]}
-      components={components}
-    >
+    <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} components={components}>
       {content}
     </ReactMarkdown>
   );

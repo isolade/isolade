@@ -137,6 +137,52 @@ describe("ChatManager", () => {
       const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
       expect(cm.getMessages(chat.id)).toHaveLength(0);
     });
+
+    it("pages backward through only the active branch with version metadata", () => {
+      const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
+      const u1 = cm.addMessage(chat.id, "user", "u1");
+      const a1 = cm.addMessage(chat.id, "assistant", "a1", { parentId: u1.id });
+      const u2 = cm.addMessage(chat.id, "user", "u2", { parentId: a1.id });
+      cm.addMessage(chat.id, "assistant", "a2", { parentId: u2.id });
+      const edited = cm.addMessage(chat.id, "user", "u2 edited", { parentId: a1.id });
+      const editedAnswer = cm.addMessage(chat.id, "assistant", "a2 edited", {
+        parentId: edited.id,
+      });
+      cm.setActiveLeaf(chat.id, editedAnswer.id);
+
+      const tail = cm.getTranscriptPage(chat.id, null, 2);
+      expect(tail.messages.map((message) => message.content)).toEqual(["u2 edited", "a2 edited"]);
+      expect(tail.messages[0]?.version).toEqual({
+        index: 2,
+        count: 2,
+        previousId: u2.id,
+        nextId: null,
+      });
+      expect(tail.hasMore).toBe(true);
+
+      const head = cm.getTranscriptPage(chat.id, tail.messages[0]!.id, 2);
+      expect(head.messages.map((message) => message.content)).toEqual(["u1", "a1"]);
+      expect(head.hasMore).toBe(false);
+    });
+
+    it("returns only adjacent version ids for a large sibling set", () => {
+      const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
+      const root = cm.addMessage(chat.id, "assistant", "root");
+      const siblings = Array.from({ length: 250 }, (_, index) =>
+        cm.addMessage(chat.id, "user", `version ${index + 1}`, { parentId: root.id }),
+      );
+      const active = siblings[198]!;
+      cm.setActiveLeaf(chat.id, active.id);
+
+      const page = cm.getTranscriptPage(chat.id, null, 1);
+      expect(page.messages[0]?.version).toEqual({
+        index: 199,
+        count: 250,
+        previousId: siblings[197]!.id,
+        nextId: siblings[199]!.id,
+      });
+      expect(JSON.stringify(page)).not.toContain("siblingIds");
+    });
   });
 
   describe("events", () => {
@@ -187,6 +233,57 @@ describe("ChatManager", () => {
         ["m2", 0],
         ["m2", 1],
       ]);
+    });
+
+    it("batches visible event rows and isolates the uncommitted turn", () => {
+      const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
+      const committed = cm.addMessage(chat.id, "assistant", "done");
+      cm.appendEvent(chat.id, committed.id, 0, "delta", "done");
+      cm.beginInFlightTurn(chat.id, "in-flight");
+      cm.appendEvent(chat.id, "in-flight", 0, "delta", "partial");
+
+      expect(
+        cm.getEventsForMessages(chat.id, [committed.id]).map((event) => event.messageId),
+      ).toEqual([committed.id]);
+      expect(cm.getInFlightEvents(chat.id)?.events.map((event) => event.seq)).toEqual([0]);
+      expect(cm.getInFlightEvents(chat.id)?.lastSeq).toBe(0);
+    });
+
+    it("uses the persisted pointer when multiple orphan turns share a timestamp", () => {
+      const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
+      cm.beginInFlightTurn(chat.id, "stale-turn");
+      cm.appendEvent(chat.id, "stale-turn", 0, "delta", "stale");
+      cm.beginInFlightTurn(chat.id, "current-turn");
+      cm.appendEvent(chat.id, "current-turn", 0, "delta", "current");
+
+      expect(cm.getInFlightEvents(chat.id)?.messageId).toBe("current-turn");
+      cm.clearInFlightTurn(chat.id, "stale-turn");
+      expect(cm.getInFlightEvents(chat.id)?.messageId).toBe("current-turn");
+      cm.clearInFlightTurn(chat.id, "current-turn");
+      expect(cm.getInFlightEvents(chat.id)).toBeNull();
+    });
+  });
+
+  describe("persisted render snapshots", () => {
+    it("returns compact committed state and only the latest reconnect metadata", () => {
+      const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
+      const assistant = cm.addMessage(chat.id, "assistant", "complete");
+      cm.appendEvent(chat.id, assistant.id, 0, "delta", "complete");
+      cm.appendEvent(chat.id, assistant.id, 1, "usage", { total: { totalTokens: 10 } });
+      cm.appendEvent(chat.id, assistant.id, 2, "usage", { total: { totalTokens: 20 } });
+      cm.appendEvent(chat.id, assistant.id, 3, "title", "Finished");
+      cm.saveMessageRender(chat.id, assistant.id, [{ kind: "text", text: "complete" }]);
+
+      expect(cm.getPersistedResumeSnapshot(chat.id, assistant.id, false)).toMatchObject({
+        messageId: assistant.id,
+        lastSeq: 3,
+        status: "done",
+        message: { id: assistant.id, content: "complete" },
+        metaEvents: [
+          { seq: 2, type: "usage", payload: { total: { totalTokens: 20 } } },
+          { seq: 3, type: "title", payload: "Finished" },
+        ],
+      });
     });
   });
 

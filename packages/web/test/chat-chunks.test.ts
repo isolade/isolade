@@ -1,9 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import {
   applyEvent,
-  revealableLen,
+  mergeToolDetails,
+  replaceChunksFromSnapshot,
+  revealableLength,
+  revealChunks,
   type StreamChunk,
-  truncateChunks,
 } from "../src/components/chat/chunks";
 
 // Fold a list of (type, payload) events through the reducer the way both the
@@ -36,6 +38,7 @@ describe("applyEvent", () => {
         kind: "tool",
         id: "t1",
         name: "Bash",
+        summary: "ls",
         input: { command: "ls" },
         output: "file.txt",
         isError: false,
@@ -91,33 +94,123 @@ describe("applyEvent", () => {
   });
 });
 
-describe("truncateChunks / revealableLen", () => {
-  const chunks: StreamChunk[] = [
-    { kind: "text", text: "abcde" },
-    { kind: "tool", id: "t", name: "Read", status: "done" },
-    { kind: "thinking", text: "hmm" },
-    { kind: "text", text: "xyz" },
-  ];
+describe("replaceChunksFromSnapshot", () => {
+  it("restores earlier debug chunks and replays only events newer than the snapshot", () => {
+    const chunks: StreamChunk[] = [{ kind: "text", text: "stale" }];
+    const toolIndex = new Map<string, number>();
 
-  it("counts only readable (text + thinking) characters", () => {
-    expect(revealableLen(chunks)).toBe(11);
-  });
+    replaceChunksFromSnapshot(
+      chunks,
+      toolIndex,
+      [
+        { kind: "thinking", text: "earlier reasoning" },
+        { kind: "text", text: "answer" },
+      ],
+      4,
+      [
+        { seq: 4, type: "delta", payload: "duplicate" },
+        { seq: 5, type: "delta", payload: " continued" },
+        { seq: 6, type: "tool_call_start", payload: { id: "tool-1", name: "Read" } },
+      ],
+    );
 
-  it("slices the text chunk at the budget boundary", () => {
-    expect(truncateChunks(chunks, 3)).toEqual([{ kind: "text", text: "abc" }]);
-  });
-
-  it("holds structural chunks behind the text that precedes them", () => {
-    // Budget covers the first text exactly, so the tool card after it rides
-    // along, but the thinking block (0 revealed chars) stops the projection.
-    const out = truncateChunks(chunks, 5);
-    expect(out).toEqual([
-      { kind: "text", text: "abcde" },
-      { kind: "tool", id: "t", name: "Read", status: "done" },
+    expect(chunks).toEqual([
+      { kind: "thinking", text: "earlier reasoning" },
+      { kind: "text", text: "answer continued" },
+      { kind: "tool", id: "tool-1", name: "Read", status: "running" },
     ]);
+    expect(toolIndex.get("tool-1")).toBe(2);
+  });
+});
+
+describe("live reveal projection", () => {
+  it("reveals readable chunks in order and gates later structural chunks", () => {
+    const chunks = [
+      { kind: "text", text: "hello" },
+      { kind: "tool", id: "tool-1", name: "Read", status: "running" },
+      { kind: "text", text: "world" },
+    ] satisfies StreamChunk[];
+
+    expect(revealableLength(chunks)).toBe(10);
+    expect(revealChunks(chunks, 3)).toEqual([{ kind: "text", text: "hel" }]);
+    expect(revealChunks(chunks, 7)).toEqual([chunks[0], chunks[1], { kind: "text", text: "wo" }]);
+    expect(revealChunks(chunks, 10)).toEqual(chunks);
+    expect(revealChunks(chunks, 10)).not.toBe(chunks);
   });
 
-  it("returns the full stream once the budget covers everything", () => {
-    expect(truncateChunks(chunks, revealableLen(chunks))).toEqual(chunks);
+  it("does not expose half of a surrogate pair", () => {
+    const chunks = [{ kind: "text", text: "A😀B" }] satisfies StreamChunk[];
+
+    expect(revealChunks(chunks, 2)).toEqual([{ kind: "text", text: "A" }]);
+    expect(revealChunks(chunks, 3)).toEqual([{ kind: "text", text: "A😀" }]);
+  });
+});
+
+describe("mergeToolDetails", () => {
+  it("fills only the requested tool without discarding newer streamed state", () => {
+    const untouched = {
+      kind: "tool" as const,
+      id: "tool-2",
+      name: "Bash",
+      summary: "echo untouched",
+      input: `${"z".repeat(1024)}…`,
+      status: "done" as const,
+      detailsAvailable: true,
+    };
+    const chunks: StreamChunk[] = [
+      { kind: "text", text: "before" },
+      {
+        kind: "tool",
+        id: "tool-1",
+        name: "Read",
+        input: `${"x".repeat(1024)}…`,
+        output: "newer result",
+        status: "done",
+        detailsAvailable: true,
+      },
+      { kind: "text", text: "arrived after the request" },
+      untouched,
+    ];
+
+    expect(
+      mergeToolDetails(
+        chunks,
+        [
+          {
+            kind: "tool",
+            id: "tool-1",
+            name: "Read",
+            input: { file_path: "/workspace/large.txt" },
+            output: "stale result",
+            status: "running",
+          },
+          {
+            kind: "tool",
+            id: "tool-2",
+            name: "Bash",
+            input: { command: "echo should not merge" },
+            status: "done",
+          },
+        ],
+        "tool-1",
+      ),
+    ).toEqual({ matched: true, changed: true, complete: true });
+
+    expect(chunks).toEqual([
+      { kind: "text", text: "before" },
+      {
+        kind: "tool",
+        id: "tool-1",
+        name: "Read",
+        summary: "/workspace/large.txt",
+        input: { file_path: "/workspace/large.txt" },
+        output: "newer result",
+        status: "done",
+        detailsAvailable: false,
+      },
+      { kind: "text", text: "arrived after the request" },
+      untouched,
+    ]);
+    expect(chunks[3]).toBe(untouched);
   });
 });

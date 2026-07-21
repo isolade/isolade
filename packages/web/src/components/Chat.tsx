@@ -1,12 +1,22 @@
-import { ArrowDown, ChevronLeft, ChevronRight, Paperclip, Pencil } from "lucide-react";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
+import { ArrowDown } from "lucide-react";
+import {
+  memo,
+  type PointerEvent as ReactPointerEvent,
+  type UIEvent as ReactUIEvent,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   API_BASE,
   getChatContextBreakdown,
-  listChatEvents,
-  listChatMessages,
+  getChatToolDetails,
+  getInFlightChatRender,
+  listChatRenderChunks,
+  listChatTranscript,
   setChatActiveLeaf,
   updateChatModel,
 } from "../lib/api";
@@ -16,19 +26,19 @@ import {
   resumeChatTurn,
   runChatTurn,
 } from "../lib/chat-stream";
-import { deriveThread, tipForSibling } from "../lib/chat-tree";
 import type {
   ChatEffort,
-  ChatEvent,
-  ChatMessage,
   ChatModelDefinition,
   Chat as ChatRow,
   ContextBreakdown,
   ModelOverrides,
+  TranscriptMessage,
   UpdateChatBody,
   Upload,
 } from "../lib/contracts";
 import { findChatModel } from "../lib/contracts";
+import { scheduleIdleWork } from "../lib/idle-work-queue";
+import { RequestGeneration } from "../lib/request-generation";
 import {
   resolveFontFamily,
   useAgentFontSetting,
@@ -37,27 +47,30 @@ import {
 } from "../lib/settings";
 import { useAttachments } from "../lib/use-attachments";
 import { AttachmentStrip } from "./chat/AttachmentStrip";
-import { StreamView } from "./chat/blocks";
 import {
   applyEvent,
-  chunksFromEvents,
-  latestUsageFromEvents,
-  REVEAL_ANIMATION,
-  REVEAL_CATCHUP_SEC,
-  REVEAL_CPS,
-  REVEAL_LAG_CHARS,
-  REVEAL_MAX_CPS,
-  revealableLen,
+  mergeToolDetails,
+  REVEAL_CATCHUP_SECONDS,
+  REVEAL_CHARACTERS_PER_SECOND,
+  REVEAL_LAG_CHARACTERS,
+  REVEAL_MAX_CHARACTERS_PER_SECOND,
+  replaceChunksFromSnapshot,
+  revealableLength,
+  revealChunks,
   type StreamChunk,
   type SubscriptionShare,
   type TokenUsage,
-  truncateChunks,
   type UsageState,
   usageSeedFromChat,
 } from "./chat/chunks";
-import { MessageUploads } from "./chat/MessageUploads";
+import {
+  type LiveAssistantRow,
+  MessageHistory,
+  type MessageHistoryHandle,
+  type MessageHistoryPage,
+  type SessionMessageRow,
+} from "./chat/MessageHistory";
 import { ContextBar, ContextBreakdownDetail, ContextDetail } from "./chat/UsagePanel";
-import Markdown from "./Markdown";
 import { MessageBox } from "./MessageBox";
 import { ModelEffortPicker } from "./ModelEffortPicker";
 
@@ -65,7 +78,28 @@ import { ModelEffortPicker } from "./ModelEffortPicker";
 // to the live tail. Pinned: streaming keeps auto-scrolling. Beyond it the
 // user is reading history, so streaming must not yank the viewport and the
 // jump-to-bottom button shows instead.
-const SCROLL_PIN_THRESHOLD_PX = 100;
+const SCROLL_PIN_THRESHOLD_PX = 2;
+
+function pageKey(messages: TranscriptMessage[], fallback: string): string {
+  return `${messages[0]?.id ?? fallback}:${messages.at(-1)?.id ?? fallback}`;
+}
+
+function chunksFromPage(page: unknown): Record<string, StreamChunk[]> {
+  const chunks = (page as { chunksByMessage?: unknown }).chunksByMessage;
+  return chunks && typeof chunks === "object" ? (chunks as Record<string, StreamChunk[]>) : {};
+}
+
+function optimisticUserMessage(chatId: string, content: string): TranscriptMessage {
+  return {
+    id: `optimistic-${chatId}`,
+    chatId,
+    role: "user",
+    content,
+    parentId: null,
+    createdAt: new Date(),
+    version: null,
+  };
+}
 
 interface ChatProps {
   instanceId: string;
@@ -98,304 +132,7 @@ interface ChatProps {
   onTitle?: (title: string) => void;
 }
 
-// In-place editor for a user message. Draft state lives here (not in Chat)
-// so keystrokes don't re-render the whole message list. Enter submits,
-// Escape cancels, and the textarea auto-grows like the main composer.
-function UserMessageEditor({
-  initial,
-  initialUploads,
-  instanceId,
-  fontFamily,
-  onCancel,
-  onSubmit,
-}: {
-  initial: string;
-  initialUploads: Upload[];
-  instanceId: string;
-  fontFamily: string;
-  onCancel: () => void;
-  onSubmit: (content: string, uploads: Upload[]) => void;
-}) {
-  const [draft, setDraft] = useState(initial);
-  const [submitting, setSubmitting] = useState(false);
-  const attachments = useAttachments(instanceId, initialUploads);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  useEffect(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.focus();
-    el.setSelectionRange(el.value.length, el.value.length);
-  }, []);
-  useEffect(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    const maxHeight = Math.min(window.innerHeight * 0.5, 480);
-    el.style.height = "0px";
-    el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`;
-  }, [draft]);
-
-  const canSubmit =
-    draft.trim().length > 0 || attachments.items.some((item) => item.status !== "error");
-  const submit = async () => {
-    if (!canSubmit || submitting) return;
-    setSubmitting(true);
-    const uploads = await attachments.resolveUploads();
-    if (!draft.trim() && uploads.length === 0) {
-      setSubmitting(false);
-      return;
-    }
-    onSubmit(draft, uploads);
-  };
-  return (
-    <div className="w-full rounded-2xl border border-input bg-secondary px-4 py-2.5">
-      <textarea
-        ref={textareaRef}
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Escape") {
-            e.preventDefault();
-            onCancel();
-          } else if (e.key === "Enter" && !e.shiftKey) {
-            e.preventDefault();
-            void submit();
-          }
-        }}
-        onPaste={(e) => {
-          const files = Array.from(e.clipboardData.items)
-            .filter((item) => item.kind === "file")
-            .map((item) => item.getAsFile())
-            .filter((file): file is File => file !== null);
-          if (files.length === 0) return;
-          e.preventDefault();
-          attachments.add(files);
-        }}
-        rows={1}
-        className="w-full resize-none bg-transparent text-sm leading-relaxed text-secondary-foreground outline-none"
-        style={{ fontFamily }}
-      />
-      {attachments.items.length > 0 && (
-        <div className="mt-2">
-          <AttachmentStrip items={attachments.items} onRemove={attachments.remove} />
-        </div>
-      )}
-      <div className="mt-2 flex items-center justify-between gap-2">
-        <div>
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            className="hidden"
-            onChange={(e) => {
-              attachments.add(Array.from(e.target.files ?? []));
-              e.target.value = "";
-            }}
-          />
-          <Button
-            type="button"
-            size="icon-sm"
-            variant="ghost"
-            aria-label="Add attachment"
-            onClick={() => fileInputRef.current?.click()}
-          >
-            <Paperclip className="size-4" />
-          </Button>
-        </div>
-        <div className="flex gap-2">
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            className="h-7 rounded-full"
-            onClick={onCancel}
-          >
-            Cancel
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            className="h-7 rounded-full"
-            disabled={!canSubmit || submitting}
-            onClick={() => void submit()}
-          >
-            Send
-          </Button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// `‹ n/m ›` version navigation shown under a message that has sibling
-// versions (i.e. it was edited at least once).
-function VersionPager({
-  index,
-  count,
-  disabled,
-  onNavigate,
-}: {
-  index: number;
-  count: number;
-  disabled: boolean;
-  onNavigate: (dir: 1 | -1) => void;
-}) {
-  return (
-    <div className="flex items-center gap-0.5 text-xs text-muted-foreground">
-      <button
-        type="button"
-        aria-label="Previous version"
-        disabled={disabled || index <= 1}
-        onClick={() => onNavigate(-1)}
-        className="flex h-6 w-6 items-center justify-center rounded transition-colors hover:text-foreground disabled:opacity-40 disabled:hover:text-muted-foreground"
-      >
-        <ChevronLeft className="h-4.5 w-4.5" />
-      </button>
-      <span className="tabular-nums">
-        {index}/{count}
-      </span>
-      <button
-        type="button"
-        aria-label="Next version"
-        disabled={disabled || index >= count}
-        onClick={() => onNavigate(1)}
-        className="flex h-6 w-6 items-center justify-center rounded transition-colors hover:text-foreground disabled:opacity-40 disabled:hover:text-muted-foreground"
-      >
-        <ChevronRight className="h-4.5 w-4.5" />
-      </button>
-    </div>
-  );
-}
-
-// One committed message in the history list. Memoized so a re-render of Chat
-// while a turn is streaming (streamingChunks changes every frame) doesn't
-// reconcile every prior message's bubble/StreamView. Its props are stable per
-// message across those frames — `chunks` is a fixed array reference once
-// committed, the font families only change on a settings edit, and the
-// edit/version props only change on a send or an explicit edit action — so
-// the memo holds for the whole history and only the live streaming bubble
-// below updates per frame.
-const MessageRow = memo(function MessageRow({
-  msg,
-  instanceId,
-  chunks,
-  showDebug,
-  userFontFamily,
-  agentFontFamily,
-  versionIndex,
-  versionCount,
-  isEditing,
-  actionsDisabled,
-  onStartEdit,
-  onCancelEdit,
-  onSubmitEdit,
-  onNavigateVersion,
-}: {
-  msg: ChatMessage;
-  instanceId: string;
-  chunks: StreamChunk[] | undefined;
-  showDebug: boolean;
-  userFontFamily: string;
-  agentFontFamily: string;
-  // Version info when this message has siblings (it was edited), else 0.
-  versionIndex: number;
-  versionCount: number;
-  isEditing: boolean;
-  // True while a turn is streaming: hides the edit affordance and freezes
-  // version navigation (the server refuses both anyway).
-  actionsDisabled: boolean;
-  onStartEdit: (id: string) => void;
-  onCancelEdit: () => void;
-  onSubmitEdit: (id: string, content: string, uploads: Upload[]) => void;
-  onNavigateVersion: (id: string, dir: 1 | -1) => void;
-}) {
-  const hasVersions = versionCount > 1;
-  return (
-    <div
-      data-message-id={msg.id}
-      className={cn("chat-message flex", msg.role === "user" ? "justify-end" : "justify-start")}
-    >
-      {msg.role === "user" ? (
-        <div
-          className={cn(
-            "group flex flex-col items-end gap-1",
-            isEditing ? "w-full" : "max-w-[80%]",
-          )}
-        >
-          {isEditing ? (
-            <UserMessageEditor
-              initial={msg.content}
-              initialUploads={msg.uploads ?? []}
-              instanceId={instanceId}
-              fontFamily={userFontFamily}
-              onCancel={onCancelEdit}
-              onSubmit={(content, uploads) => onSubmitEdit(msg.id, content, uploads)}
-            />
-          ) : (
-            <>
-              {msg.content && (
-                <div
-                  className="rounded-2xl px-4 py-2.5 text-sm break-words bg-secondary text-secondary-foreground whitespace-pre-wrap"
-                  style={{ fontFamily: userFontFamily }}
-                >
-                  {msg.content}
-                </div>
-              )}
-              {msg.uploads && msg.uploads.length > 0 && (
-                <MessageUploads instanceId={instanceId} uploads={msg.uploads} />
-              )}
-              {/* Action row under the bubble: hover-revealed edit pencil,
-                  then the version pager (always visible when the message has
-                  versions). Rendered only when it has something to offer, so
-                  ordinary messages don't reserve dead space mid-stream. */}
-              {(hasVersions || !actionsDisabled) && (
-                <div className="flex h-6 items-center">
-                  {!actionsDisabled && (
-                    <button
-                      type="button"
-                      aria-label="Edit message"
-                      onClick={() => onStartEdit(msg.id)}
-                      className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
-                    >
-                      <Pencil className="h-3.5 w-3.5" />
-                    </button>
-                  )}
-                  {hasVersions && (
-                    <VersionPager
-                      index={versionIndex}
-                      count={versionCount}
-                      disabled={actionsDisabled}
-                      onNavigate={(dir) => onNavigateVersion(msg.id, dir)}
-                    />
-                  )}
-                </div>
-              )}
-            </>
-          )}
-        </div>
-      ) : (
-        <div
-          className="w-full pr-12 text-[15px] leading-relaxed text-foreground break-words"
-          style={{ fontFamily: agentFontFamily }}
-        >
-          {chunks ? (
-            <StreamView chunks={chunks} showDebug={showDebug} />
-          ) : (
-            <Markdown content={msg.content} />
-          )}
-          {hasVersions && (
-            <VersionPager
-              index={versionIndex}
-              count={versionCount}
-              disabled={actionsDisabled}
-              onNavigate={(dir) => onNavigateVersion(msg.id, dir)}
-            />
-          )}
-        </div>
-      )}
-    </div>
-  );
-});
+type RenderEventFrame = Extract<ChatTurnEvent, { kind: "event" }>;
 
 // Memoized so activating a chat tab (which re-renders the parent InstanceView)
 // only re-renders the two tabs whose `visible` flips, not every mounted chat
@@ -422,19 +159,23 @@ function Chat({
   // this chat (either real or synthetic-pending). Render the user's bubble +
   // streaming dots from the very first commit so the synthetic→real swap is
   // visually identical and seamless.
-  const [messages, setMessages] = useState<ChatMessage[]>(() =>
+  const [historyPages, setHistoryPages] = useState<MessageHistoryPage[]>([]);
+  const [sessionRows, setSessionRows] = useState<SessionMessageRow[]>(() =>
     initialMessage
       ? [
           {
-            id: `optimistic-${chatId}`,
-            chatId,
-            role: "user",
-            content: initialMessage,
-            parentId: null,
-            createdAt: new Date(),
+            renderKey: `optimistic-${chatId}`,
+            message: optimisticUserMessage(chatId, initialMessage),
           },
         ]
       : [],
+  );
+  const messages = useMemo(
+    () => [
+      ...historyPages.flatMap((page) => page.messages),
+      ...sessionRows.map((row) => row.message),
+    ],
+    [historyPages, sessionRows],
   );
   const [input, setInput] = useState("");
   // Staged file attachments for the next send (browser upload / clipboard
@@ -448,22 +189,38 @@ function Chat({
   // advanced locally as turns run, and re-pointed by version navigation.
   // Mirrored into a ref so long-lived closures (drainTurn) read the current
   // value without re-subscribing.
-  const [activeLeafId, setActiveLeafId] = useState<string | null>(chat.activeLeafId ?? null);
   const activeLeafRef = useRef<string | null>(chat.activeLeafId ?? null);
   const setActiveLeaf = useCallback((id: string | null) => {
     activeLeafRef.current = id;
-    setActiveLeafId(id);
   }, []);
   // The user message currently being edited in place, if any.
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [navigatingBranch, setNavigatingBranch] = useState(false);
+  const navigatingBranchRef = useRef(false);
   // The optimistic user bubble of the in-flight turn, replaced by the
   // server's `user_message` frame (which carries the real id + parent).
   const pendingUserIdRef = useRef<string | null>(null);
-  const [streamingChunks, setStreamingChunks] = useState<StreamChunk[]>([]);
-  // Per-message debug+text chunks captured during streaming. Kept in component
-  // state (not persisted server-side) so the user can review tool calls etc.
-  // until the chat tab unmounts.
-  const [messageChunks, setMessageChunks] = useState<Record<string, StreamChunk[]>>({});
+  const initialLiveRenderKeyRef = useRef(initialMessage ? `live-${crypto.randomUUID()}` : null);
+  const liveRenderKeyRef = useRef<string | null>(initialLiveRenderKeyRef.current);
+  const [liveRow, setLiveRow] = useState<{
+    renderKey: string;
+    messageId: string | null;
+    parentId: string | null;
+    chunks: StreamChunk[];
+  } | null>(() =>
+    initialLiveRenderKeyRef.current
+      ? { renderKey: initialLiveRenderKeyRef.current, messageId: null, parentId: null, chunks: [] }
+      : null,
+  );
+  const [hasOlder, setHasOlder] = useState(false);
+  const showDebug = useDebugSetting();
+  const loadingOlderRef = useRef(false);
+  const loadedChunkKeysRef = useRef(new Set<string>());
+  const [chunkRequests] = useState(() => new RequestGeneration());
+  const [toolDetailRequestGeneration] = useState(() => new RequestGeneration());
+  const chunkModeRef = useRef(showDebug);
+  const [transcriptRequests] = useState(() => new RequestGeneration());
+  const hydratedRef = useRef(false);
   const [currentModel, setCurrentModel] = useState(model);
   const [currentEffort, setCurrentEffort] = useState<ChatEffort>(effort);
   // Server-synced (model, effort) pair. The picker stays interactive while a
@@ -476,7 +233,14 @@ function Chat({
   // SSE fetch. Stop also sends an explicit cancellation request. A plain
   // disconnect leaves the server turn running during its reconnect grace.
   const abortRef = useRef<AbortController | null>(null);
-  const showDebug = useDebugSetting();
+  const detachedControllersRef = useRef(new WeakSet<AbortController>());
+  const detachedTurnRef = useRef<{
+    messageId: string;
+    lastSeq: number;
+    renderKey: string;
+  } | null>(null);
+  const streamingMessageIdRef = useRef<string | null>(null);
+  const liveLastSeqRef = useRef(-1);
   const agentFontFamily = resolveFontFamily(useAgentFontSetting());
   const userFontFamily = resolveFontFamily(useUserFontSetting());
   // Latest token-usage snapshot from the server. Seeded synchronously from
@@ -493,17 +257,15 @@ function Chat({
   const [breakdownError, setBreakdownError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const messageHistoryRef = useRef<MessageHistoryHandle>(null);
   // Latest chat prop, for effects/closures that shouldn't re-run when the
   // parent refreshes the row (only the values are read, lazily).
   const chatRef = useRef(chat);
   chatRef.current = chat;
-  // The visible thread: one root-to-tip path through the message tree, plus
-  // version info for messages that have been edited. `messages` holds every
-  // branch, and this projects the active one.
-  const thread = useMemo(() => deriveThread(messages, activeLeafId), [messages, activeLeafId]);
-  // Render-derived tip of the visible branch, for long-lived closures.
+  // The transcript API already returns the active root-to-tip path. Its last
+  // loaded row is therefore the branch tip and remains O(1) to read.
   const tipIdRef = useRef<string | null>(null);
-  tipIdRef.current = thread.tipId;
+  tipIdRef.current = messages.at(-1)?.id ?? null;
   // The user message the in-flight turn replies to: the optimistic id at
   // send time, then the server id once the user_message frame lands. Null on
   // resumed turns (whose user message is already the branch tip). Where the
@@ -512,12 +274,166 @@ function Chat({
   // Mirror of `streaming` for stable callbacks (edit/navigation guards).
   const streamingRef = useRef(streaming);
   streamingRef.current = streaming;
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
+  const showDebugRef = useRef(showDebug);
+  showDebugRef.current = showDebug;
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  const historyPagesRef = useRef(historyPages);
+  historyPagesRef.current = historyPages;
+  const sessionRowsRef = useRef(sessionRows);
+  sessionRowsRef.current = sessionRows;
+  const liveChunksRef = useRef<StreamChunk[]>([]);
+  const liveRowRef = useRef(liveRow);
+  liveRowRef.current = liveRow;
+  const liveToolIndexRef = useRef(new Map<string, number>());
+  const toolDetailsCacheRef = useRef(new Map<string, StreamChunk[]>());
+  const toolDetailRequestsRef = useRef(new Set<string>());
+  const debugReplayRef = useRef<{
+    messageId: string;
+    events: RenderEventFrame[];
+  } | null>(null);
+  const hiddenLiveRenderDirtyRef = useRef(false);
+  // A hidden stream mutates its reducer without publishing React updates.
+  // Include that accumulated snapshot in the reveal render itself so the
+  // layout effect below can position the final-height row before first paint.
+  const hotSwitchLiveChunks = useMemo(
+    () =>
+      visible && liveRow && hiddenLiveRenderDirtyRef.current ? [...liveChunksRef.current] : null,
+    [liveRow, visible],
+  );
   // Whether the viewport is within SCROLL_PIN_THRESHOLD_PX of the bottom.
   // Written by the container's onScroll, read inside scrollToBottom's rAF
   // callback, a ref (not state) so streaming scrolls never depend on a
   // re-render to see the latest value.
   const isPinnedRef = useRef(true);
+  // Visibility changes can produce native scroll events while the retained
+  // pane reflows. Preserve the user's logical state at hide time so a stale
+  // event cannot turn a reader into a pinned viewport during reveal.
+  const retainedPinnedRef = useRef(true);
+  const previousVisibleRef = useRef(visible);
+  const pinNextCommitRef = useRef(false);
   const [showJump, setShowJump] = useState(false);
+
+  const positionAtBottom = useCallback(() => {
+    const scrollElement = scrollContainerRef.current;
+    if (!scrollElement) return;
+    scrollElement.scrollTop = scrollElement.scrollHeight;
+    isPinnedRef.current = true;
+    setShowJump(false);
+  }, []);
+
+  const pinNextCommitToBottom = useCallback(() => {
+    pinNextCommitRef.current = true;
+    isPinnedRef.current = true;
+  }, []);
+
+  // State setters below can publish an entire transcript or a newly appended
+  // row. Consume their one-shot placement request in the same commit so those
+  // rows can never paint at scrollTop=0 before an rAF repair. The branch is a
+  // ref check only, so ordinary streaming commits pay no layout cost here.
+  useLayoutEffect(() => {
+    if (!pinNextCommitRef.current) return;
+    pinNextCommitRef.current = false;
+    positionAtBottom();
+  });
+
+  const invalidateTranscriptRequests = useCallback(() => {
+    loadingOlderRef.current = false;
+    return transcriptRequests.invalidate();
+  }, [transcriptRequests]);
+
+  const resetChunkCache = useCallback(() => {
+    chunkRequests.invalidate();
+    loadedChunkKeysRef.current.clear();
+    setHistoryPages((pages) =>
+      pages.map((page) =>
+        Object.keys(page.chunksByMessage).length === 0 ? page : { ...page, chunksByMessage: {} },
+      ),
+    );
+  }, [chunkRequests]);
+
+  // Debug and normal responses have different contents. Preserve the bounded
+  // transcript that is already on screen while the explicit debug request
+  // replaces it. Switching debug off only removes debug-only chunks. It does
+  // not trigger a full-render fetch for every historical assistant message.
+  useLayoutEffect(() => {
+    if (chunkModeRef.current === showDebug) return;
+    chunkModeRef.current = showDebug;
+    chunkRequests.invalidate();
+    loadedChunkKeysRef.current.clear();
+    if (!showDebug) {
+      const visibleOnly = (chunks: StreamChunk[]) =>
+        chunks.filter((chunk) => chunk.kind !== "thinking" && chunk.kind !== "raw");
+      setHistoryPages((pages) =>
+        pages.map((page) => ({
+          ...page,
+          chunksByMessage: Object.fromEntries(
+            Object.entries(page.chunksByMessage).map(([id, chunks]) => [id, visibleOnly(chunks)]),
+          ),
+        })),
+      );
+      setSessionRows((rows) =>
+        rows.map((row) => (row.chunks ? { ...row, chunks: visibleOnly(row.chunks) } : row)),
+      );
+      const visibleChunks = visibleOnly(liveChunksRef.current);
+      liveChunksRef.current.splice(0, liveChunksRef.current.length, ...visibleChunks);
+      liveToolIndexRef.current.clear();
+      for (const [index, chunk] of liveChunksRef.current.entries()) {
+        if (chunk.kind === "tool") liveToolIndexRef.current.set(chunk.id, index);
+      }
+      if (streamingRef.current) {
+        setLiveRow((row) => (row ? { ...row, chunks: [...liveChunksRef.current] } : row));
+      }
+    }
+  }, [chunkRequests, showDebug]);
+
+  // Normal streaming deliberately drops provider-debug payloads. If the user
+  // enables debug mid-turn, fetch one compact full snapshot and replay any
+  // render events that arrived during that request. Mutating the active
+  // reducer in place keeps the existing SSE connection and tool indexes valid.
+  useEffect(() => {
+    if (!showDebug || !streamingRef.current) return;
+    const messageId = streamingMessageIdRef.current;
+    if (!messageId) return;
+    const capture = { messageId, events: [] as RenderEventFrame[] };
+    debugReplayRef.current = capture;
+    const controller = new AbortController();
+    void getInFlightChatRender(instanceId, chatId, true, controller.signal)
+      .then((snapshot) => {
+        if (
+          controller.signal.aborted ||
+          debugReplayRef.current !== capture ||
+          streamingMessageIdRef.current !== messageId ||
+          snapshot?.messageId !== messageId
+        ) {
+          return;
+        }
+        replaceChunksFromSnapshot(
+          liveChunksRef.current,
+          liveToolIndexRef.current,
+          snapshot.chunks,
+          snapshot.lastSeq,
+          capture.events,
+        );
+        if (visibleRef.current) {
+          setLiveRow((row) => (row ? { ...row, chunks: [...liveChunksRef.current] } : row));
+        } else hiddenLiveRenderDirtyRef.current = true;
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          console.warn(`[chat] live debug replay failed (chat=${chatId}):`, error);
+        }
+      })
+      .finally(() => {
+        if (debugReplayRef.current === capture) debugReplayRef.current = null;
+      });
+    return () => {
+      controller.abort();
+      if (debugReplayRef.current === capture) debugReplayRef.current = null;
+    };
+  }, [chatId, instanceId, showDebug]);
 
   const refreshBreakdown = useCallback(() => {
     setBreakdownLoading(true);
@@ -546,75 +462,117 @@ function Chat({
   // is already stale by the time it finishes while content streams in.
   const scrollRafRef = useRef<number | null>(null);
   const scrollForceRef = useRef(false);
-  // Separate rAF handle for the "settle to bottom" loop used on chat
-  // switch / hydration (see scrollToBottomSettled). Kept apart from
-  // scrollRafRef so a live streaming scroll and a settle pass don't cancel
-  // each other.
-  const settleScrollRafRef = useRef<number | null>(null);
-  // rAF handle for the typewriter reveal loop (see drainTurn). Component-level
-  // so unmount can cancel a drain that's still typing out the tail. Only one
-  // turn streams at a time, and commit()/abort always cancel it, so a single
-  // shared handle is enough.
+  const scrollFollowRef = useRef(false);
+  const scrollFollowStartTopRef = useRef(0);
+  const userScrollIntentUntilRef = useRef(0);
+  const liveRenderRafRef = useRef<number | null>(null);
   const revealRafRef = useRef<number | null>(null);
   const scrollToBottom = useCallback((force = false) => {
+    if (!visibleRef.current) {
+      if (force) isPinnedRef.current = true;
+      return;
+    }
     if (force) scrollForceRef.current = true;
+    else {
+      if (!isPinnedRef.current) return;
+      if (!scrollFollowRef.current) {
+        scrollFollowStartTopRef.current = scrollContainerRef.current?.scrollTop ?? 0;
+      }
+      scrollFollowRef.current = true;
+    }
     if (scrollRafRef.current !== null) return;
     scrollRafRef.current = requestAnimationFrame(() => {
       scrollRafRef.current = null;
       const forced = scrollForceRef.current;
+      const follow = scrollFollowRef.current;
       scrollForceRef.current = false;
-      if (!forced && !isPinnedRef.current) return;
+      scrollFollowRef.current = false;
+      if (!forced && !follow) return;
       isPinnedRef.current = true;
       setShowJump(false);
       bottomRef.current?.scrollIntoView();
     });
   }, []);
 
-  // Land reliably at the very bottom when a chat becomes visible (tab switch
-  // or first hydration). A single scrollIntoView isn't enough here: the
-  // history rows carry `content-visibility: auto` (see index.css), so rows
-  // that are off-screen at scroll time report only their placeholder
-  // intrinsic height. As the bottom rows realize their real, taller height
-  // the true bottom moves down and one jump lands short. So we re-pin to the
-  // bottom across successive frames until the scroll height stops growing (or
-  // a bounded frame budget is spent, so a still-streaming turn can't loop it
-  // forever). Non-forced calls respect the pin so switching to a chat the
-  // user had scrolled up in keeps their position.
-  const scrollToBottomSettled = useCallback((force = false) => {
-    if (!force && !isPinnedRef.current) return;
-    if (settleScrollRafRef.current !== null) cancelAnimationFrame(settleScrollRafRef.current);
-    isPinnedRef.current = true;
-    setShowJump(false);
-    let lastHeight = -1;
-    let stableFrames = 0;
-    let frames = 0;
-    const step = () => {
-      settleScrollRafRef.current = null;
-      const el = scrollContainerRef.current;
-      if (!el) return;
-      bottomRef.current?.scrollIntoView();
-      frames += 1;
-      if (el.scrollHeight === lastHeight) {
-        stableFrames += 1;
-      } else {
-        stableFrames = 0;
-        lastHeight = el.scrollHeight;
-      }
-      // Stop once the height has held steady for a few frames (content
-      // realized) or the budget (~0.5s at 60fps) is exhausted.
-      if (stableFrames >= 3 || frames >= 30) return;
-      settleScrollRafRef.current = requestAnimationFrame(step);
-    };
-    settleScrollRafRef.current = requestAnimationFrame(step);
-  }, []);
-
-  const handleScroll = useCallback(() => {
+  const handleScroll = useCallback((event: ReactUIEvent<HTMLDivElement>) => {
+    // Hidden layout and warm-up writes are not user intent. In particular, a
+    // delayed scroll event from a stale offset must not turn a pinned pane
+    // into an unpinned pane immediately before it is revealed.
+    if (!visibleRef.current) return;
     const el = scrollContainerRef.current;
     if (!el) return;
     const pinned = el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_PIN_THRESHOLD_PX;
+    const hasRecentUserIntent = performance.now() <= userScrollIntentUntilRef.current;
+    const movedUpDuringFollow =
+      scrollFollowRef.current && el.scrollTop < scrollFollowStartTopRef.current - 1;
+    // Content growth can emit a native scroll before the queued bottom
+    // correction, so an arbitrary unpinned scroll must not cancel follow.
+    // Reader input and explicit upward movement do cancel it, including
+    // keyboard, scrollbar, touch, and imperative scrolling.
+    if (
+      !scrollForceRef.current &&
+      (!event.nativeEvent.isTrusted || hasRecentUserIntent || movedUpDuringFollow)
+    ) {
+      scrollFollowRef.current = false;
+      if (scrollRafRef.current !== null) {
+        cancelAnimationFrame(scrollRafRef.current);
+        scrollRafRef.current = null;
+      }
+    }
+    if (hasRecentUserIntent) userScrollIntentUntilRef.current = 0;
     isPinnedRef.current = pinned;
     setShowJump(!pinned);
   }, []);
+  const handleUserScrollIntent = useCallback(() => {
+    if (scrollForceRef.current) return;
+    userScrollIntentUntilRef.current = performance.now() + 1_000;
+    scrollFollowRef.current = false;
+    if (scrollRafRef.current !== null) {
+      cancelAnimationFrame(scrollRafRef.current);
+      scrollRafRef.current = null;
+    }
+  }, []);
+  const handleScrollKeyIntent = useCallback(
+    (event: KeyboardEvent) => {
+      if (!visibleRef.current) return;
+      const target = event.target instanceof Element ? event.target : null;
+      if (
+        event.defaultPrevented ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.altKey ||
+        target?.closest("input, textarea, select, button, a, [contenteditable='true']")
+      ) {
+        return;
+      }
+      if (
+        event.key === "ArrowUp" ||
+        event.key === "ArrowDown" ||
+        event.key === "PageUp" ||
+        event.key === "PageDown" ||
+        event.key === "Home" ||
+        event.key === "End" ||
+        event.key === " "
+      ) {
+        handleUserScrollIntent();
+      }
+    },
+    [handleUserScrollIntent],
+  );
+  useEffect(() => {
+    document.addEventListener("keydown", handleScrollKeyIntent);
+    return () => document.removeEventListener("keydown", handleScrollKeyIntent);
+  }, [handleScrollKeyIntent]);
+  const handlePointerScrollIntent = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (event.pointerType !== "mouse") return;
+      const element = event.currentTarget;
+      const bounds = element.getBoundingClientRect();
+      const scrollbarWidth = Math.max(12, element.offsetWidth - element.clientWidth);
+      if (event.clientX >= bounds.right - scrollbarWidth - 2) handleUserScrollIntent();
+    },
+    [handleUserScrollIntent],
+  );
   // Cleanup on unmount to avoid the rare case where the rAF callback
   // fires after the component is gone and the ref is stale-null.
   const mountedRef = useRef(true);
@@ -626,14 +584,20 @@ function Chat({
         cancelAnimationFrame(scrollRafRef.current);
         scrollRafRef.current = null;
       }
-      if (settleScrollRafRef.current !== null) {
-        cancelAnimationFrame(settleScrollRafRef.current);
-        settleScrollRafRef.current = null;
+      scrollForceRef.current = false;
+      scrollFollowRef.current = false;
+      userScrollIntentUntilRef.current = 0;
+      if (liveRenderRafRef.current !== null) {
+        cancelAnimationFrame(liveRenderRafRef.current);
+        liveRenderRafRef.current = null;
       }
       if (revealRafRef.current !== null) {
         cancelAnimationFrame(revealRafRef.current);
         revealRafRef.current = null;
       }
+      chunkRequests.invalidate();
+      toolDetailRequestGeneration.invalidate();
+      transcriptRequests.invalidate();
       // Release the in-flight stream's HTTP connection on unmount.
       // Switching chats/instances unmounts this component, and a stream that
       // is never aborted keeps its fetch (an open connection to the local
@@ -660,7 +624,7 @@ function Chat({
         });
       }
     };
-  }, []);
+  }, [chunkRequests, toolDetailRequestGeneration, transcriptRequests]);
 
   // The composer floats over the scroll container so the scrollbar runs the
   // full height of the pane instead of stopping above the message box. Its
@@ -686,121 +650,42 @@ function Chat({
     return () => ro.disconnect();
   }, [scrollToBottom]);
 
-  // Clear stale usage AND message chunks when the user actually
-  // switches to a different chat. Without clearing chunks, switching
-  // away and back leaves the previous chat's tool calls / debug
-  // chunks rendered against the new chat's messages until the next
-  // streaming turn replaces them. We deliberately avoid keying this
-  // on `pending` or `initialMessage` because both flip during the
-  // fresh-chat boot sequence (synthetic → real id transition,
-  // pending=true→false), and clearing usage there races with the SSE
-  // stream's first few usage events and reliably wipes them in Firefox.
-  const lastChatIdRef = useRef(chatId);
+  // One bounded view response carries the tail, structural chunks, and any
+  // in-flight snapshot. The active chat hydrates immediately. Hidden chats
+  // warm during idle time and keep the resulting DOM for instant switching.
   useEffect(() => {
-    if (lastChatIdRef.current !== chatId) {
-      lastChatIdRef.current = chatId;
-      setUsage(null);
-      setBreakdown(null);
-      setBreakdownError(null);
-      setMessageChunks({});
-      setStreamingChunks([]);
-      setActiveLeaf(chatRef.current.activeLeafId ?? null);
-      setEditingId(null);
-      pendingUserIdRef.current = null;
-      isPinnedRef.current = true;
-      setShowJump(false);
-    }
-  }, [chatId, setActiveLeaf]);
-
-  // Skip the fetch while pending (chat doesn't exist on the server
-  // yet, since its ids are synthetic stand-ins) or when mounted with a
-  // bootstrap initialMessage (server has no history yet, and fetching
-  // would clobber the optimistic user bubble). The AbortController
-  // keys to chatId so switching chats mid-fetch never lets a stale
-  // response clobber the new chat's state. StrictMode's double-mount
-  // is also covered: the first effect's cleanup aborts before the
-  // second effect's fetch resolves.
-  useEffect(() => {
-    if (pending || initialMessage) return;
-    const ac = new AbortController();
-    void (async () => {
+    if (pending || initialMessage || hydratedRef.current) return;
+    const generation = invalidateTranscriptRequests();
+    const ac = transcriptRequests.createController();
+    let cancelScheduled: (() => void) | null = null;
+    const hydrate = async () => {
       try {
-        const [msgs, events] = await Promise.all([
-          listChatMessages(instanceId, chatId, ac.signal),
-          // Events are best-effort: an empty list still renders the
-          // chat correctly using just chat_messages. But a real
-          // failure (DB locked, server bug) is worth surfacing so we
-          // don't silently lose the in-flight turn detection below.
-          listChatEvents(instanceId, chatId, ac.signal).catch((err: unknown) => {
-            if (err instanceof DOMException && err.name === "AbortError") {
-              return [] as ChatEvent[];
-            }
-            console.warn(`[chat] listChatEvents failed (chat=${chatId}):`, err);
-            return [] as ChatEvent[];
-          }),
+        // Cold transcript pages are always the bounded normal projection.
+        // Debug mode deliberately fills full structural data afterward in
+        // focused batches, so one raw provider payload cannot block first
+        // paint or inflate every hidden chat's warm state.
+        const page = await listChatTranscript(instanceId, chatId, { signal: ac.signal });
+        if (!transcriptRequests.accepts(generation, ac)) return;
+        hydratedRef.current = true;
+        pinNextCommitToBottom();
+        setHistoryPages([
+          {
+            key: pageKey(page.messages, "tail"),
+            messages: page.messages,
+            chunksByMessage: chunksFromPage(page),
+          },
         ]);
-        if (ac.signal.aborted) return;
-        setMessages(msgs);
-        // Adopt the server's branch choice when the local leaf isn't among
-        // the fetched messages (first hydration, or a leaf minted by another
-        // window). An unknown/absent leaf falls back to the newest message
-        // inside deriveThread, which is the legacy linear behavior.
-        const localLeaf = activeLeafRef.current;
-        if (!localLeaf || !msgs.some((m) => m.id === localLeaf)) {
-          const serverLeaf = chatRef.current.activeLeafId;
-          setActiveLeaf(serverLeaf && msgs.some((m) => m.id === serverLeaf) ? serverLeaf : null);
-        }
-        if (events.length > 0) {
-          const grouped: Record<string, ChatEvent[]> = {};
-          for (const ev of events) {
-            (grouped[ev.messageId] ??= []).push(ev);
-          }
-          // Sort each group by seq before reducing so out-of-order
-          // arrivals don't mis-order the chunks.
-          for (const evs of Object.values(grouped)) {
-            evs.sort((a, b) => a.seq - b.seq);
-          }
-          // Detect in-flight turn: a messageId that has no
-          // chat_messages row yet. There can be at most one in flight
-          // per chat (server enforces it).
-          const messageIds = new Set(msgs.filter((m) => m.role === "assistant").map((m) => m.id));
-          let inFlightId: string | null = null;
-          let inFlightLastSeq = -1;
-          for (const [mid, evs] of Object.entries(grouped)) {
-            if (messageIds.has(mid)) continue;
-            inFlightId = mid;
-            for (const ev of evs) if (ev.seq > inFlightLastSeq) inFlightLastSeq = ev.seq;
-          }
-          const chunksByMessage: Record<string, StreamChunk[]> = {};
-          let inFlightChunks: StreamChunk[] = [];
-          for (const [mid, evs] of Object.entries(grouped)) {
-            const chunks = chunksFromEvents(evs);
-            if (mid === inFlightId) inFlightChunks = chunks;
-            else chunksByMessage[mid] = chunks;
-          }
-          setMessageChunks(chunksByMessage);
-          const { payload, compacted } = latestUsageFromEvents(events);
-          if (payload) {
-            setUsage({
-              last: payload.last,
-              total: payload.total,
-              modelContextWindow: payload.modelContextWindow,
-              costUsd: payload.costUsd,
-              subscriptionShare: payload.subscriptionShare,
-              compacted,
-            });
-          } else if (compacted) {
-            setUsage((prev) => (prev ? { ...prev, compacted: true } : prev));
-          }
-          if (inFlightId) {
-            attachResume(inFlightId, inFlightLastSeq, inFlightChunks);
+        for (const message of page.messages) {
+          if (message.role === "assistant") {
+            loadedChunkKeysRef.current.add(`normal:${message.id}`);
           }
         }
-        // Settle to the bottom once the freshly hydrated history has laid
-        // out. Forced, so a first load always lands at the tail, and the
-        // settle loop absorbs content-visibility rows realizing their real
-        // height. Subsequent streaming scrolls go through scrollToBottom.
-        setTimeout(() => scrollToBottomSettled(true), 50);
+        setSessionRows([]);
+        setHasOlder(page.hasMore);
+        setActiveLeaf(page.messages.at(-1)?.id ?? chatRef.current.activeLeafId ?? null);
+        if (transcriptRequests.accepts(generation, ac) && page.inFlight) {
+          attachResume(page.inFlight.messageId, page.inFlight.lastSeq, page.inFlight.chunks);
+        }
       } catch (err) {
         // Aborts are routine (chat switch, unmount). Anything else is
         // a real failure to hydrate, so log it so a server-side issue
@@ -808,18 +693,267 @@ function Chat({
         if (err instanceof DOMException && err.name === "AbortError") return;
         if (ac.signal.aborted) return;
         console.warn(`[chat] hydration failed (chat=${chatId}):`, err);
+      } finally {
+        transcriptRequests.release(ac);
       }
-    })();
-    return () => ac.abort();
+    };
+    if (visible) {
+      void hydrate();
+    } else {
+      cancelScheduled = scheduleIdleWork(hydrate);
+    }
+    return () => {
+      cancelScheduled?.();
+      ac.abort();
+      transcriptRequests.release(ac);
+    };
     // attachResume is stable (defined as ref-using callback below), and we
     // exclude it from deps to avoid re-running the fetch on every
     // re-render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pending, initialMessage, instanceId, chatId]);
+  }, [
+    pending,
+    initialMessage,
+    instanceId,
+    chatId,
+    visible,
+    invalidateTranscriptRequests,
+    pinNextCommitToBottom,
+    setActiveLeaf,
+  ]);
+
+  useLayoutEffect(() => {
+    const wasVisible = previousVisibleRef.current;
+    previousVisibleRef.current = visible;
+    if (!visible) {
+      if (wasVisible) {
+        retainedPinnedRef.current = isPinnedRef.current;
+        if (!isPinnedRef.current) messageHistoryRef.current?.captureRetainedAnchor();
+        // A reveal rAF can be canceled by the subsequent stream detach before
+        // it observes hidden visibility. Mark the canonical target dirty in
+        // this commit so the next hot reveal uses it on its first frame.
+        if (liveRowRef.current) hiddenLiveRenderDirtyRef.current = true;
+      }
+      return;
+    }
+    if (hotSwitchLiveChunks) {
+      hiddenLiveRenderDirtyRef.current = false;
+      setLiveRow((row) => (row ? { ...row, chunks: hotSwitchLiveChunks } : row));
+    }
+    const pinned = wasVisible ? isPinnedRef.current : retainedPinnedRef.current;
+    isPinnedRef.current = pinned;
+    if (!pinned) {
+      messageHistoryRef.current?.restoreRetainedAnchor();
+      return;
+    }
+    // The parent reveals this retained pane in the same commit. Position it
+    // synchronously so the browser cannot paint scrollTop=0 and repair it on
+    // a later animation frame. Ordinary streaming still uses scrollToBottom's
+    // coalesced rAF path.
+    positionAtBottom();
+  }, [hotSwitchLiveChunks, positionAtBottom, visible]);
+
+  const loadOlderMessages = useCallback(() => {
+    if (loadingOlderRef.current || !hasOlder) return;
+    const before = messages[0]?.id;
+    if (!before) return;
+    const generation = transcriptRequests.current;
+    const controller = transcriptRequests.createController();
+    loadingOlderRef.current = true;
+    void listChatTranscript(instanceId, chatId, { before, signal: controller.signal })
+      .then((page) => {
+        if (!transcriptRequests.accepts(generation, controller)) return;
+        if (messages[0]?.id !== before) return;
+        messageHistoryRef.current?.capturePrependAnchor();
+        setHistoryPages((current) => {
+          if (current[0]?.messages[0]?.id !== before) return current;
+          const known = new Set(
+            current.flatMap((entry) => entry.messages.map((message) => message.id)),
+          );
+          const older = page.messages.filter((message) => !known.has(message.id));
+          if (older.length === 0) return current;
+          return [
+            {
+              key: pageKey(older, `older-${before}`),
+              messages: older,
+              chunksByMessage: chunksFromPage(page),
+            },
+            ...current,
+          ];
+        });
+        setHasOlder(page.hasMore);
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        console.warn(`[chat] older transcript page failed (chat=${chatId}):`, error);
+      })
+      .finally(() => {
+        transcriptRequests.release(controller);
+        if (transcriptRequests.current === generation) loadingOlderRef.current = false;
+      });
+  }, [chatId, hasOlder, instanceId, messages, transcriptRequests]);
+
+  const loadAssistantChunks = useCallback(
+    (messageIds: string[]) => {
+      const generation = chunkRequests.current;
+      const includeDebug = showDebug;
+      const missing = messageIds.filter((messageId) => {
+        const key = `${includeDebug ? "debug" : "normal"}:${messageId}`;
+        if (loadedChunkKeysRef.current.has(key)) return false;
+        loadedChunkKeysRef.current.add(key);
+        return true;
+      });
+      if (missing.length === 0) return;
+      for (let start = 0; start < missing.length; start += 64) {
+        const batch = missing.slice(start, start + 64);
+        const controller = chunkRequests.createController();
+        void listChatRenderChunks(instanceId, chatId, batch, includeDebug, controller.signal)
+          .then(({ chunksByMessage }) => {
+            if (
+              !chunkRequests.accepts(generation, controller) ||
+              chunkModeRef.current !== includeDebug
+            ) {
+              return;
+            }
+            const populated = Object.fromEntries(
+              Object.entries(chunksByMessage).filter(([, chunks]) => chunks.length > 0),
+            ) as Record<string, StreamChunk[]>;
+            if (Object.keys(populated).length > 0) {
+              setHistoryPages((pages) =>
+                pages.map((page) => {
+                  const relevant: Record<string, StreamChunk[]> = {};
+                  for (const message of page.messages) {
+                    const chunks = populated[message.id];
+                    if (chunks) relevant[message.id] = chunks;
+                  }
+                  return Object.keys(relevant).length === 0
+                    ? page
+                    : { ...page, chunksByMessage: { ...page.chunksByMessage, ...relevant } };
+                }),
+              );
+              setSessionRows((rows) =>
+                rows.map((row) => {
+                  const chunks = populated[row.message.id];
+                  return chunks ? { ...row, chunks } : row;
+                }),
+              );
+            }
+          })
+          .catch((error: unknown) => {
+            if (controller.signal.aborted) return;
+            if (error instanceof DOMException && error.name === "AbortError") return;
+            if (chunkRequests.current === generation) {
+              for (const messageId of batch) {
+                loadedChunkKeysRef.current.delete(
+                  `${includeDebug ? "debug" : "normal"}:${messageId}`,
+                );
+              }
+            }
+            console.warn(`[chat] visible render chunks failed (chat=${chatId}):`, error);
+          })
+          .finally(() => {
+            chunkRequests.release(controller);
+          });
+      }
+    },
+    [chatId, chunkRequests, instanceId, showDebug],
+  );
 
   useEffect(() => {
-    if (visible) scrollToBottomSettled();
-  }, [visible, scrollToBottomSettled]);
+    if (!visible || !showDebug) return;
+    const ids = [
+      ...historyPages.flatMap((page) =>
+        page.messages
+          .filter((message) => message.role === "assistant")
+          .map((message) => message.id),
+      ),
+      ...sessionRows.filter((row) => row.message.role === "assistant").map((row) => row.message.id),
+    ];
+    loadAssistantChunks(ids);
+  }, [historyPages, loadAssistantChunks, sessionRows, showDebug, visible]);
+
+  const loadToolDetails = useCallback(
+    (messageId: string, toolId: string) => {
+      const key = `details:${messageId}:${toolId}`;
+      const applyDetails = (fetched: StreamChunk[]): { matched: boolean; complete: boolean } => {
+        let matched = false;
+        let complete = true;
+        const inspect = (current: StreamChunk[]) => {
+          const result = mergeToolDetails([...current], fetched, toolId);
+          if (result.matched) {
+            matched = true;
+            complete = complete && result.complete;
+          }
+        };
+        if (streamingMessageIdRef.current === messageId) inspect(liveChunksRef.current);
+        for (const page of historyPagesRef.current) {
+          const current = page.chunksByMessage[messageId];
+          if (current) inspect(current);
+        }
+        for (const row of sessionRowsRef.current) {
+          if (row.message.id === messageId && row.chunks) inspect(row.chunks);
+        }
+        const result = { matched, complete: matched && complete };
+        if (streamingMessageIdRef.current === messageId) {
+          const liveMerge = mergeToolDetails(liveChunksRef.current, fetched, toolId);
+          if (liveMerge.changed) {
+            if (visibleRef.current) {
+              setLiveRow((row) => (row ? { ...row, chunks: [...liveChunksRef.current] } : row));
+            } else hiddenLiveRenderDirtyRef.current = true;
+          }
+        }
+        setHistoryPages((pages) => {
+          let changed = false;
+          const nextPages = pages.map((page) => {
+            const current = page.chunksByMessage[messageId];
+            if (!current) return page;
+            const next = [...current];
+            if (!mergeToolDetails(next, fetched, toolId).changed) return page;
+            changed = true;
+            return { ...page, chunksByMessage: { ...page.chunksByMessage, [messageId]: next } };
+          });
+          return changed ? nextPages : pages;
+        });
+        setSessionRows((rows) => {
+          let changed = false;
+          const nextRows = rows.map((row) => {
+            if (row.message.id !== messageId || !row.chunks) return row;
+            const next = [...row.chunks];
+            if (!mergeToolDetails(next, fetched, toolId).changed) return row;
+            changed = true;
+            return { ...row, chunks: next };
+          });
+          return changed ? nextRows : rows;
+        });
+        return result;
+      };
+      const cached = toolDetailsCacheRef.current.get(key);
+      if (cached && applyDetails(cached).complete) return;
+      if (toolDetailRequestsRef.current.has(key)) return;
+      toolDetailRequestsRef.current.add(key);
+      const generation = toolDetailRequestGeneration.current;
+      const controller = toolDetailRequestGeneration.createController();
+      void getChatToolDetails(instanceId, chatId, messageId, toolId, controller.signal)
+        .then(({ chunksByMessage }) => {
+          if (!toolDetailRequestGeneration.accepts(generation, controller)) return;
+          const chunks = chunksByMessage[messageId];
+          if (!chunks || chunks.length === 0) return;
+          toolDetailsCacheRef.current.set(key, chunks);
+          applyDetails(chunks);
+        })
+        .catch((error: unknown) => {
+          if (controller.signal.aborted) return;
+          if (error instanceof DOMException && error.name === "AbortError") return;
+          console.warn(`[chat] tool details failed (chat=${chatId} msg=${messageId}):`, error);
+        })
+        .finally(() => {
+          toolDetailRequestsRef.current.delete(key);
+          toolDetailRequestGeneration.release(controller);
+        });
+    },
+    [chatId, instanceId, toolDetailRequestGeneration],
+  );
 
   const applyModelChange = useCallback(
     async (body: UpdateChatBody) => {
@@ -879,18 +1013,23 @@ function Chat({
       runner: (onEvent: (ev: ChatTurnEvent) => void) => Promise<void>,
     ) => {
       const chunks: StreamChunk[] = existingChunks ? [...existingChunks] : [];
+      liveChunksRef.current = chunks;
+      hiddenLiveRenderDirtyRef.current = false;
       const toolIndex = new Map<string, number>();
+      liveToolIndexRef.current = toolIndex;
       // Rebuild toolIndex from any pre-seeded chunks so a resume can
       // patch the same tool entry the live stream was about to update.
       for (const [i, c] of chunks.entries()) {
         if (c.kind === "tool") toolIndex.set(c.id, i);
       }
-      let accumulated = chunks.reduce((acc, c) => (c.kind === "text" ? acc + c.text : acc), "");
       let serverMessageId: string | null = null;
+      const snapshotState: {
+        message: Extract<ChatTurnEvent, { kind: "snapshot" }>["snapshot"]["message"];
+      } = { message: null };
       // Idempotency guard: ignore events we've already applied. The
       // server suppresses them via afterSeq on resume, but a buggy
       // backend or a duplicated frame shouldn't render twice.
-      let lastSeq = -1;
+      let lastSeq = existingChunks ? liveLastSeqRef.current : -1;
       // Tracks whether onEvent saw a terminal event (done OR error)
       // from the server. If the runner returns without firing one
       // (caller aborted between events, server protocol failure),
@@ -901,96 +1040,129 @@ function Chat({
       // fallback path doesn't add a second error message on top of
       // the one the error handler already rendered.
       let terminalHandled = false;
-
-      // --- Typewriter reveal state ----------------------------------------
-      // Claude streams text in large blocks, and rendering them verbatim makes the
-      // message lurch in. Instead we keep `chunks` as the fully-received target
-      // and animate a `revealed` cursor toward it a few characters per frame,
-      // rendering truncateChunks(chunks, revealed). Codex's token-sized deltas
-      // already arrive smaller than the per-frame rate, so they're unaffected
-      // beyond being coalesced to one render per frame.
-      //
-      // Seeded resume chunks are already on screen, so start fully revealed so we
-      // only ever type out genuinely new text.
-      let revealed = revealableLen(chunks);
-      // Set on a normal `done`: the loop runs this once it has typed out the
-      // tail, so the last block animates in instead of snapping.
+      let revealed = revealableLength(chunks);
       let pendingCommit: (() => void) | null = null;
-      // Resolves when a deferred (typed-out) commit has actually landed.
-      // drainTurn awaits this before returning so the turn isn't reported
-      // complete (and the composer re-enabled) mid-animation.
       let finishingDrain: Promise<void> | null = null;
-      // Defensive: a previous turn cancels its own loop via commit(), but never
-      // inherit a stale handle.
+      let previousRevealTimestamp: number | null = null;
+      let queuedLiveChunks: StreamChunk[] | null = null;
+      const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+      // Provider events mutate the canonical reducer immediately. Only output
+      // received while this chat and the app are visible is revealed at a
+      // readable character cadence. A hidden chat, a backgrounded app, or a
+      // resume snapshot catches up immediately so old output is never replayed
+      // as an animation when the user returns.
+      if (liveRenderRafRef.current !== null) {
+        cancelAnimationFrame(liveRenderRafRef.current);
+        liveRenderRafRef.current = null;
+      }
       if (revealRafRef.current !== null) {
         cancelAnimationFrame(revealRafRef.current);
         revealRafRef.current = null;
       }
-
-      // Timestamp of the previous rAF tick, so reveal speed is measured in
-      // real time (chars/sec) rather than chars/frame, so it is uniform regardless of
-      // refresh rate or dropped frames. Reset whenever the loop restarts.
-      let prevTs: number | null = null;
+      const cancelLiveRender = () => {
+        if (liveRenderRafRef.current === null) return;
+        cancelAnimationFrame(liveRenderRafRef.current);
+        liveRenderRafRef.current = null;
+        queuedLiveChunks = null;
+      };
+      const cancelReveal = () => {
+        if (revealRafRef.current === null) return;
+        cancelAnimationFrame(revealRafRef.current);
+        revealRafRef.current = null;
+        previousRevealTimestamp = null;
+      };
+      const canRenderLive = () => visibleRef.current && document.visibilityState === "visible";
+      const canAnimateLive = () => canRenderLive() && !reduceMotion;
+      const renderLive = (renderedChunks: StreamChunk[]) => {
+        if (!canRenderLive()) {
+          hiddenLiveRenderDirtyRef.current = true;
+          return;
+        }
+        hiddenLiveRenderDirtyRef.current = false;
+        setLiveRow((row) => (row ? { ...row, chunks: renderedChunks } : row));
+        scrollToBottom();
+      };
+      const queueLiveRender = (renderedChunks: StreamChunk[]) => {
+        if (!canRenderLive()) {
+          hiddenLiveRenderDirtyRef.current = true;
+          return;
+        }
+        queuedLiveChunks = renderedChunks;
+        if (liveRenderRafRef.current !== null) return;
+        liveRenderRafRef.current = requestAnimationFrame(() => {
+          liveRenderRafRef.current = null;
+          const queued = queuedLiveChunks;
+          queuedLiveChunks = null;
+          if (queued) renderLive(queued);
+        });
+      };
+      const finishPendingCommit = () => {
+        const finish = pendingCommit;
+        pendingCommit = null;
+        finish?.();
+      };
+      const settleRevealWithoutAnimation = (publish: boolean) => {
+        cancelReveal();
+        revealed = revealableLength(chunks);
+        if (publish) queueLiveRender([...chunks]);
+        else hiddenLiveRenderDirtyRef.current = true;
+        finishPendingCommit();
+      };
       const pumpReveal = () => {
-        if (revealRafRef.current !== null) return; // already draining
-        const step = (ts: number) => {
+        if (revealRafRef.current !== null) return;
+        cancelLiveRender();
+        const step = (timestamp: number) => {
           revealRafRef.current = null;
-          const target = revealableLen(chunks);
+          if (!canAnimateLive()) {
+            settleRevealWithoutAnimation(canRenderLive());
+            return;
+          }
+          const target = revealableLength(chunks);
           if (revealed < target) {
-            // Clamp dt so a backgrounded tab resuming with a multi-second gap
-            // doesn't lurch the whole backlog onto screen in one frame. The
-            // catch-up below bleeds it off smoothly over the next few frames.
-            const dt = prevTs === null ? 16 : Math.min(64, ts - prevTs);
-            prevTs = ts;
+            const elapsed =
+              previousRevealTimestamp === null
+                ? 16
+                : Math.min(64, timestamp - previousRevealTimestamp);
+            previousRevealTimestamp = timestamp;
             const backlog = target - revealed;
-            // Constant cadence, plus a capped catch-up once the buffer is large
-            // so the visible text never trails real output unboundedly.
-            let cps = REVEAL_CPS;
-            if (backlog > REVEAL_LAG_CHARS) {
-              cps = Math.min(
-                REVEAL_MAX_CPS,
-                REVEAL_CPS + (backlog - REVEAL_LAG_CHARS) / REVEAL_CATCHUP_SEC,
-              );
-            }
-            revealed = Math.min(target, revealed + Math.max(1, Math.round((cps * dt) / 1000)));
-            setStreamingChunks(truncateChunks(chunks, revealed));
-            scrollToBottom();
+            const charactersPerSecond =
+              backlog > REVEAL_LAG_CHARACTERS
+                ? Math.min(
+                    REVEAL_MAX_CHARACTERS_PER_SECOND,
+                    REVEAL_CHARACTERS_PER_SECOND +
+                      (backlog - REVEAL_LAG_CHARACTERS) / REVEAL_CATCHUP_SECONDS,
+                  )
+                : REVEAL_CHARACTERS_PER_SECOND;
+            revealed = Math.min(
+              target,
+              revealed + Math.max(1, Math.round((charactersPerSecond * elapsed) / 1000)),
+            );
+            renderLive(revealChunks(chunks, revealed));
           }
           if (revealed < target) {
             revealRafRef.current = requestAnimationFrame(step);
           } else {
-            prevTs = null; // idle until the next delta restarts the loop
-            if (pendingCommit) {
-              const fn = pendingCommit;
-              pendingCommit = null;
-              fn();
-            }
+            previousRevealTimestamp = null;
+            finishPendingCommit();
           }
         };
         revealRafRef.current = requestAnimationFrame(step);
       };
-
-      // Type out whatever's still buffered, then run `fn` (the commit), and
-      // resolve once it has. Commits synchronously if already caught up.
-      // otherwise the loop calls it on the frame it reaches the target. A
-      // Stop/unmount mid-drain snaps the remainder in and commits now rather
-      // than keep typing into a turn the user ended.
-      const finishThenCommit = (fn: () => void): Promise<void> => {
-        if (!REVEAL_ANIMATION || revealed >= revealableLen(chunks)) {
-          fn();
+      const finishThenCommit = (commit: () => void): Promise<void> => {
+        if (!canAnimateLive() || revealed >= revealableLength(chunks)) {
+          revealed = revealableLength(chunks);
+          commit();
           return Promise.resolve();
         }
         return new Promise<void>((resolve) => {
           const finish = () => {
             ac.signal.removeEventListener("abort", onAbort);
-            fn();
+            commit();
             resolve();
           };
           const onAbort = () => {
-            if (revealRafRef.current !== null) {
-              cancelAnimationFrame(revealRafRef.current);
-              revealRafRef.current = null;
-            }
+            cancelReveal();
             finish();
           };
           pendingCommit = finish;
@@ -998,50 +1170,119 @@ function Chat({
           pumpReveal();
         });
       };
+      const handleVisibilityChange = () => {
+        if (document.visibilityState !== "visible") {
+          settleRevealWithoutAnimation(false);
+          return;
+        }
+        if (visibleRef.current && hiddenLiveRenderDirtyRef.current) {
+          revealed = revealableLength(chunks);
+          queueLiveRender([...chunks]);
+        }
+      };
+      document.addEventListener("visibilitychange", handleVisibilityChange);
+      const discardLiveRow = () => {
+        cancelLiveRender();
+        cancelReveal();
+        pendingCommit = null;
+        setLiveRow(null);
+        liveRenderKeyRef.current = null;
+        liveChunksRef.current = [];
+        liveToolIndexRef.current = new Map();
+        hiddenLiveRenderDirtyRef.current = false;
+      };
+      const accumulatedContent = () =>
+        chunks
+          .filter((chunk): chunk is Extract<StreamChunk, { kind: "text" }> => chunk.kind === "text")
+          .map((chunk) => chunk.text)
+          .join("");
+
+      const applyMetaEvent = (type: string, payload: unknown): boolean => {
+        if (type === "usage") {
+          const usagePayload = payload as {
+            last: TokenUsage;
+            total: TokenUsage;
+            modelContextWindow?: number;
+            costUsd?: number;
+            subscriptionShare?: SubscriptionShare;
+          };
+          setUsage((prev) => ({
+            last: usagePayload.last,
+            total: usagePayload.total,
+            modelContextWindow: usagePayload.modelContextWindow,
+            costUsd: usagePayload.costUsd,
+            subscriptionShare: usagePayload.subscriptionShare,
+            compacted: prev?.compacted,
+          }));
+          return true;
+        }
+        if (type === "title") {
+          const title = typeof payload === "string" ? payload : String(payload ?? "");
+          onTitle?.(title);
+          return true;
+        }
+        if (type === "context_compacted") {
+          setUsage((prev) => (prev ? { ...prev, compacted: true } : prev));
+          return true;
+        }
+        return false;
+      };
 
       const commit = (id: string, content: string) => {
-        if (revealRafRef.current !== null) {
-          cancelAnimationFrame(revealRafRef.current);
-          revealRafRef.current = null;
-        }
+        cancelLiveRender();
+        cancelReveal();
         pendingCommit = null;
         terminalHandled = true;
-        const msg: ChatMessage = {
-          id,
-          chatId,
-          role: "assistant",
-          // The assistant message replies to the turn's user message. For a
-          // resumed turn (no turnUserIdRef) that message is the visible
-          // branch's tip: the leaf advanced onto it at turn start and the
-          // tip derivation descends to it even from a stale leaf.
-          parentId: turnUserIdRef.current ?? tipIdRef.current,
-          content,
-          createdAt: new Date(),
-        };
-        setMessages((prev) => {
-          // Skip duplicate commits when a resume races with our
-          // own optimistic message (e.g. quick reconnect).
-          if (prev.some((m) => m.id === id)) return prev;
-          return [...prev, msg];
+        const msg: TranscriptMessage = snapshotState.message
+          ? { ...snapshotState.message, version: null }
+          : {
+              id,
+              chatId,
+              role: "assistant",
+              // The assistant message replies to the turn's user message. For a
+              // resumed turn (no turnUserIdRef) that message is the visible
+              // branch's tip: the leaf advanced onto it at turn start and the
+              // tip derivation descends to it even from a stale leaf.
+              parentId: turnUserIdRef.current ?? activeLeafRef.current ?? tipIdRef.current,
+              content,
+              createdAt: new Date(),
+              version: null,
+            };
+        setSessionRows((rows) => {
+          // Skip duplicate commits when a resume races with the committed row.
+          if (rows.some((row) => row.message.id === msg.id)) return rows;
+          return [
+            ...rows,
+            {
+              renderKey: liveRenderKeyRef.current ?? msg.id,
+              message: msg,
+              chunks: [...chunks],
+            },
+          ];
         });
         setActiveLeaf(id);
-        setMessageChunks((prev) => ({ ...prev, [id]: chunks }));
-        setStreamingChunks([]);
+        setLiveRow(null);
+        liveRenderKeyRef.current = null;
+        liveChunksRef.current = [];
+        liveToolIndexRef.current = new Map();
+        debugReplayRef.current = null;
+        hiddenLiveRenderDirtyRef.current = false;
         scrollToBottom();
       };
 
       // Append a client-only assistant error bubble at the tip of the
       // visible branch (and advance the leaf so it stays visible).
       const appendErrorBubble = (content: string) => {
-        const errMsg: ChatMessage = {
+        const errMsg: TranscriptMessage = {
           id: `err-${crypto.randomUUID()}`,
           chatId,
           role: "assistant",
           parentId: activeLeafRef.current,
           content,
           createdAt: new Date(),
+          version: null,
         };
-        setMessages((prev) => [...prev, errMsg]);
+        setSessionRows((rows) => [...rows, { renderKey: errMsg.id, message: errMsg }]);
         setActiveLeaf(errMsg.id);
       };
 
@@ -1049,9 +1290,36 @@ function Chat({
         if (ev.kind === "message_id") {
           serverMessageId = ev.messageId;
           streamingMessageIdRef.current = ev.messageId;
+          setLiveRow((current) => (current ? { ...current, messageId: ev.messageId } : current));
           // Re-key any pre-seeded chunks under the canonical id so a
           // resume that landed before message_id still rendered into
           // the right bubble.
+          return;
+        }
+        if (ev.kind === "snapshot") {
+          serverMessageId = ev.snapshot.messageId;
+          streamingMessageIdRef.current = ev.snapshot.messageId;
+          lastSeq = ev.snapshot.lastSeq;
+          liveLastSeqRef.current = lastSeq;
+          snapshotState.message = ev.snapshot.message;
+          for (const metaEvent of ev.snapshot.metaEvents) {
+            applyMetaEvent(metaEvent.type, metaEvent.payload);
+          }
+          const snapshotChunks = [...ev.snapshot.chunks];
+          if (
+            snapshotChunks.length === 0 &&
+            ev.snapshot.message?.content &&
+            ev.snapshot.message.content.length > 0
+          ) {
+            snapshotChunks.push({ kind: "text", text: ev.snapshot.message.content });
+          }
+          replaceChunksFromSnapshot(chunks, toolIndex, snapshotChunks, ev.snapshot.lastSeq, []);
+          cancelReveal();
+          revealed = revealableLength(chunks);
+          setLiveRow((current) =>
+            current ? { ...current, messageId: ev.snapshot.messageId } : current,
+          );
+          queueLiveRender([...chunks]);
           return;
         }
         if (ev.kind === "user_message") {
@@ -1061,16 +1329,28 @@ function Chat({
           pendingUserIdRef.current = null;
           const serverMsg = ev.message;
           turnUserIdRef.current = serverMsg.id;
-          setMessages((prev) => {
-            const idx = pendingId ? prev.findIndex((m) => m.id === pendingId) : -1;
+          setSessionRows((rows) => {
+            const idx = pendingId ? rows.findIndex((row) => row.message.id === pendingId) : -1;
             if (idx >= 0) {
-              const next = [...prev];
-              next[idx] = serverMsg;
+              const next = [...rows];
+              const row = next[idx];
+              if (!row) return rows;
+              next[idx] = {
+                ...row,
+                message: { ...serverMsg, version: row.message.version ?? null },
+              };
               return next;
             }
-            if (prev.some((m) => m.id === serverMsg.id)) return prev;
-            return [...prev, serverMsg];
+            if (rows.some((row) => row.message.id === serverMsg.id)) return rows;
+            return [
+              ...rows,
+              {
+                renderKey: serverMsg.id,
+                message: { ...serverMsg, version: null },
+              },
+            ];
           });
+          setLiveRow((current) => (current ? { ...current, parentId: serverMsg.id } : current));
           if (activeLeafRef.current === pendingId || activeLeafRef.current === null) {
             setActiveLeaf(serverMsg.id);
           }
@@ -1078,13 +1358,10 @@ function Chat({
         }
         if (ev.kind === "done") {
           const id = serverMessageId ?? crypto.randomUUID();
-          // Let the typewriter finish the tail before committing, so the last
-          // block types in rather than snapping. drainTurn awaits the returned
-          // promise so the turn stays "streaming" until it lands.
-          finishingDrain = finishThenCommit(() => {
-            commit(id, accumulated);
-            streamingMessageIdRef.current = null;
-          });
+          finishingDrain = finishThenCommit(() =>
+            commit(id, snapshotState.message?.content ?? accumulatedContent()),
+          );
+          streamingMessageIdRef.current = null;
           return;
         }
         if (ev.kind === "error") {
@@ -1099,12 +1376,12 @@ function Chat({
           // crash-recovery backfill, so the UI flickers an empty
           // assistant slot then fills in on reload. Commit them
           // either way so the live and post-refresh views agree.
-          if (chunks.length > 0) {
+          if (chunks.length > 0 || snapshotState.message) {
             const id = serverMessageId ?? crypto.randomUUID();
-            commit(id, accumulated);
+            commit(id, snapshotState.message?.content ?? accumulatedContent());
           } else {
             terminalHandled = true;
-            setStreamingChunks([]);
+            discardLiveRow();
           }
           if (!isCancel) {
             // Real failures (CLI exit code, upstream API error, …)
@@ -1119,35 +1396,12 @@ function Chat({
         }
         // ev.kind === "event"
         if (ev.seq >= 0 && ev.seq <= lastSeq) return;
-        if (ev.seq >= 0) lastSeq = ev.seq;
+        if (ev.seq >= 0) {
+          lastSeq = ev.seq;
+          liveLastSeqRef.current = lastSeq;
+        }
         // Meta events that don't produce chunks but update other UI.
-        if (ev.type === "usage") {
-          const payload = ev.payload as {
-            last: TokenUsage;
-            total: TokenUsage;
-            modelContextWindow?: number;
-            costUsd?: number;
-            subscriptionShare?: SubscriptionShare;
-          };
-          setUsage((prev) => ({
-            last: payload.last,
-            total: payload.total,
-            modelContextWindow: payload.modelContextWindow,
-            costUsd: payload.costUsd,
-            subscriptionShare: payload.subscriptionShare,
-            compacted: prev?.compacted,
-          }));
-          return;
-        }
-        if (ev.type === "title") {
-          const title = typeof ev.payload === "string" ? ev.payload : String(ev.payload ?? "");
-          onTitle?.(title);
-          return;
-        }
-        if (ev.type === "context_compacted") {
-          setUsage((prev) => (prev ? { ...prev, compacted: true } : prev));
-          return;
-        }
+        if (applyMetaEvent(ev.type, ev.payload)) return;
         // Chunk-producing events flow through the shared reducer so
         // mount-time replay and live streaming end up with byte-for-
         // byte identical chunks.
@@ -1160,24 +1414,17 @@ function Chat({
           ev.type === "api_retry" ||
           ev.type === "raw"
         ) {
-          if (ev.type === "delta") {
-            accumulated += typeof ev.payload === "string" ? ev.payload : String(ev.payload ?? "");
+          const debugReplay = debugReplayRef.current;
+          if (debugReplay?.messageId === streamingMessageIdRef.current) {
+            debugReplay.events.push(ev);
           }
+          if ((ev.type === "thinking" || ev.type === "raw") && !showDebugRef.current) return;
           applyEvent(chunks, toolIndex, ev.type, ev.payload);
-          if (!REVEAL_ANIMATION) {
-            // Typewriter disabled, so render everything received so far at once.
-            setStreamingChunks([...chunks]);
-            scrollToBottom();
-          } else if (ev.type === "delta" || ev.type === "thinking") {
-            // New readable text, so hand off to the typewriter, which renders and
-            // scrolls one frame at a time as it catches up to the target.
-            pumpReveal();
-          } else {
-            // Structural change (tool call, retry, raw). Render it now, still
-            // projected through `revealed` so it stays hidden behind any text
-            // ahead of it that hasn't finished typing yet.
-            setStreamingChunks(truncateChunks(chunks, revealed));
-            scrollToBottom();
+          if (ev.type === "delta" || ev.type === "thinking") {
+            if (canAnimateLive()) pumpReveal();
+            else settleRevealWithoutAnimation(canRenderLive());
+          } else if (revealRafRef.current === null) {
+            queueLiveRender(revealChunks(chunks, revealed));
           }
           return;
         }
@@ -1190,61 +1437,69 @@ function Chat({
           label: `unknown sse: ${ev.type}`,
           payload: ev.payload,
         });
-        setStreamingChunks(REVEAL_ANIMATION ? truncateChunks(chunks, revealed) : [...chunks]);
+        if (revealRafRef.current === null) {
+          queueLiveRender(revealChunks(chunks, revealed));
+        }
       };
 
       try {
-        await runner(onEvent);
-      } catch (err) {
-        if (ac.signal.aborted) {
-          // Local abort (Stop button / unmount). Commit partial.
-          if (!terminalHandled && chunks.length > 0) {
-            const id = serverMessageId ?? crypto.randomUUID();
-            commit(id, accumulated);
-          } else if (!terminalHandled) {
-            setStreamingChunks([]);
+        try {
+          await runner(onEvent);
+        } catch (err) {
+          if (detachedControllersRef.current.has(ac)) return;
+          if (ac.signal.aborted) {
+            // Local abort (Stop button / unmount). Commit partial.
+            if (!terminalHandled && (chunks.length > 0 || snapshotState.message)) {
+              const id = serverMessageId ?? crypto.randomUUID();
+              commit(id, snapshotState.message?.content ?? accumulatedContent());
+            } else if (!terminalHandled) {
+              discardLiveRow();
+            }
+            return;
           }
+          appendErrorBubble(`Error: ${err instanceof Error ? err.message : String(err)}`);
+          discardLiveRow();
+          scrollToBottom();
           return;
         }
-        appendErrorBubble(`Error: ${err instanceof Error ? err.message : String(err)}`);
-        setStreamingChunks([]);
-        scrollToBottom();
-        return;
-      }
-      // A normal `done` defers its commit until the typewriter finishes the
-      // tail. Wait for it here so the turn isn't reported complete (and the
-      // post-runner fallback below isn't tricked into a false "no terminal
-      // event") until the message has actually committed.
-      if (finishingDrain) await finishingDrain;
-      // Runner returned without throwing AND without firing a
-      // terminal onEvent. Two cases:
-      //   1. Outer-signal abort (user hit Stop, component unmounted):
-      //      treat as a cancelled partial, same as a hub-emitted
-      //      `error: aborted`.
-      //   2. Anything else: the runner exited without telling us why.
-      //      That's a bug or a server protocol failure, so surface it as
-      //      a visible error so the user knows the chat didn't
-      //      complete normally.
-      if (!terminalHandled) {
-        if (ac.signal.aborted) {
-          if (chunks.length > 0) {
-            const id = serverMessageId ?? crypto.randomUUID();
-            commit(id, accumulated);
+
+        if (finishingDrain) await finishingDrain;
+
+        // Runner returned without throwing AND without firing a
+        // terminal onEvent. Two cases:
+        //   1. Outer-signal abort (user hit Stop, component unmounted):
+        //      treat as a cancelled partial, same as a hub-emitted
+        //      `error: aborted`.
+        //   2. Anything else: the runner exited without telling us why.
+        //      That's a bug or a server protocol failure, so surface it as
+        //      a visible error so the user knows the chat didn't
+        //      complete normally.
+        if (!terminalHandled) {
+          if (detachedControllersRef.current.has(ac)) return;
+          if (ac.signal.aborted) {
+            if (chunks.length > 0 || snapshotState.message) {
+              const id = serverMessageId ?? crypto.randomUUID();
+              commit(id, snapshotState.message?.content ?? accumulatedContent());
+            } else {
+              discardLiveRow();
+            }
           } else {
-            setStreamingChunks([]);
+            console.warn(
+              `[chat] runner exited without terminal event (chat=${chatId} msg=${serverMessageId})`,
+            );
+            appendErrorBubble(
+              "Error: stream ended without a completion signal, and " +
+                "the server may have dropped the connection. " +
+                "Reload to see any partial output that was persisted.",
+            );
+            discardLiveRow();
+            scrollToBottom();
           }
-        } else {
-          console.warn(
-            `[chat] runner exited without terminal event (chat=${chatId} msg=${serverMessageId})`,
-          );
-          appendErrorBubble(
-            "Error: stream ended without a completion signal, and " +
-              "the server may have dropped the connection. " +
-              "Reload to see any partial output that was persisted.",
-          );
-          setStreamingChunks([]);
-          scrollToBottom();
         }
+      } finally {
+        document.removeEventListener("visibilitychange", handleVisibilityChange);
+        cancelLiveRender();
+        cancelReveal();
       }
     },
     [chatId, scrollToBottom, onTitle, setActiveLeaf],
@@ -1263,14 +1518,16 @@ function Chat({
       // `force` bypasses the streaming guard for the bootstrap re-entry where
       // the optimistic state already has `streaming=true` from the useState
       // initializer.
-      if (streaming && !force) return;
+      if ((streaming || navigatingBranchRef.current) && !force) return;
+
+      invalidateTranscriptRequests();
 
       if (override === undefined) {
         setInput("");
         attachments.clear();
       }
       setStreaming(true);
-      setStreamingChunks([]);
+      liveLastSeqRef.current = -1;
 
       // Flush any model/effort change the user made while the previous turn
       // was still streaming. Picker edits are local-only mid-turn and apply
@@ -1291,22 +1548,26 @@ function Chat({
       const optimisticId = reuseBootstrap ? last.id : crypto.randomUUID();
       pendingUserIdRef.current = optimisticId;
       turnUserIdRef.current = optimisticId;
+      const renderKey = liveRenderKeyRef.current ?? `live-${crypto.randomUUID()}`;
+      liveRenderKeyRef.current = renderKey;
+      pinNextCommitToBottom();
+      setLiveRow({ renderKey, messageId: null, parentId: optimisticId, chunks: [] });
       if (!reuseBootstrap) {
-        const optimistic: ChatMessage = {
+        const optimistic: TranscriptMessage = {
           id: optimisticId,
           chatId,
           role: "user",
           content,
-          parentId: thread.tipId,
-          // Already uploaded, so the previews resolve immediately (before the
-          // server's user_message frame swaps in the persisted row).
+          parentId: tipIdRef.current,
+          // Already uploaded, so previews resolve before the server swaps in
+          // the persisted user message.
           uploads: uploads.length > 0 ? uploads : undefined,
           createdAt: new Date(),
+          version: null,
         };
-        setMessages((prev) => [...prev, optimistic]);
+        setSessionRows((rows) => [...rows, { renderKey: optimistic.id, message: optimistic }]);
       }
       setActiveLeaf(optimisticId);
-      scrollToBottom(true);
 
       const ac = new AbortController();
       abortRef.current = ac;
@@ -1318,13 +1579,14 @@ function Chat({
             chatId,
             content,
             uploadIds,
+            includeDebug: showDebugRef.current,
             onEvent,
             signal: ac.signal,
           }),
         );
       } finally {
         if (abortRef.current === ac) abortRef.current = null;
-        setStreaming(false);
+        if (!detachedControllersRef.current.has(ac)) setStreaming(false);
       }
     },
     [
@@ -1334,13 +1596,13 @@ function Chat({
       instanceId,
       chatId,
       messages,
-      thread.tipId,
-      scrollToBottom,
+      pinNextCommitToBottom,
       setActiveLeaf,
       currentModel,
       currentEffort,
       applyModelChange,
       drainTurn,
+      invalidateTranscriptRequests,
     ],
   );
 
@@ -1368,12 +1630,17 @@ function Chat({
     async (messageId: string, content: string, uploads: Upload[]) => {
       const trimmed = content.trim();
       if ((!trimmed && uploads.length === 0) || streamingRef.current) return;
-      const edited = messages.find((m) => m.id === messageId);
-      if (!edited) return;
+      const currentMessages = messagesRef.current;
+      const editedIndex = currentMessages.findIndex((message) => message.id === messageId);
+      const edited = currentMessages[editedIndex];
+      if (!edited || editedIndex < 0) return;
+
+      invalidateTranscriptRequests();
+      resetChunkCache();
 
       setEditingId(null);
       setStreaming(true);
-      setStreamingChunks([]);
+      liveLastSeqRef.current = -1;
 
       // Same deferred model/effort flush as a normal send.
       if (currentModel !== appliedModelRef.current || currentEffort !== appliedEffortRef.current) {
@@ -1389,7 +1656,13 @@ function Chat({
       const optimisticId = crypto.randomUUID();
       pendingUserIdRef.current = optimisticId;
       turnUserIdRef.current = optimisticId;
-      const optimistic: ChatMessage = {
+      const oldVersion = edited.version ?? {
+        index: 1,
+        count: 1,
+        previousId: null,
+        nextId: null,
+      };
+      const optimistic: TranscriptMessage = {
         id: optimisticId,
         chatId,
         role: "user",
@@ -1397,10 +1670,35 @@ function Chat({
         parentId: edited.parentId ?? null,
         uploads: uploads.length > 0 ? uploads : undefined,
         createdAt: new Date(),
+        version: {
+          index: oldVersion.count + 1,
+          count: oldVersion.count + 1,
+          previousId: edited.id,
+          nextId: null,
+        },
       };
-      setMessages((prev) => [...prev, optimistic]);
+      const retainedMessages = currentMessages.slice(0, editedIndex);
+      pinNextCommitToBottom();
+      setHistoryPages([
+        {
+          key: pageKey(retainedMessages, `edit-${messageId}`),
+          messages: retainedMessages,
+          chunksByMessage: Object.assign(
+            {},
+            ...historyPagesRef.current.map((page) => page.chunksByMessage),
+            Object.fromEntries(
+              sessionRowsRef.current.flatMap((row) =>
+                row.chunks ? [[row.message.id, row.chunks]] : [],
+              ),
+            ),
+          ),
+        },
+      ]);
+      setSessionRows([{ renderKey: optimistic.id, message: optimistic }]);
+      const renderKey = `live-${crypto.randomUUID()}`;
+      liveRenderKeyRef.current = renderKey;
+      setLiveRow({ renderKey, messageId: null, parentId: optimisticId, chunks: [] });
       setActiveLeaf(optimisticId);
-      scrollToBottom(true);
 
       const ac = new AbortController();
       abortRef.current = ac;
@@ -1413,25 +1711,27 @@ function Chat({
             content: trimmed,
             uploadIds: uploads.map((upload) => upload.id),
             editMessageId: messageId,
+            includeDebug: showDebugRef.current,
             onEvent,
             signal: ac.signal,
           }),
         );
       } finally {
         if (abortRef.current === ac) abortRef.current = null;
-        setStreaming(false);
+        if (!detachedControllersRef.current.has(ac)) setStreaming(false);
       }
     },
     [
-      messages,
       instanceId,
       chatId,
-      scrollToBottom,
+      pinNextCommitToBottom,
       setActiveLeaf,
       currentModel,
       currentEffort,
       applyModelChange,
       drainTurn,
+      invalidateTranscriptRequests,
+      resetChunkCache,
     ],
   );
 
@@ -1440,40 +1740,90 @@ function Chat({
     setEditingId(id);
   }, []);
   const handleCancelEdit = useCallback(() => setEditingId(null), []);
-  const handleSubmitEdit = useCallback(
-    (id: string, content: string, uploads: Upload[]) => {
-      void sendEdit(id, content, uploads);
-    },
-    [sendEdit],
-  );
+  const sendEditRef = useRef(sendEdit);
+  sendEditRef.current = sendEdit;
+  const handleSubmitEdit = useCallback((id: string, content: string, uploads: Upload[]) => {
+    void sendEditRef.current(id, content, uploads);
+  }, []);
 
-  // Switch to a neighboring version of an edited message: activate that
-  // sibling's branch (its newest tip) locally for an instant swap, then
-  // persist the choice. The server resolves the tip itself and re-points the
-  // provider session at the branch, and its answer wins over our local
-  // guess (they only differ if another window raced us).
+  // Switch branches on the server, then replace the bounded tail page. No
+  // inactive branch bodies are kept in the renderer.
   const handleNavigateVersion = useCallback(
     (messageId: string, dir: 1 | -1) => {
-      if (streamingRef.current) return;
-      const info = thread.versions.get(messageId);
+      if (streamingRef.current || navigatingBranchRef.current) return;
+      const info = messagesRef.current.find((message) => message.id === messageId)?.version;
       if (!info) return;
-      const targetId = info.siblingIds[info.index - 1 + dir];
+      const targetId = dir === -1 ? info.previousId : info.nextId;
       if (!targetId) return;
-      const previousLeaf = activeLeafRef.current;
-      setActiveLeaf(tipForSibling(messages, targetId));
-      setChatActiveLeaf(instanceId, chatId, targetId)
+      const generation = invalidateTranscriptRequests();
+      const controller = transcriptRequests.createController();
+      navigatingBranchRef.current = true;
+      setNavigatingBranch(true);
+      setChatActiveLeaf(instanceId, chatId, targetId, controller.signal)
         .then((updated) => {
-          if (updated.activeLeafId) setActiveLeaf(updated.activeLeafId);
+          const page = updated.transcript;
+          if (!transcriptRequests.accepts(generation, controller)) return;
+          resetChunkCache();
+          pinNextCommitToBottom();
+          setHistoryPages([
+            {
+              key: pageKey(page.messages, `branch-${targetId}`),
+              messages: page.messages,
+              chunksByMessage: chunksFromPage(page),
+            },
+          ]);
+          setSessionRows([]);
+          setHasOlder(page.hasMore);
+          setActiveLeaf(updated.activeLeafId ?? page.messages.at(-1)?.id ?? null);
+          setEditingId(null);
         })
-        .catch((err: unknown) => {
-          // The server refused (e.g. a turn raced us from another window).
-          // Snap back so the visible branch matches the session the next
-          // turn will actually run in.
+        .catch(async (err: unknown) => {
+          if (controller.signal.aborted) return;
+          if (err instanceof DOMException && err.name === "AbortError") return;
           console.warn(`[chat] branch switch failed (chat=${chatId}):`, err);
-          setActiveLeaf(previousLeaf);
+          // The POST may have reached the server even when its response was
+          // lost. Re-read the authoritative branch instead of guessing which
+          // side committed, while retaining the current chunk cache if this
+          // recovery request also fails.
+          try {
+            const page = await listChatTranscript(instanceId, chatId, {
+              signal: controller.signal,
+            });
+            if (!transcriptRequests.accepts(generation, controller)) return;
+            resetChunkCache();
+            pinNextCommitToBottom();
+            setHistoryPages([
+              {
+                key: pageKey(page.messages, "branch-recovery"),
+                messages: page.messages,
+                chunksByMessage: chunksFromPage(page),
+              },
+            ]);
+            setSessionRows([]);
+            setHasOlder(page.hasMore);
+            setActiveLeaf(page.messages.at(-1)?.id ?? null);
+            setEditingId(null);
+          } catch (recoveryError) {
+            if (!controller.signal.aborted) {
+              console.warn(`[chat] branch recovery failed (chat=${chatId}):`, recoveryError);
+            }
+          }
+        })
+        .finally(() => {
+          transcriptRequests.release(controller);
+          navigatingBranchRef.current = false;
+          setNavigatingBranch(false);
         });
     },
-    [thread, messages, instanceId, chatId, setActiveLeaf],
+    [
+      chatId,
+      instanceId,
+      invalidateTranscriptRequests,
+      pinNextCommitToBottom,
+      resetChunkCache,
+      setActiveLeaf,
+      transcriptRequests,
+    ],
   );
 
   // Attach to an in-flight turn discovered during mount-time
@@ -1482,11 +1832,23 @@ function Chat({
   // been connected throughout. `seedChunks` is whatever the event
   // replay reconstructed for this messageId, and drainTurn picks up the
   // text accumulator and tool index from there.
-  const streamingMessageIdRef = useRef<string | null>(null);
   const attachResume = useCallback(
-    (messageId: string, afterSeq: number, seedChunks: StreamChunk[]) => {
-      setStreamingChunks(seedChunks);
+    (
+      messageId: string,
+      afterSeq: number,
+      seedChunks: StreamChunk[],
+      retainedRenderKey?: string,
+    ) => {
       setStreaming(true);
+      liveLastSeqRef.current = afterSeq;
+      const renderKey = retainedRenderKey ?? messageId;
+      liveRenderKeyRef.current = renderKey;
+      setLiveRow({
+        renderKey,
+        messageId,
+        parentId: activeLeafRef.current ?? tipIdRef.current,
+        chunks: seedChunks,
+      });
       const ac = new AbortController();
       abortRef.current = ac;
       streamingMessageIdRef.current = messageId;
@@ -1507,18 +1869,60 @@ function Chat({
               chatId,
               messageId,
               afterSeq,
+              includeDebug: showDebugRef.current,
               onEvent,
               signal: ac.signal,
             });
           });
         } finally {
           if (abortRef.current === ac) abortRef.current = null;
-          setStreaming(false);
+          if (!detachedControllersRef.current.has(ac)) setStreaming(false);
         }
       })();
     },
     [chatId, instanceId, drainTurn],
   );
+
+  useEffect(() => {
+    if (!streamingRef.current) return;
+    if (!visible) {
+      const messageId = streamingMessageIdRef.current;
+      const ac = abortRef.current;
+      if (!messageId || !ac) return;
+      detachedControllersRef.current.add(ac);
+      detachedTurnRef.current = {
+        messageId,
+        lastSeq: liveLastSeqRef.current,
+        renderKey: liveRenderKeyRef.current ?? messageId,
+      };
+      ac.abort();
+      return;
+    }
+
+    const detached = detachedTurnRef.current;
+    if (!detached) return;
+    let cancelled = false;
+    let retryFrame: number | null = null;
+    const resumeWhenReleased = () => {
+      if (cancelled) return;
+      if (abortRef.current) {
+        retryFrame = requestAnimationFrame(resumeWhenReleased);
+        return;
+      }
+      detachedTurnRef.current = null;
+      attachResume(
+        detached.messageId,
+        detached.lastSeq,
+        [...liveChunksRef.current],
+        detached.renderKey,
+      );
+    };
+    resumeWhenReleased();
+    return () => {
+      cancelled = true;
+      if (retryFrame !== null) cancelAnimationFrame(retryFrame);
+    };
+  }, [attachResume, chatId, instanceId, liveRow?.messageId, streaming, visible]);
 
   // Fire the initial-message send exactly once per (chatId, initialMessage).
   // The new-chat flow passes a message typed in the empty-state pane.
@@ -1544,15 +1948,16 @@ function Chat({
     if (creationErrorFiredRef.current === creationError) return;
     creationErrorFiredRef.current = creationError;
     setStreaming(false);
-    const errMsg: ChatMessage = {
+    const errMsg: TranscriptMessage = {
       id: `creation-error-${crypto.randomUUID()}`,
       chatId,
       role: "assistant",
       parentId: activeLeafRef.current,
       content: `Error: ${creationError}`,
       createdAt: new Date(),
+      version: null,
     };
-    setMessages((prev) => [...prev, errMsg]);
+    setSessionRows((rows) => [...rows, { renderKey: errMsg.id, message: errMsg }]);
     setActiveLeaf(errMsg.id);
   }, [creationError, chatId, setActiveLeaf]);
 
@@ -1563,78 +1968,61 @@ function Chat({
     findChatModel(currentModel)?.provider ??
     chatModels.find((m) => m.id === currentModel)?.provider;
   const sameProviderModels = chatModels.filter((m) => m.provider === currentProvider);
+  const liveAssistantRow = useMemo<LiveAssistantRow | null>(() => {
+    if (!liveRow) return null;
+    return {
+      renderKey: liveRow.renderKey,
+      message: {
+        id: liveRow.messageId ?? liveRow.renderKey,
+        chatId,
+        role: "assistant",
+        parentId: liveRow.parentId,
+        content: "",
+        createdAt: new Date(0),
+        version: null,
+      },
+      chunks: hotSwitchLiveChunks ?? liveRow.chunks,
+      streaming,
+    };
+  }, [chatId, hotSwitchLiveChunks, liveRow, streaming]);
 
   return (
     <div className="relative h-full bg-background">
       <div
         ref={scrollContainerRef}
+        data-chat-scroll
         onScroll={handleScroll}
+        onWheel={handleUserScrollIntent}
+        onTouchMove={handleUserScrollIntent}
+        onPointerDown={handlePointerScrollIntent}
         className="h-full overflow-y-auto pt-16 flex flex-col gap-4 items-center"
       >
         <div
           className="w-full max-w-3xl px-4 flex flex-col gap-4"
           style={{ paddingBottom: composerHeight + 16 }}
         >
-          {thread.path.map((msg, i) => {
-            const version = thread.versions.get(msg.id);
-            // User rows are keyed by PATH POSITION, not message id: pressing
-            // ‹/› swaps in a sibling version at the same position, and an
-            // id key would remount the row, re-running the pencil's
-            // hover-reveal fade (a visible flicker) and dropping the pager
-            // button's focus/hover state on every press. Position keys keep
-            // the DOM node alive across the swap. The path never reorders
-            // (it only grows or swaps a suffix), so positions are stable.
-            // Assistant rows keep id keys so their tool-call cards remount
-            // with fresh collapse state when the branch switches.
-            return (
-              <MessageRow
-                key={msg.role === "user" ? `user-pos-${i}` : msg.id}
-                msg={msg}
-                instanceId={instanceId}
-                chunks={messageChunks[msg.id]}
-                showDebug={showDebug}
-                userFontFamily={userFontFamily}
-                agentFontFamily={agentFontFamily}
-                versionIndex={version?.index ?? 0}
-                versionCount={version?.count ?? 0}
-                isEditing={editingId === msg.id}
-                actionsDisabled={streaming}
-                onStartEdit={handleStartEdit}
-                onCancelEdit={handleCancelEdit}
-                onSubmitEdit={handleSubmitEdit}
-                onNavigateVersion={handleNavigateVersion}
-              />
-            );
-          })}
-          {streamingChunks.length > 0 && (
-            <div className="flex justify-start">
-              <div
-                className="w-full pr-12 text-[15px] leading-relaxed text-foreground break-words"
-                style={{ fontFamily: agentFontFamily }}
-              >
-                <StreamView chunks={streamingChunks} showDebug={showDebug} />
-                <span className="inline-block w-1 h-4 ml-0.5 bg-muted-foreground animate-pulse align-text-bottom" />
-              </div>
-            </div>
-          )}
-          {streaming && streamingChunks.length === 0 && (
-            <div className="flex justify-start">
-              <span className="flex gap-1 py-2">
-                <span
-                  className="w-1.5 h-1.5 bg-muted-foreground rounded-full animate-bounce"
-                  style={{ animationDelay: "0ms" }}
-                />
-                <span
-                  className="w-1.5 h-1.5 bg-muted-foreground rounded-full animate-bounce"
-                  style={{ animationDelay: "150ms" }}
-                />
-                <span
-                  className="w-1.5 h-1.5 bg-muted-foreground rounded-full animate-bounce"
-                  style={{ animationDelay: "300ms" }}
-                />
-              </span>
-            </div>
-          )}
+          <MessageHistory
+            ref={messageHistoryRef}
+            instanceId={instanceId}
+            pages={historyPages}
+            sessionRows={sessionRows}
+            live={liveAssistantRow}
+            scrollElementRef={scrollContainerRef}
+            showDebug={showDebug}
+            userFontFamily={userFontFamily}
+            agentFontFamily={agentFontFamily}
+            editingId={editingId}
+            actionsDisabled={streaming || navigatingBranch}
+            visible={visible}
+            hasOlder={hasOlder && !streaming && !navigatingBranch}
+            onStartEdit={handleStartEdit}
+            onCancelEdit={handleCancelEdit}
+            onSubmitEdit={handleSubmitEdit}
+            onNavigateVersion={handleNavigateVersion}
+            onRequestToolDetails={loadToolDetails}
+            onLoadOlder={loadOlderMessages}
+            onLayoutChange={scrollToBottom}
+          />
           <div ref={bottomRef} />
         </div>
       </div>

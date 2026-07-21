@@ -216,6 +216,10 @@ export const chats = sqliteTable("chats", {
   // session the next turn continues). Null on legacy rows, resolved to the
   // newest message at read time, which reproduces the old linear behavior.
   activeLeafId: text("active_leaf_id"),
+  // Reserved assistant message for the one currently-running turn. This is a
+  // direct O(1) hydration pointer and survives a server crash. It is cleared
+  // when the producer settles normally.
+  inFlightMessageId: text("in_flight_message_id"),
   createdAt: integer("created_at", { mode: "timestamp" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -321,6 +325,24 @@ export const chatEvents = sqliteTable("chat_events", {
     .$defaultFn(() => new Date()),
 });
 
+// Pre-folded display chunks for completed assistant messages. Pure-text turns
+// store an empty sentinel because chat_messages.content is already their most
+// compact representation. Keeping this separate prevents large render payloads
+// from leaking into the bounded transcript query.
+export const chatMessageRenders = sqliteTable(
+  "chat_message_renders",
+  {
+    messageId: text("message_id").primaryKey(),
+    chatId: text("chat_id").notNull(),
+    // Normal mode omits reasoning/raw payloads so the common path never reads
+    // or parses potentially huge provider-debug objects.
+    chunks: text("chunks").notNull(),
+    debugChunks: text("debug_chunks").notNull(),
+    previewChunks: text("preview_chunks").notNull(),
+  },
+  (table) => [index("idx_chat_message_renders_chat").on(table.chatId)],
+);
+
 // Raw usage event log: one append-only row per metrics event, the sole source
 // of truth for everything on the Usage page. The per-chat columns above hold
 // only the *current* cumulative total, so they can't answer "how much did I
@@ -405,6 +427,8 @@ export type ChatEvent = typeof chatEvents.$inferSelect;
 export type NewChatEvent = typeof chatEvents.$inferInsert;
 export type UploadRow = typeof uploads.$inferSelect;
 export type NewUploadRow = typeof uploads.$inferInsert;
+export type ChatMessageRender = typeof chatMessageRenders.$inferSelect;
+export type NewChatMessageRender = typeof chatMessageRenders.$inferInsert;
 export type UsageEvent = typeof usageEvents.$inferSelect;
 export type NewUsageEvent = typeof usageEvents.$inferInsert;
 export type AppStateRow = typeof appState.$inferSelect;

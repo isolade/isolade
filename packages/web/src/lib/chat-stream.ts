@@ -1,6 +1,12 @@
 import { parseSse, type SseEvent } from "@isolade/shared";
 import { apiFetch } from "./api";
-import { type ChatMessage, chatMessageSchema, errorResponseSchema } from "./contracts";
+import {
+  type ChatMessage,
+  type ChatResumeSnapshot,
+  chatMessageSchema,
+  chatResumeSnapshotSchema,
+  errorResponseSchema,
+} from "./contracts";
 
 // Logical events the chat client cares about, decoded from the raw SSE
 // frames. `done`/`error` are terminal. Once one fires, the caller's
@@ -11,6 +17,7 @@ import { type ChatMessage, chatMessageSchema, errorResponseSchema } from "./cont
 export type ChatTurnEvent =
   | { kind: "message_id"; messageId: string }
   | { kind: "user_message"; message: ChatMessage }
+  | { kind: "snapshot"; snapshot: ChatResumeSnapshot }
   | { kind: "event"; type: string; payload: unknown; seq: number }
   | { kind: "done" }
   | { kind: "error"; message: string };
@@ -27,6 +34,7 @@ export interface RunChatTurnOptions {
   // the content as a sibling version and recomputes the answer from that
   // point (same SSE stream shape as a normal send).
   editMessageId?: string;
+  includeDebug?: boolean;
   // Caller-visible hook fired once per logical event. `seq` is the
   // server-assigned monotonic number. The caller should ignore events
   // with seq <= the last applied one (the reconnect path passes
@@ -123,6 +131,12 @@ async function streamFromResponse(
       onEvent(decoded);
       continue;
     }
+    if (decoded.kind === "snapshot") {
+      messageId = decoded.snapshot.messageId;
+      lastSeq = decoded.snapshot.lastSeq;
+      onEvent(decoded);
+      continue;
+    }
     if (decoded.kind === "event") {
       if (decoded.seq > lastSeq) lastSeq = decoded.seq;
       onEvent(decoded);
@@ -168,6 +182,14 @@ function decodeSseEvent(ev: SseEvent): ChatTurnEvent | null {
       return null;
     }
   }
+  if (ev.event === "snapshot") {
+    try {
+      return { kind: "snapshot", snapshot: chatResumeSnapshotSchema.parse(JSON.parse(ev.data)) };
+    } catch (err) {
+      console.warn("[chat] unparseable resume snapshot, ignoring:", err);
+      return null;
+    }
+  }
   if (ev.event === "done") return { kind: "done" };
   if (ev.event === "error") return { kind: "error", message: ev.data };
   let payload: unknown;
@@ -207,7 +229,8 @@ export async function runChatTurn(opts: RunChatTurnOptions): Promise<void> {
   // since those aren't recoverable so we don't waste retries.
   const post = async (): Promise<Response> => {
     const base = `${opts.apiBase}/api/instances/${opts.instanceId}/chats/${opts.chatId}/messages`;
-    const url = opts.editMessageId ? `${base}/${opts.editMessageId}/edit` : base;
+    const path = opts.editMessageId ? `${base}/${opts.editMessageId}/edit` : base;
+    const url = opts.includeDebug ? `${path}?debug=1` : path;
     const resp = await apiFetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -221,10 +244,11 @@ export async function runChatTurn(opts: RunChatTurnOptions): Promise<void> {
     return resp;
   };
 
-  const resume = async (mid: string, afterSeq: number): Promise<Response> => {
-    const qs = `?afterSeq=${encodeURIComponent(String(afterSeq))}`;
+  const resume = async (mid: string): Promise<Response> => {
+    const qs = new URLSearchParams();
+    if (opts.includeDebug) qs.set("debug", "1");
     const resp = await apiFetch(
-      `${opts.apiBase}/api/instances/${opts.instanceId}/chats/${opts.chatId}/messages/${mid}/stream${qs}`,
+      `${opts.apiBase}/api/instances/${opts.instanceId}/chats/${opts.chatId}/messages/${mid}/stream?${qs}`,
       { signal: opts.signal },
     );
     if (!resp.ok) {
@@ -248,7 +272,7 @@ export async function runChatTurn(opts: RunChatTurnOptions): Promise<void> {
       if (messageId === null) {
         resp = await post();
       } else {
-        resp = await resume(messageId, lastSeq);
+        resp = await resume(messageId);
       }
     } catch (err) {
       // Couldn't even open the connection. If we have a messageId,
@@ -366,6 +390,7 @@ export interface ResumeChatTurnOptions {
   chatId: string;
   messageId: string;
   afterSeq: number;
+  includeDebug?: boolean;
   onEvent: (event: ChatTurnEvent) => void;
   signal: AbortSignal;
   maxRetries?: number;
@@ -391,7 +416,7 @@ export async function resumeChatTurn(opts: ResumeChatTurnOptions): Promise<void>
     let resp: Response;
     try {
       resp = await apiFetch(
-        `${opts.apiBase}/api/instances/${opts.instanceId}/chats/${opts.chatId}/messages/${opts.messageId}/stream?afterSeq=${encodeURIComponent(String(lastSeq))}`,
+        `${opts.apiBase}/api/instances/${opts.instanceId}/chats/${opts.chatId}/messages/${opts.messageId}/stream?debug=${opts.includeDebug ? "1" : "0"}`,
         { signal: opts.signal },
       );
     } catch (err) {

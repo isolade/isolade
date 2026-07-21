@@ -163,12 +163,20 @@ export class UploadStore {
 
   // Uploads for every message of a chat, grouped by messageId, so a transcript
   // fetch can decorate its messages in one query instead of N.
-  byMessageForChat(chatId: string): Map<string, Upload[]> {
+  byMessageForChat(chatId: string, messageIds?: string[]): Map<string, Upload[]> {
+    if (messageIds?.length === 0) return new Map();
     const rows = this.db
       .select({ association: schema.messageUploads, upload: schema.uploads })
       .from(schema.messageUploads)
       .innerJoin(schema.uploads, eq(schema.messageUploads.uploadId, schema.uploads.id))
-      .where(eq(schema.messageUploads.chatId, chatId))
+      .where(
+        messageIds
+          ? and(
+              eq(schema.messageUploads.chatId, chatId),
+              inArray(schema.messageUploads.messageId, messageIds),
+            )
+          : eq(schema.messageUploads.chatId, chatId),
+      )
       .orderBy(asc(schema.messageUploads.position))
       .all();
     const map = new Map<string, Upload[]>();

@@ -1,14 +1,22 @@
 import { randomUUID } from "crypto";
-import { and, asc, desc, eq, gt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import { effectiveInputTokens, pricingFor } from "./chat/subscription-share";
 import type {
   AggregateTotals,
   AggregateTotalsBucket,
   ChatEffort,
   ChatProvider,
+  ChatRenderChunk,
+  ChatResumeSnapshot,
+  ChatViewPage,
   UsageDay,
 } from "./contracts";
-import { localDay, resolveEffort } from "./contracts";
+import {
+  boundChatRenderChunks,
+  compactChatRenderEvents,
+  localDay,
+  resolveEffort,
+} from "./contracts";
 import type { Db } from "./db";
 import { schema } from "./db";
 import type { ChatMessage, Chat as ChatRow } from "./db/schema";
@@ -65,6 +73,7 @@ export class ChatManager {
 
   remove(id: string) {
     this.db.delete(schema.chatEvents).where(eq(schema.chatEvents.chatId, id)).run();
+    this.db.delete(schema.chatMessageRenders).where(eq(schema.chatMessageRenders.chatId, id)).run();
     this.db.delete(schema.chatMessages).where(eq(schema.chatMessages.chatId, id)).run();
     this.db.delete(schema.chats).where(eq(schema.chats.id, id)).run();
   }
@@ -119,6 +128,140 @@ export class ChatManager {
       .where(eq(schema.chatMessages.chatId, chatId))
       .orderBy(asc(sql`rowid`))
       .all();
+  }
+
+  // Return a bounded slice of the active root-to-tip path. Walking indexed
+  // parent links caps DB and JS work at limit + 1 rows, unlike the legacy API
+  // that materializes every body and branch before the client can paint.
+  getTranscriptPage(chatId: string, before: string | null, limit: number) {
+    let current: ChatMessage | undefined;
+    if (before) {
+      const cursor = this.getMessage(before);
+      if (!cursor || cursor.chatId !== chatId) {
+        current = this.resolveTip(chatId);
+      } else {
+        current = cursor.parentId ? this.getMessage(cursor.parentId) : undefined;
+      }
+    } else {
+      current = this.resolveTip(chatId);
+    }
+
+    const newestFirst: ChatMessage[] = [];
+    const seen = new Set<string>();
+    while (current && newestFirst.length <= limit) {
+      if (seen.has(current.id)) break;
+      seen.add(current.id);
+      if (current.chatId !== chatId) break;
+      newestFirst.push(current);
+      current = current.parentId ? this.getMessage(current.parentId) : undefined;
+    }
+    const hasMore = newestFirst.length > limit;
+    const rows = newestFirst.slice(0, limit).reverse();
+    if (rows.length === 0) return { messages: [], hasMore };
+    // Version metadata stays bounded even if one prompt has been edited many
+    // thousands of times. Correlated indexed lookups return only count,
+    // position, and the two neighbors needed by the pager.
+    const versionRows = this.db
+      .select({
+        id: schema.chatMessages.id,
+        count: sql<number>`(
+          SELECT count(*) FROM chat_messages AS sibling
+          WHERE sibling.chat_id = "chat_messages"."chat_id"
+            AND sibling.role = "chat_messages"."role"
+            AND sibling.parent_id IS "chat_messages"."parent_id"
+        )`,
+        index: sql<number>`(
+          SELECT count(*) FROM chat_messages AS sibling
+          WHERE sibling.chat_id = "chat_messages"."chat_id"
+            AND sibling.role = "chat_messages"."role"
+            AND sibling.parent_id IS "chat_messages"."parent_id"
+            AND sibling.rowid <= chat_messages.rowid
+        )`,
+        previousId: sql<string | null>`(
+          SELECT sibling.id FROM chat_messages AS sibling
+          WHERE sibling.chat_id = "chat_messages"."chat_id"
+            AND sibling.role = "chat_messages"."role"
+            AND sibling.parent_id IS "chat_messages"."parent_id"
+            AND sibling.rowid < chat_messages.rowid
+          ORDER BY sibling.rowid DESC LIMIT 1
+        )`,
+        nextId: sql<string | null>`(
+          SELECT sibling.id FROM chat_messages AS sibling
+          WHERE sibling.chat_id = "chat_messages"."chat_id"
+            AND sibling.role = "chat_messages"."role"
+            AND sibling.parent_id IS "chat_messages"."parent_id"
+            AND sibling.rowid > chat_messages.rowid
+          ORDER BY sibling.rowid ASC LIMIT 1
+        )`,
+      })
+      .from(schema.chatMessages)
+      .where(
+        and(
+          eq(schema.chatMessages.chatId, chatId),
+          inArray(
+            schema.chatMessages.id,
+            rows.map((row) => row.id),
+          ),
+        ),
+      )
+      .all();
+    const versions = new Map(versionRows.map((row) => [row.id, row]));
+    const messages = rows.map((row) => {
+      const version = versions.get(row.id);
+      return {
+        ...row,
+        version:
+          version && version.count > 1
+            ? {
+                index: version.index,
+                count: version.count,
+                previousId: version.previousId,
+                nextId: version.nextId,
+              }
+            : null,
+      };
+    });
+    return { messages, hasMore };
+  }
+
+  // One coherent read for a cold chat or an older page. Bun's SQLite driver
+  // is synchronous, so every helper call below executes on the same
+  // connection while this transaction is open. A finalizing turn can be
+  // observed either before or after commit, never as a transcript/in-flight
+  // mixture assembled from different database snapshots.
+  getChatViewPage(
+    chatId: string,
+    before: string | null,
+    limit: number,
+    options: {
+      inFlightSnapshot?: NonNullable<ChatViewPage["inFlight"]>;
+    } = {},
+  ): ChatViewPage {
+    return this.db.transaction(() => {
+      const page = this.getTranscriptPage(chatId, before, limit);
+      const assistantIds = page.messages
+        .filter((message) => message.role === "assistant")
+        .map((message) => message.id);
+      const chunksByMessage = this.getMessageRenderChunks(chatId, assistantIds, false, true);
+      const turn =
+        before === null && !options.inFlightSnapshot
+          ? this.readInFlightEvents(chatId, false)
+          : null;
+      const inFlight =
+        options.inFlightSnapshot ??
+        (turn
+          ? {
+              messageId: turn.messageId,
+              lastSeq: turn.lastSeq,
+              chunks: boundChatRenderChunks(compactChatRenderEvents(turn.events)),
+            }
+          : null);
+      return {
+        ...page,
+        chunksByMessage,
+        inFlight,
+      };
+    });
   }
 
   // Stamp the provider-session snapshot onto an assistant row after (or
@@ -285,6 +428,499 @@ export class ChatManager {
       .where(and(eq(schema.chatEvents.messageId, messageId), gt(schema.chatEvents.seq, afterSeq)))
       .orderBy(asc(schema.chatEvents.seq))
       .all();
+  }
+
+  // Batch history lookup for just the assistant rows in a bounded page.
+  // The composite chat/message/seq index makes this independent of the rest
+  // of the transcript's event volume.
+  getEventsForMessages(chatId: string, messageIds: string[], includeDebug = true) {
+    if (messageIds.length === 0) return [];
+    const renderTypes = [
+      "delta",
+      "tool_call_start",
+      "tool_call_input",
+      "tool_call_result",
+      "api_retry",
+      ...(includeDebug ? ["thinking", "raw"] : []),
+    ];
+    return this.db
+      .select()
+      .from(schema.chatEvents)
+      .where(
+        and(
+          eq(schema.chatEvents.chatId, chatId),
+          inArray(schema.chatEvents.messageId, messageIds),
+          inArray(schema.chatEvents.type, renderTypes),
+        ),
+      )
+      .orderBy(asc(schema.chatEvents.messageId), asc(schema.chatEvents.seq))
+      .all();
+  }
+
+  // Validate client-supplied ids before reading or populating
+  // the render cache. A render row is meaningful only for an assistant
+  // message owned by this chat.
+  getAssistantMessageIds(chatId: string, messageIds: string[]) {
+    if (messageIds.length === 0) return [];
+    return this.db
+      .select({ id: schema.chatMessages.id })
+      .from(schema.chatMessages)
+      .where(
+        and(
+          eq(schema.chatMessages.chatId, chatId),
+          eq(schema.chatMessages.role, "assistant"),
+          inArray(schema.chatMessages.id, messageIds),
+        ),
+      )
+      .all()
+      .map((row) => row.id);
+  }
+
+  // Identify turns that need more than their final Markdown body. This first
+  // pass selects no payloads, so the common pure-text turn never allocates or
+  // JSON-parses its potentially thousands of persisted delta rows.
+  getRenderableEventMessageIds(chatId: string, messageIds: string[], includeDebug: boolean) {
+    if (messageIds.length === 0) return [];
+    const structuralTypes = [
+      "tool_call_start",
+      "tool_call_input",
+      "tool_call_result",
+      "api_retry",
+      ...(includeDebug ? ["thinking", "raw"] : []),
+    ];
+    return this.db
+      .select({ messageId: schema.chatEvents.messageId })
+      .from(schema.chatEvents)
+      .where(
+        and(
+          eq(schema.chatEvents.chatId, chatId),
+          inArray(schema.chatEvents.messageId, messageIds),
+          inArray(schema.chatEvents.type, structuralTypes),
+        ),
+      )
+      .groupBy(schema.chatEvents.messageId)
+      .all()
+      .map((row) => row.messageId);
+  }
+
+  beginInFlightTurn(chatId: string, messageId: string) {
+    this.db.transaction((tx) => {
+      tx.update(schema.chats)
+        .set({ inFlightMessageId: messageId })
+        .where(eq(schema.chats.id, chatId))
+        .run();
+      tx.insert(schema.chatEvents)
+        .values({
+          id: randomUUID(),
+          chatId,
+          messageId,
+          seq: -1,
+          type: "turn_started",
+          payload: "null",
+        })
+        .run();
+    });
+  }
+
+  beginTurn(
+    chatId: string,
+    assistantMessageId: string,
+    content: string,
+    parentId: string | null,
+  ): ChatMessage {
+    return this.db.transaction(() => {
+      const userMessage = this.addMessage(chatId, "user", content, { parentId });
+      this.db
+        .update(schema.chats)
+        .set({ activeLeafId: userMessage.id, inFlightMessageId: assistantMessageId })
+        .where(eq(schema.chats.id, chatId))
+        .run();
+      this.db
+        .insert(schema.chatEvents)
+        .values({
+          id: randomUUID(),
+          chatId,
+          messageId: assistantMessageId,
+          seq: -1,
+          type: "turn_started",
+          payload: "null",
+        })
+        .run();
+      return userMessage;
+    });
+  }
+
+  finalizeTurn(
+    chatId: string,
+    messageId: string,
+    content: string,
+    meta: MessageMeta,
+    chunks: ChatRenderChunk[],
+  ): ChatMessage | null {
+    return this.db.transaction(() => {
+      const owner = this.db
+        .select({ id: schema.chats.id })
+        .from(schema.chats)
+        .where(and(eq(schema.chats.id, chatId), eq(schema.chats.inFlightMessageId, messageId)))
+        .get();
+      if (!owner) return null;
+      const message = this.addMessageWithId(chatId, messageId, "assistant", content, meta);
+      this.saveMessageRender(chatId, messageId, chunks);
+      this.db
+        .update(schema.chats)
+        .set({ activeLeafId: messageId, inFlightMessageId: null })
+        .where(and(eq(schema.chats.id, chatId), eq(schema.chats.inFlightMessageId, messageId)))
+        .run();
+      return message;
+    });
+  }
+
+  inFlightMessageId(chatId: string): string | null {
+    return (
+      this.db
+        .select({ messageId: schema.chats.inFlightMessageId })
+        .from(schema.chats)
+        .where(eq(schema.chats.id, chatId))
+        .get()?.messageId ?? null
+    );
+  }
+
+  clearInFlightTurn(chatId: string, messageId: string) {
+    this.db
+      .update(schema.chats)
+      .set({ inFlightMessageId: null })
+      .where(and(eq(schema.chats.id, chatId), eq(schema.chats.inFlightMessageId, messageId)))
+      .run();
+  }
+
+  saveMessageRender(chatId: string, messageId: string, chunks: ChatRenderChunk[]) {
+    const storedChunks = chunks.some((chunk) => chunk.kind !== "text") ? chunks : [];
+    const normalChunks = storedChunks.filter(
+      (chunk) => chunk.kind !== "thinking" && chunk.kind !== "raw",
+    );
+    const previewChunks = boundChatRenderChunks(normalChunks);
+    this.db
+      .insert(schema.chatMessageRenders)
+      .values({
+        chatId,
+        messageId,
+        chunks: JSON.stringify(normalChunks),
+        debugChunks: JSON.stringify(storedChunks),
+        previewChunks: JSON.stringify(previewChunks),
+      })
+      .onConflictDoUpdate({
+        target: schema.chatMessageRenders.messageId,
+        set: {
+          chatId,
+          chunks: JSON.stringify(normalChunks),
+          debugChunks: JSON.stringify(storedChunks),
+          previewChunks: JSON.stringify(previewChunks),
+        },
+      })
+      .run();
+  }
+
+  getMessageRenders(chatId: string, messageIds: string[]) {
+    if (messageIds.length === 0) return [];
+    return this.db
+      .select()
+      .from(schema.chatMessageRenders)
+      .where(
+        and(
+          eq(schema.chatMessageRenders.chatId, chatId),
+          inArray(schema.chatMessageRenders.messageId, messageIds),
+        ),
+      )
+      .all();
+  }
+
+  private getMessageRenderProjections(
+    chatId: string,
+    messageIds: string[],
+    includeDebug: boolean,
+    bounded: boolean,
+  ) {
+    if (messageIds.length === 0) return [];
+    const projection = bounded
+      ? schema.chatMessageRenders.previewChunks
+      : includeDebug
+        ? schema.chatMessageRenders.debugChunks
+        : schema.chatMessageRenders.chunks;
+    return this.db
+      .select({ messageId: schema.chatMessageRenders.messageId, chunks: projection })
+      .from(schema.chatMessageRenders)
+      .where(
+        and(
+          eq(schema.chatMessageRenders.chatId, chatId),
+          inArray(schema.chatMessageRenders.messageId, messageIds),
+        ),
+      )
+      .all();
+  }
+
+  // Resolve compact semantic renders for a bounded set of assistant rows.
+  // Missing legacy projections are folded and cached once. `bounded` keeps
+  // provider-controlled tool payloads out of cold pages while the focused
+  // render endpoint continues to return the full compatible chunk shape.
+  getMessageRenderChunks(
+    chatId: string,
+    messageIds: string[],
+    includeDebug: boolean,
+    bounded: boolean,
+  ): Record<string, ChatRenderChunk[]> {
+    if (messageIds.length === 0) return {};
+    const uniqueIds = [...new Set(messageIds)].slice(0, 100);
+    const validIds = this.getAssistantMessageIds(chatId, uniqueIds);
+    const valid = new Set(validIds);
+    const cached = new Map<string, ChatRenderChunk[]>();
+    for (const row of this.getMessageRenderProjections(chatId, validIds, includeDebug, bounded)) {
+      try {
+        cached.set(row.messageId, JSON.parse(row.chunks));
+      } catch (error) {
+        console.warn(`[chat] corrupt render cache (chat=${chatId} msg=${row.messageId}):`, error);
+      }
+    }
+
+    // Preview rows written before collapsed tool summaries were stored may
+    // contain only a serialized, truncated input. Lazily rebuild just those
+    // messages from their full compact projection, then heal the cache. This
+    // avoids a startup migration over every historical tool payload.
+    if (bounded) {
+      const stalePreviewIds = [...cached]
+        .filter(([, chunks]) =>
+          chunks.some((chunk) => chunk.kind === "tool" && chunk.summary === undefined),
+        )
+        .map(([messageId]) => messageId);
+      for (const row of this.getMessageRenders(chatId, stalePreviewIds)) {
+        try {
+          const full = JSON.parse(row.chunks) as ChatRenderChunk[];
+          const preview = boundChatRenderChunks(full);
+          cached.set(row.messageId, preview);
+          this.db
+            .update(schema.chatMessageRenders)
+            .set({ previewChunks: JSON.stringify(preview) })
+            .where(eq(schema.chatMessageRenders.messageId, row.messageId))
+            .run();
+        } catch (error) {
+          console.warn(
+            `[chat] corrupt full render cache (chat=${chatId} msg=${row.messageId}):`,
+            error,
+          );
+        }
+      }
+    }
+
+    const uncachedIds = validIds.filter((messageId) => !cached.has(messageId));
+    // Always detect debug-only structure while doing the one-time legacy fold,
+    // then persist both full and normal projections together.
+    const renderableIds = this.getRenderableEventMessageIds(chatId, uncachedIds, true);
+    const renderable = new Set(renderableIds);
+    const grouped = new Map<string, ReturnType<ChatManager["getEventsForMessages"]>>();
+    for (const event of this.getEventsForMessages(chatId, renderableIds, true)) {
+      const events = grouped.get(event.messageId) ?? [];
+      events.push(event);
+      grouped.set(event.messageId, events);
+    }
+    for (const messageId of renderableIds) {
+      const compacted = compactChatRenderEvents(grouped.get(messageId) ?? []);
+      this.saveMessageRender(chatId, messageId, compacted);
+      cached.set(
+        messageId,
+        includeDebug
+          ? compacted
+          : compacted.filter((chunk) => chunk.kind !== "thinking" && chunk.kind !== "raw"),
+      );
+    }
+    for (const messageId of uncachedIds) {
+      if (renderable.has(messageId)) continue;
+      this.saveMessageRender(chatId, messageId, []);
+      cached.set(messageId, []);
+    }
+
+    const result: Record<string, ChatRenderChunk[]> = {};
+    for (const messageId of uniqueIds) {
+      if (!valid.has(messageId)) continue;
+      const compacted = cached.get(messageId) ?? [];
+      const visible = includeDebug
+        ? compacted
+        : compacted.filter((chunk) => chunk.kind !== "thinking" && chunk.kind !== "raw");
+      const structural = visible.some((chunk) => chunk.kind !== "text") ? visible : [];
+      result[messageId] = bounded ? boundChatRenderChunks(structural) : structural;
+    }
+    return result;
+  }
+
+  // The chat row points directly at the reserved assistant id, so this lookup
+  // is independent of both committed history size and stale orphan events.
+  getInFlightEvents(chatId: string, includeDebug = true) {
+    return this.db.transaction(() => this.readInFlightEvents(chatId, includeDebug));
+  }
+
+  private readInFlightEvents(chatId: string, includeDebug: boolean) {
+    const messageId = this.db
+      .select({ messageId: schema.chats.inFlightMessageId })
+      .from(schema.chats)
+      .where(eq(schema.chats.id, chatId))
+      .get()?.messageId;
+    if (!messageId) return null;
+    const committed = this.db
+      .select({ id: schema.chatMessages.id })
+      .from(schema.chatMessages)
+      .where(and(eq(schema.chatMessages.chatId, chatId), eq(schema.chatMessages.id, messageId)))
+      .get();
+    if (committed) return null;
+    const last = this.db
+      .select({ seq: schema.chatEvents.seq })
+      .from(schema.chatEvents)
+      .where(and(eq(schema.chatEvents.chatId, chatId), eq(schema.chatEvents.messageId, messageId)))
+      .orderBy(desc(schema.chatEvents.seq))
+      .limit(1)
+      .get();
+    if (!last) return null;
+    const renderTypes = [
+      "delta",
+      "tool_call_start",
+      "tool_call_input",
+      "tool_call_result",
+      "api_retry",
+      ...(includeDebug ? ["thinking", "raw"] : []),
+    ];
+    const events = this.db
+      .select()
+      .from(schema.chatEvents)
+      .where(
+        and(
+          eq(schema.chatEvents.chatId, chatId),
+          eq(schema.chatEvents.messageId, messageId),
+          inArray(schema.chatEvents.type, renderTypes),
+        ),
+      )
+      .orderBy(asc(schema.chatEvents.seq))
+      .all();
+    return { messageId, lastSeq: last.seq, events };
+  }
+
+  // Terminal resume fallback after a settled turn has left the in-memory
+  // hub, or after a server restart killed a producer. It returns one bounded
+  // semantic snapshot plus the canonical message. A dead pre-commit turn is
+  // materialized once so future hydration no longer rediscovers its marker.
+  getPersistedResumeSnapshot(
+    chatId: string,
+    messageId: string,
+    includeDebug: boolean,
+  ): ChatResumeSnapshot | null {
+    return this.db.transaction(() => {
+      let message = this.db
+        .select()
+        .from(schema.chatMessages)
+        .where(and(eq(schema.chatMessages.chatId, chatId), eq(schema.chatMessages.id, messageId)))
+        .get();
+      const interrupted = !message;
+      let lastSeq = -1;
+      let recoveryEvents: ReturnType<ChatManager["getEventsForMessage"]> = [];
+      let metaRows: Array<{ seq: number; type: string; payload: string }> = [];
+
+      if (interrupted) {
+        // A server restart killed the producer before it could commit. This is
+        // the only path that needs the raw deltas to materialize a partial
+        // assistant row. Normal completed resumes below stay O(render size).
+        recoveryEvents = this.getEventsForMessage(messageId, -2).filter(
+          (event) => event.chatId === chatId,
+        );
+        if (recoveryEvents.length === 0) return null;
+        lastSeq = recoveryEvents.at(-1)?.seq ?? -1;
+        const latest = new Map<string, (typeof recoveryEvents)[number]>();
+        for (const event of recoveryEvents) {
+          if (
+            event.type === "usage" ||
+            event.type === "title" ||
+            event.type === "context_compacted"
+          ) {
+            latest.set(event.type, event);
+          }
+        }
+        metaRows = [...latest.values()];
+      } else {
+        const last = this.db
+          .select({ seq: schema.chatEvents.seq })
+          .from(schema.chatEvents)
+          .where(
+            and(eq(schema.chatEvents.chatId, chatId), eq(schema.chatEvents.messageId, messageId)),
+          )
+          .orderBy(desc(schema.chatEvents.seq))
+          .limit(1)
+          .get();
+        if (!last) return null;
+        lastSeq = last.seq;
+        for (const type of ["usage", "title", "context_compacted"] as const) {
+          const row = this.db
+            .select({
+              seq: schema.chatEvents.seq,
+              type: schema.chatEvents.type,
+              payload: schema.chatEvents.payload,
+            })
+            .from(schema.chatEvents)
+            .where(
+              and(
+                eq(schema.chatEvents.chatId, chatId),
+                eq(schema.chatEvents.messageId, messageId),
+                eq(schema.chatEvents.type, type),
+              ),
+            )
+            .orderBy(desc(schema.chatEvents.seq))
+            .limit(1)
+            .get();
+          if (row) metaRows.push(row);
+        }
+      }
+
+      if (!message) {
+        let content = "";
+        for (const event of recoveryEvents) {
+          if (event.type !== "delta") continue;
+          try {
+            const text = JSON.parse(event.payload);
+            if (typeof text === "string") content += text;
+          } catch (error) {
+            console.warn(
+              `[chat] recovered delta event has non-JSON payload (chat=${chatId} msg=${messageId} seq=${event.seq}):`,
+              error,
+            );
+          }
+        }
+        const tip = this.resolveTip(chatId);
+        const parentId = tip?.role === "user" ? tip.id : null;
+        message = this.addMessageWithId(chatId, messageId, "assistant", content, { parentId });
+        this.saveMessageRender(chatId, messageId, compactChatRenderEvents(recoveryEvents));
+        if (parentId) this.setActiveLeaf(chatId, messageId);
+        this.clearInFlightTurn(chatId, messageId);
+      }
+
+      const chunks =
+        this.getMessageRenderChunks(chatId, [messageId], includeDebug, true)[messageId] ?? [];
+      const metaEvents = metaRows
+        .map((event) => {
+          let payload: unknown = event.payload;
+          try {
+            payload = JSON.parse(event.payload);
+          } catch {}
+          return {
+            seq: event.seq,
+            type: event.type as "usage" | "title" | "context_compacted",
+            payload,
+          };
+        })
+        .toSorted((a, b) => a.seq - b.seq);
+      return {
+        messageId,
+        lastSeq,
+        chunks,
+        metaEvents,
+        status: interrupted ? "error" : "done",
+        message,
+        ...(interrupted ? { error: "turn ended before completion" } : {}),
+      };
+    });
   }
 
   // `null` clears a session id (the active branch has no known session yet,

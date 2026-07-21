@@ -16,6 +16,8 @@
     "lint:fix": "oxlint --fix",
     "typecheck": "bun run --filter '*' typecheck",
     "test": "bun run --filter '*' test",
+    "test:browser": "bun run --cwd packages/web test:browser",
+    "test:browser:stress": "bun run --cwd packages/web test:browser:stress",
     "bootstrap:microsandbox": "./scripts/bootstrap-microsandbox.sh",
     "seed-usage": "bun run scripts/seed-usage.ts",
     "refresh-catalog": "bun run scripts/refresh-catalog.ts"

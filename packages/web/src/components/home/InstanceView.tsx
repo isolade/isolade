@@ -1,5 +1,5 @@
 import { Bot, Plus, X } from "lucide-react";
-import { useCallback, useLayoutEffect, useState } from "react";
+import { memo, useCallback, useLayoutEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -9,20 +9,16 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import { createChat, deleteChat } from "../../lib/api";
-import type {
-  ChatModelDefinition,
-  Chat as ChatT,
-  Instance,
-  ModelOverrides,
-} from "../../lib/contracts";
+import type { ChatModelDefinition, Chat as ChatT, ModelOverrides } from "../../lib/contracts";
 import { findChatModel, splitModelsByTier } from "../../lib/contracts";
 import Chat from "../Chat";
 
 interface InstanceViewProps {
-  instance: Instance;
+  instanceId: string;
   chats: ChatT[];
   chatModels: ChatModelDefinition[];
   modelOverrides: ModelOverrides;
+  visible: boolean;
   // First message to auto-send when this chat was just created. Keyed by
   // chatId so we only fire it for the right chat tab.
   pendingFirstMessage: { chatId: string; content: string; uploadIds?: string[] } | null;
@@ -32,7 +28,7 @@ interface InstanceViewProps {
   pending: boolean;
   creationError: string | null;
   onTitleAutoUpdated: (instanceId: string, title: string) => void;
-  onResourceChange: () => void;
+  onResourceChange: (instanceId: string) => void;
 }
 
 function chatLabel(chatId: string, chats: ChatT[], chatModels: ChatModelDefinition[]): string {
@@ -43,11 +39,12 @@ function chatLabel(chatId: string, chats: ChatT[], chatModels: ChatModelDefiniti
   return model?.name ?? "Chat";
 }
 
-export default function InstanceView({
-  instance,
+function InstanceView({
+  instanceId,
   chats,
   chatModels,
   modelOverrides,
+  visible,
   pendingFirstMessage,
   pending,
   creationError,
@@ -78,6 +75,7 @@ export default function InstanceView({
         if (bi === -1) return -1;
         return ai - bi;
       });
+      if (next.length === prev.length && next.every((id, index) => id === prev[index])) return prev;
       return next;
     });
     // If we just created the instance, focus the chat the first message will
@@ -90,11 +88,11 @@ export default function InstanceView({
     });
     // We intentionally re-run when chat ids change, not just their count.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [instance.id, chats.map((c) => c.id).join(",")]);
+  }, [instanceId, chats.map((c) => c.id).join(",")]);
 
   const handleAddChat = async (modelId: string) => {
-    const chat = await createChat(instance.id, { model: modelId });
-    onResourceChange();
+    const chat = await createChat(instanceId, { model: modelId });
+    onResourceChange(instanceId);
     setOpenTabs((prev) => [...prev, chat.id]);
     setActiveKey(chat.id);
   };
@@ -107,17 +105,17 @@ export default function InstanceView({
       const fallback = newTabs[idx] ?? newTabs[idx - 1] ?? newTabs[0] ?? null;
       setActiveKey(fallback);
     }
-    await deleteChat(instance.id, chatId).catch(() => {});
-    onResourceChange();
+    await deleteChat(instanceId, chatId).catch(() => {});
+    onResourceChange(instanceId);
   };
 
   // Stable per-instance callback so the memoized Chat tabs don't all re-render
   // on every InstanceView render (e.g. a tab click flipping activeKey). An
-  // inline `(t) => onTitleAutoUpdated(instance.id, t)` would be a fresh
+  // inline `(t) => onTitleAutoUpdated(instanceId, t)` would be a fresh
   // identity each render and defeat the memo.
   const handleTitle = useCallback(
-    (title: string) => onTitleAutoUpdated(instance.id, title),
-    [onTitleAutoUpdated, instance.id],
+    (title: string) => onTitleAutoUpdated(instanceId, title),
+    [onTitleAutoUpdated, instanceId],
   );
 
   const showStrip = openTabs.length > 1;
@@ -251,17 +249,23 @@ export default function InstanceView({
             <div
               key={chat.id}
               className="absolute inset-0"
-              style={{ display: isActive ? "block" : "none" }}
+              aria-hidden={!isActive}
+              inert={!isActive}
+              style={{
+                contain: "strict",
+                opacity: isActive ? 1 : 0,
+                pointerEvents: isActive ? "auto" : "none",
+              }}
             >
               <Chat
-                instanceId={instance.id}
+                instanceId={instanceId}
                 chatId={chat.id}
                 model={chat.model}
                 effort={chat.effort}
                 chat={chat}
                 chatModels={chatModels}
                 modelOverrides={modelOverrides}
-                visible={isActive}
+                visible={visible && isActive}
                 initialMessage={initialMessage}
                 initialUploadIds={initialUploadIds}
                 pending={pending}
@@ -275,3 +279,21 @@ export default function InstanceView({
     </div>
   );
 }
+
+function instanceViewPropsEqual(previous: InstanceViewProps, next: InstanceViewProps): boolean {
+  return (
+    previous.instanceId === next.instanceId &&
+    previous.visible === next.visible &&
+    previous.chatModels === next.chatModels &&
+    previous.modelOverrides === next.modelOverrides &&
+    previous.pendingFirstMessage === next.pendingFirstMessage &&
+    previous.pending === next.pending &&
+    previous.creationError === next.creationError &&
+    previous.onTitleAutoUpdated === next.onTitleAutoUpdated &&
+    previous.onResourceChange === next.onResourceChange &&
+    previous.chats.length === next.chats.length &&
+    previous.chats.every((chat, index) => chat === next.chats[index])
+  );
+}
+
+export default memo(InstanceView, instanceViewPropsEqual);
