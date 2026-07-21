@@ -6,10 +6,11 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
-### Changed
+### Fixed
 
-- Codex chats no longer expose Codex's built-in subagent tools, so a chat can
-  no longer spawn subagents. A custom subagents tool will replace this later.
+- Codex chats no longer unintentionally expose the built-in subagent tools.
+  A custom subagents tool will replace this later.
+- VMs now inherit the host's timezone instead of defaulting to UTC.
 
 ## [0.2.0] - 2026-07-19
 
