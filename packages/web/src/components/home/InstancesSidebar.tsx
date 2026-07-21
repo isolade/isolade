@@ -35,6 +35,14 @@ interface InstancesSidebarProps {
   archivedInstances: Instance[];
   selectedId: string | null;
   isDrafting: boolean;
+  // Top padding (px) that clears the floating window-chrome cluster, which sits
+  // over the sidebar's top-left corner when the sidebar is extended. The strip
+  // it reserves doubles as an OS window-drag surface via `topDrag`.
+  topInset?: number;
+  topDrag?: {
+    onMouseDown: (e: React.MouseEvent) => void;
+    onDoubleClick: (e: React.MouseEvent) => void;
+  };
   onNew: () => void;
   onSelect: (id: string) => void;
   onRename: (id: string) => void;
@@ -140,6 +148,8 @@ export default function InstancesSidebar({
   archivedInstances,
   selectedId,
   isDrafting,
+  topInset = 0,
+  topDrag,
   onNew,
   onSelect,
   onRename,
@@ -200,12 +210,17 @@ export default function InstancesSidebar({
 
   return (
     <aside className="relative flex-shrink-0 flex flex-col min-h-0" style={{ width }}>
-      {/* The title bar and this (transparent) sidebar share the muted chrome
-          colour with no seam, so the New-chat row should sit just below the bar
-          at the same absolute y it had in the old in-sidebar header layout
-          (~1px below the bar). pl-[7px] mirrors the list inset below so the row
-          text lines up with the chat titles. */}
-      <div className="pl-[7px] pr-2 pt-px pb-0.5">
+      {/* Reserves the title-bar row that the floating window-chrome cluster
+          (traffic lights + toggle + gear) sits over at the sidebar's top-left,
+          and doubles as an OS window-drag surface. */}
+      {topInset > 0 && (
+        // eslint-disable-next-line jsx-a11y/no-static-element-interactions
+        <div className="flex-shrink-0 select-none" style={{ height: topInset }} {...topDrag} />
+      )}
+      {/* The New-chat row, on the shared sidebar-row style, with pl-[7px]
+          mirroring the list inset below so its text lines up with the chat
+          titles. */}
+      <div className="pl-[7px] pr-2 pb-0.5">
         {/* A plain <button> on the shared row style, not a shadcn <Button>: the
             Button base leaks rounded-md (6px) and has-[>svg]:px-2.5 that don't
             match the chat rows' rounded (4px) / px-2. sidebarRowClass makes it

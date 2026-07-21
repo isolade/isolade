@@ -20,6 +20,7 @@ import {
   setChatActiveLeaf,
   updateChatModel,
 } from "../lib/api";
+import { writeLastEffort, writeLastModelId } from "../lib/chat-defaults";
 import {
   type ChatTurnEvent,
   cancelChatTurn,
@@ -134,9 +135,9 @@ interface ChatProps {
 
 type RenderEventFrame = Extract<ChatTurnEvent, { kind: "event" }>;
 
-// Memoized so activating a chat tab (which re-renders the parent InstanceView)
-// only re-renders the two tabs whose `visible` flips, not every mounted chat
-// of the instance. All other props (chat row, model list, callbacks) keep a
+// Memoized so activating a chat tab (which re-renders the parent panel) only
+// re-renders the two tabs whose `visible` flips, not every mounted chat of the
+// instance. All other props (chat row, model list, callbacks) keep a
 // stable identity across a tab switch, so the memo holds. Without this, each
 // click reconciles the full message list of every open chat on the main
 // thread — work that scales with total history across all tabs.
@@ -955,6 +956,11 @@ function Chat({
     [chatId, instanceId, toolDetailRequestGeneration],
   );
 
+  // A newly created, hydrated chat has no provider session or transcript to
+  // lose, so its composer can choose from the full catalog. Once the first
+  // turn starts, keep model changes within that chat's current provider.
+  const isFreshChat = hydratedRef.current && messages.length === 0 && !streaming;
+
   const applyModelChange = useCallback(
     async (body: UpdateChatBody) => {
       // Keep the existing usage/cost snapshot visible across model and effort
@@ -989,17 +995,19 @@ function Chat({
       if (def && !def.supportedEfforts.includes(currentEffort)) {
         setCurrentEffort(def.defaultEffort);
       }
+      if (isFreshChat) writeLastModelId(newModel);
       if (!streaming) void applyModelChange({ model: newModel });
     },
-    [streaming, chatModels, currentEffort, applyModelChange],
+    [streaming, chatModels, currentEffort, isFreshChat, applyModelChange],
   );
 
   const handleEffortChange = useCallback(
     (next: ChatEffort) => {
       setCurrentEffort(next);
+      if (isFreshChat) writeLastEffort(next);
       if (!streaming) void applyModelChange({ effort: next });
     },
-    [streaming, applyModelChange],
+    [streaming, isFreshChat, applyModelChange],
   );
 
   // Drives one streaming turn from `runChatTurn` (or `resumeChatTurn`).
@@ -1970,13 +1978,11 @@ function Chat({
     setActiveLeaf(errMsg.id);
   }, [creationError, chatId, setActiveLeaf]);
 
-  // Block cross-provider model swaps: the picker only offers models that
-  // match the current chat's provider. To switch providers, the user opens
-  // a new Chat tab.
   const currentProvider =
     findChatModel(currentModel)?.provider ??
     chatModels.find((m) => m.id === currentModel)?.provider;
   const sameProviderModels = chatModels.filter((m) => m.provider === currentProvider);
+  const pickerModels = isFreshChat ? chatModels : sameProviderModels;
   const liveAssistantRow = useMemo<LiveAssistantRow | null>(() => {
     if (!liveRow) return null;
     return {
@@ -1996,7 +2002,7 @@ function Chat({
   }, [chatId, hotSwitchLiveChunks, liveRow, streaming]);
 
   return (
-    <div className="relative h-full bg-background">
+    <div data-chat-root className="relative h-full w-full min-w-0 bg-background">
       <div
         ref={scrollContainerRef}
         data-chat-scroll
@@ -2093,7 +2099,7 @@ function Chat({
             }
             leftToolbar={
               <ModelEffortPicker
-                models={sameProviderModels}
+                models={pickerModels}
                 overrides={modelOverrides}
                 currentModelId={currentModel}
                 currentEffort={currentEffort}

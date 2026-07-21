@@ -40,8 +40,10 @@ export default function App() {
     };
   }, []);
 
-  // The title bar (see components/TitleBar) owns the window chrome: the
-  // traffic-light slot, the drag region and double-click-to-zoom.
+  // The window chrome (traffic-light slot, sidebar toggle, settings gear) floats
+  // over the top-left of the workspace via components/home/WindowChrome; the
+  // panel tab strips carry the drag region and double-click-to-zoom
+  // (lib/window-drag).
   const body = (
     <div
       className={`${isTauri ? "h-screen" : "h-full"} flex flex-col bg-background text-foreground`}

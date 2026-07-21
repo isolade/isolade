@@ -6,6 +6,7 @@ import {
   prRefBodySchema,
   terminalResizeMessageSchema,
   updateInstanceBodySchema,
+  updateInstanceLayoutBodySchema,
 } from "../contracts";
 import { terminalCommand } from "../terminals";
 import type { RouteContext } from "./context";
@@ -78,6 +79,25 @@ export function createInstancesRouter(ctx: RouteContext): Hono {
     const { title } = updateInstanceBodySchema.parse(await c.req.json());
     const updated = instances.setTitle(id, title);
     return c.json(updated);
+  });
+
+  // Dockable panel layout for this instance's workspace. Served (and saved)
+  // separately from the instance contract so it stays off the 1s sidebar poll
+  // and a stale server copy can't clobber an in-flight local drag/split. GET
+  // returns null when nothing is saved yet (the client then builds a default
+  // from the instance's chats); PATCH replaces the whole tree.
+  app.get("/api/instances/:id/layout", (c) => {
+    const id = c.req.param("id");
+    if (!instances.get(id)) return c.json({ error: "not found" }, 404);
+    return c.json({ layout: instances.getLayout(id) });
+  });
+
+  app.patch("/api/instances/:id/layout", async (c) => {
+    const id = c.req.param("id");
+    if (!instances.get(id)) return c.json({ error: "not found" }, 404);
+    const { layout } = updateInstanceLayoutBodySchema.parse(await c.req.json());
+    instances.setLayout(id, layout);
+    return c.json({ ok: true });
   });
 
   // Mark an instance read. The user is viewing it, so clear the unread flag.

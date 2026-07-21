@@ -1,3 +1,4 @@
+import type { Layout } from "@isolade/shared";
 import { index, integer, primaryKey, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 // A profile is the whole unit: identity (Claude/Codex auth, appearance, git,
@@ -99,6 +100,14 @@ export const instances = sqliteTable("instances", {
   updatedAt: integer("updated_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
+  // The dockable panel layout for this instance's workspace: a JSON-encoded
+  // Layout tree (see shared domain.ts). Null until the client first saves one,
+  // in which case the client builds a default from the instance's chats.
+  // Deliberately NOT part of the instance contract sent by list()/get(): it
+  // would bloat the 1s sidebar poll and a stale copy could clobber an in-flight
+  // local edit (a drag/split in progress). Read and written through the
+  // dedicated .../layout endpoints instead (see routes/instances.ts).
+  layout: text("layout", { mode: "json" }).$type<Layout>(),
 });
 
 // Dynamically-added port forwards for an instance. Config-declared ports

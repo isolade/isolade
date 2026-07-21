@@ -957,8 +957,8 @@ export class ChatManager {
       compacted?: null;
       modelContextWindow?: null;
     } = { model, provider, effort };
-    // Switching provider invalidates both session IDs. The next message starts fresh.
-    // The UI blocks cross-provider swaps, but defend in depth.
+    // Switching provider invalidates both session IDs. The UI only offers this
+    // before a fresh chat's first message, but keep API-initiated swaps safe.
     if (chat.provider !== provider) {
       updates.claudeSessionId = null;
       updates.codexThreadId = null;

@@ -10,6 +10,11 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 - Added chat thinking indicators. Codex shows thinking updates, while Claude
   shows thinking token counts and summaries.
+- Workspaces now use flexible, dockable panels. Drag tabs onto a panel edge to
+  split the workspace, onto its centre to move them, or along a tab row to
+  reorder them. Dividers resize adjacent panels, crowded tab rows scroll, and
+  each row keeps its new-tab button beside the final tab. Layouts are saved per
+  instance and restored across restarts.
 - Chat messages can now carry file attachments. Use the paperclip on the
   bottom-left of the composer, or paste an image straight from the clipboard
   (Cmd+V), and it shows up as a preview before you send. Attachments are placed

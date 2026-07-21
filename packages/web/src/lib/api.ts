@@ -29,9 +29,12 @@ import {
   type GitConfigStatus,
   gitConfigStatusSchema,
   type Instance,
+  type InstanceLayoutResponse,
   inFlightChatRenderSchema,
   instanceArraySchema,
+  instanceLayoutResponseSchema,
   instanceSchema,
+  type Layout,
   type LoginSession,
   loginSessionSchema,
   type ModelOverridesPayload,
@@ -88,6 +91,7 @@ import {
   type UsageStats,
   updateChatBodySchema,
   updateInstanceBodySchema,
+  updateInstanceLayoutBodySchema,
   updateStatusSchema,
   uploadFileBodySchema,
   uploadSchema,
@@ -558,6 +562,31 @@ export async function listInstances(): Promise<Instance[]> {
   return parseResponse(await apiFetch(`${API_BASE}/api/instances`), instanceArraySchema);
 }
 
+// The dockable panel layout for an instance's workspace. Fetched separately
+// from the instance list so it stays off the 1s poll (see the layout column
+// note in server db/schema.ts). Returns null when nothing is saved yet, and
+// the caller then builds a default from the instance's chats.
+export async function getInstanceLayout(id: string): Promise<Layout | null> {
+  const { layout }: InstanceLayoutResponse = await parseResponse(
+    await apiFetch(`${API_BASE}/api/instances/${id}/layout`),
+    instanceLayoutResponseSchema,
+  );
+  return layout;
+}
+
+// Persist an instance's panel layout (replaces the whole tree). Fire-and-forget
+// at the call sites: the client holds the source of truth while the workspace
+// is open, so a dropped save just re-syncs on the next change.
+export async function updateInstanceLayout(id: string, layout: Layout): Promise<void> {
+  await parseOptionalOk(
+    await apiFetch(`${API_BASE}/api/instances/${id}/layout`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updateInstanceLayoutBodySchema.parse({ layout })),
+    }),
+  );
+}
+
 export async function createInstance(body: CreateInstanceBody): Promise<Instance> {
   return parseResponse(
     await apiFetch(`${API_BASE}/api/instances`, {
@@ -833,6 +862,14 @@ export async function createTerminal(instanceId: string): Promise<Terminal> {
       method: "POST",
     }),
     terminalSchema,
+  );
+}
+
+export async function deleteTerminal(instanceId: string, terminalId: string): Promise<void> {
+  await parseOptionalOk(
+    await apiFetch(`${API_BASE}/api/instances/${instanceId}/terminals/${terminalId}`, {
+      method: "DELETE",
+    }),
   );
 }
 

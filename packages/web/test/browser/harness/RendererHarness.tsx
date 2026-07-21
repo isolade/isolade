@@ -9,6 +9,9 @@ import {
   useState,
 } from "react";
 import type { SessionMessageRow } from "@/components/chat/MessageHistory";
+import PanelWorkspace, { DragLayer } from "@/components/home/PanelWorkspace";
+import WindowChrome from "@/components/home/WindowChrome";
+import type { Instance } from "@/lib/contracts";
 import { type HarnessPage, makeOlderPage, makePages } from "./fixtures";
 import { getRenderMetrics, type MetricSnapshot } from "./metrics";
 import {
@@ -169,7 +172,109 @@ export interface HarnessApi {
   waitFrames: (count?: number) => Promise<void>;
 }
 
+const PANEL_GESTURE_INSTANCE: Instance = {
+  id: "panel-gesture-instance",
+  vmId: "panel-gesture-vm",
+  title: "Panel gesture test",
+  status: "running",
+  lastError: null,
+  image: "test",
+  profileId: "test",
+  diffAdded: null,
+  diffDeleted: null,
+  working: false,
+  unread: false,
+  archived: false,
+  pinned: false,
+  createdAt: new Date(0),
+  updatedAt: new Date(0),
+};
+
+function PanelGestureHarness() {
+  const parameters = new URLSearchParams(window.location.search);
+  const withChromeInset = parameters.get("chromeInset") === "1";
+  const sidebarExpanded = parameters.get("sidebarExpanded") === "1";
+  const [chromeWidth, setChromeWidth] = useState(0);
+  return (
+    <main className="relative h-screen bg-background text-foreground">
+      <p data-selection-target className="absolute top-2 left-2">
+        Text outside the panel must not become selected during a tab drag.
+      </p>
+      <div
+        className="absolute flex"
+        style={{
+          left: withChromeInset ? 0 : 100,
+          top: withChromeInset ? 0 : 80,
+          width: 500,
+          height: 400,
+          contain: "strict",
+        }}
+      >
+        <PanelWorkspace
+          instance={PANEL_GESTURE_INSTANCE}
+          chats={[]}
+          terminals={[]}
+          ports={[]}
+          prs={[]}
+          onDetachPr={() => {}}
+          chatModels={[]}
+          modelOverrides={{}}
+          pendingFirstMessage={null}
+          visible
+          sidebarCollapsed={!sidebarExpanded}
+          chromeInset={withChromeInset ? chromeWidth : 0}
+          isTauri={false}
+          onTitleAutoUpdated={() => {}}
+          onChatCreated={() => {}}
+          onChatDeleted={() => {}}
+          onTerminalCreated={() => {}}
+          onTerminalDeleted={() => {}}
+        />
+      </div>
+      {withChromeInset && (
+        <WindowChrome
+          isTauri={false}
+          settingsOpen={false}
+          onToggleSidebar={() => {}}
+          onOpenSettings={() => {}}
+          onCloseSettings={() => {}}
+          onWidthChange={setChromeWidth}
+        />
+      )}
+    </main>
+  );
+}
+
 export function RendererHarness() {
+  if (new URLSearchParams(window.location.search).get("panelGesture") === "1") {
+    return <PanelGestureHarness />;
+  }
+  if (new URLSearchParams(window.location.search).get("dragLayer") === "1") {
+    return (
+      <main className="relative h-screen bg-background text-foreground">
+        <div
+          data-drag-containing-block
+          className="absolute"
+          style={{ left: 100, top: 80, width: 500, height: 400, contain: "strict" }}
+        >
+          <DragLayer
+            drag={{
+              tabId: "test-tab",
+              label: "Dragged tab",
+              kind: "chat",
+              x: 200,
+              y: 160,
+              preview: { left: 160, top: 120, width: 240, height: 180 },
+            }}
+          />
+        </div>
+      </main>
+    );
+  }
+  return <MessageRendererHarness />;
+}
+
+function MessageRendererHarness() {
   const parameters = useMemo(() => new URLSearchParams(window.location.search), []);
   const count = Number(parameters.get("messages") ?? 400);
   const chatCount = Number(parameters.get("chats") ?? 2);
