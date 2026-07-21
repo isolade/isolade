@@ -93,6 +93,49 @@ function streamedResponse(
 }
 
 describe("runChatTurn", () => {
+  it("posts retained and added upload ids to the edit endpoint", async () => {
+    let requestPath = "";
+    let requestBody: unknown;
+    const mock = installMockFetch({
+      routes: [
+        {
+          method: "POST",
+          pathRegex: /\/messages\/user-1\/edit$/,
+          respond: async (req) => {
+            requestPath = new URL(req.url).pathname;
+            requestBody = await req.json();
+            return new Response(
+              sseBody([
+                { event: "message_id", data: JSON.stringify("assistant-2") },
+                { event: "done", data: "" },
+              ]),
+              { headers: { "Content-Type": "text/event-stream" } },
+            );
+          },
+        },
+      ],
+    });
+    try {
+      await runChatTurn({
+        apiBase: "http://test",
+        instanceId: "i1",
+        chatId: "c1",
+        content: "updated",
+        uploadIds: ["retained", "added"],
+        editMessageId: "user-1",
+        onEvent: () => {},
+        signal: new AbortController().signal,
+      });
+      expect(requestPath).toBe("/api/instances/i1/chats/c1/messages/user-1/edit");
+      expect(requestBody).toEqual({
+        content: "updated",
+        uploadIds: ["retained", "added"],
+      });
+    } finally {
+      mock.restore();
+    }
+  });
+
   it("happy path: POST → message_id, deltas, done", async () => {
     const mock = installMockFetch({
       routes: [

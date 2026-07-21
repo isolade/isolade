@@ -82,12 +82,14 @@ import {
   type UpdateChatBody,
   type UpdateInstanceBody,
   type UpdateStatus,
+  type Upload,
   type UsageHistory,
   type UsageStats,
   updateChatBodySchema,
   updateInstanceBodySchema,
   updateStatusSchema,
   uploadFileBodySchema,
+  uploadSchema,
   usageHistorySchema,
   usageStatsSchema,
   type WorkspaceDiff,
@@ -926,6 +928,43 @@ export async function listChatMessages(
     await apiFetch(`${API_BASE}/api/instances/${instanceId}/chats/${chatId}/messages`, { signal }),
     chatMessageArraySchema,
   );
+}
+
+// Stage a file (or clipboard blob) as a message attachment. The bytes stream
+// straight up as the request body; `filename` rides the query string and the
+// MIME type the Content-Type header. Returns the metadata (with the id the send
+// body references via `uploadIds`). No size limit. (Distinct from `uploadFile`,
+// which drops a file into the workspace tree as base64.)
+export async function uploadAttachment(
+  instanceId: string,
+  file: Blob,
+  filename: string,
+  signal?: AbortSignal,
+): Promise<Upload> {
+  return parseResponse(
+    await apiFetch(
+      `${API_BASE}/api/instances/${instanceId}/uploads?filename=${encodeURIComponent(filename)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": file.type || "application/octet-stream" },
+        body: file,
+        signal,
+      },
+    ),
+    uploadSchema,
+  );
+}
+
+// URL the browser loads to preview or download an upload's bytes (an <img> src
+// or a download link's href). Carries the auth token as a query param because
+// those elements can't set an Authorization header.
+export function uploadUrl(
+  instanceId: string,
+  uploadId: string,
+  opts?: { download?: boolean },
+): string {
+  const base = `${API_BASE}/api/instances/${instanceId}/uploads/${uploadId}`;
+  return withAuthToken(opts?.download ? `${base}?download=1` : base);
 }
 
 // Returns every persisted SSE event for the chat, ordered by

@@ -1,4 +1,4 @@
-import { ArrowDown, ChevronLeft, ChevronRight, Pencil } from "lucide-react";
+import { ArrowDown, ChevronLeft, ChevronRight, Paperclip, Pencil } from "lucide-react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -26,6 +26,7 @@ import type {
   ContextBreakdown,
   ModelOverrides,
   UpdateChatBody,
+  Upload,
 } from "../lib/contracts";
 import { findChatModel } from "../lib/contracts";
 import {
@@ -34,6 +35,8 @@ import {
   useDebugSetting,
   useUserFontSetting,
 } from "../lib/settings";
+import { useAttachments } from "../lib/use-attachments";
+import { AttachmentStrip } from "./chat/AttachmentStrip";
 import { StreamView } from "./chat/blocks";
 import {
   applyEvent,
@@ -52,6 +55,7 @@ import {
   type UsageState,
   usageSeedFromChat,
 } from "./chat/chunks";
+import { MessageUploads } from "./chat/MessageUploads";
 import { ContextBar, ContextBreakdownDetail, ContextDetail } from "./chat/UsagePanel";
 import Markdown from "./Markdown";
 import { MessageBox } from "./MessageBox";
@@ -79,6 +83,9 @@ interface ChatProps {
   // new-chat flow so the user's first message (typed in the empty-state
   // pane) streams in immediately when the chat tab opens.
   initialMessage?: string;
+  // Ids of files the user attached to that first message in the empty-state
+  // pane (already staged against this instance). Attached to the bootstrap send.
+  initialUploadIds?: string[];
   // True while the instance's VM + server-side chat haven't been created
   // yet. The chat tab still renders the optimistic user bubble + dots (via the
   // useState initializer below), but skips all server I/O and the auto-send.
@@ -96,17 +103,24 @@ interface ChatProps {
 // Escape cancels, and the textarea auto-grows like the main composer.
 function UserMessageEditor({
   initial,
+  initialUploads,
+  instanceId,
   fontFamily,
   onCancel,
   onSubmit,
 }: {
   initial: string;
+  initialUploads: Upload[];
+  instanceId: string;
   fontFamily: string;
   onCancel: () => void;
-  onSubmit: (content: string) => void;
+  onSubmit: (content: string, uploads: Upload[]) => void;
 }) {
   const [draft, setDraft] = useState(initial);
+  const [submitting, setSubmitting] = useState(false);
+  const attachments = useAttachments(instanceId, initialUploads);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
@@ -121,7 +135,18 @@ function UserMessageEditor({
     el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`;
   }, [draft]);
 
-  const canSubmit = draft.trim().length > 0;
+  const canSubmit =
+    draft.trim().length > 0 || attachments.items.some((item) => item.status !== "error");
+  const submit = async () => {
+    if (!canSubmit || submitting) return;
+    setSubmitting(true);
+    const uploads = await attachments.resolveUploads();
+    if (!draft.trim() && uploads.length === 0) {
+      setSubmitting(false);
+      return;
+    }
+    onSubmit(draft, uploads);
+  };
   return (
     <div className="w-full rounded-2xl border border-input bg-secondary px-4 py-2.5">
       <textarea
@@ -134,32 +159,69 @@ function UserMessageEditor({
             onCancel();
           } else if (e.key === "Enter" && !e.shiftKey) {
             e.preventDefault();
-            if (canSubmit) onSubmit(draft);
+            void submit();
           }
+        }}
+        onPaste={(e) => {
+          const files = Array.from(e.clipboardData.items)
+            .filter((item) => item.kind === "file")
+            .map((item) => item.getAsFile())
+            .filter((file): file is File => file !== null);
+          if (files.length === 0) return;
+          e.preventDefault();
+          attachments.add(files);
         }}
         rows={1}
         className="w-full resize-none bg-transparent text-sm leading-relaxed text-secondary-foreground outline-none"
         style={{ fontFamily }}
       />
-      <div className="mt-2 flex justify-end gap-2">
-        <Button
-          type="button"
-          size="sm"
-          variant="ghost"
-          className="h-7 rounded-full"
-          onClick={onCancel}
-        >
-          Cancel
-        </Button>
-        <Button
-          type="button"
-          size="sm"
-          className="h-7 rounded-full"
-          disabled={!canSubmit}
-          onClick={() => onSubmit(draft)}
-        >
-          Send
-        </Button>
+      {attachments.items.length > 0 && (
+        <div className="mt-2">
+          <AttachmentStrip items={attachments.items} onRemove={attachments.remove} />
+        </div>
+      )}
+      <div className="mt-2 flex items-center justify-between gap-2">
+        <div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              attachments.add(Array.from(e.target.files ?? []));
+              e.target.value = "";
+            }}
+          />
+          <Button
+            type="button"
+            size="icon-sm"
+            variant="ghost"
+            aria-label="Add attachment"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <Paperclip className="size-4" />
+          </Button>
+        </div>
+        <div className="flex gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="h-7 rounded-full"
+            onClick={onCancel}
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            className="h-7 rounded-full"
+            disabled={!canSubmit || submitting}
+            onClick={() => void submit()}
+          >
+            Send
+          </Button>
+        </div>
       </div>
     </div>
   );
@@ -215,6 +277,7 @@ function VersionPager({
 // below updates per frame.
 const MessageRow = memo(function MessageRow({
   msg,
+  instanceId,
   chunks,
   showDebug,
   userFontFamily,
@@ -229,6 +292,7 @@ const MessageRow = memo(function MessageRow({
   onNavigateVersion,
 }: {
   msg: ChatMessage;
+  instanceId: string;
   chunks: StreamChunk[] | undefined;
   showDebug: boolean;
   userFontFamily: string;
@@ -242,7 +306,7 @@ const MessageRow = memo(function MessageRow({
   actionsDisabled: boolean;
   onStartEdit: (id: string) => void;
   onCancelEdit: () => void;
-  onSubmitEdit: (id: string, content: string) => void;
+  onSubmitEdit: (id: string, content: string, uploads: Upload[]) => void;
   onNavigateVersion: (id: string, dir: 1 | -1) => void;
 }) {
   const hasVersions = versionCount > 1;
@@ -261,18 +325,25 @@ const MessageRow = memo(function MessageRow({
           {isEditing ? (
             <UserMessageEditor
               initial={msg.content}
+              initialUploads={msg.uploads ?? []}
+              instanceId={instanceId}
               fontFamily={userFontFamily}
               onCancel={onCancelEdit}
-              onSubmit={(content) => onSubmitEdit(msg.id, content)}
+              onSubmit={(content, uploads) => onSubmitEdit(msg.id, content, uploads)}
             />
           ) : (
             <>
-              <div
-                className="rounded-2xl px-4 py-2.5 text-sm break-words bg-secondary text-secondary-foreground whitespace-pre-wrap"
-                style={{ fontFamily: userFontFamily }}
-              >
-                {msg.content}
-              </div>
+              {msg.content && (
+                <div
+                  className="rounded-2xl px-4 py-2.5 text-sm break-words bg-secondary text-secondary-foreground whitespace-pre-wrap"
+                  style={{ fontFamily: userFontFamily }}
+                >
+                  {msg.content}
+                </div>
+              )}
+              {msg.uploads && msg.uploads.length > 0 && (
+                <MessageUploads instanceId={instanceId} uploads={msg.uploads} />
+              )}
               {/* Action row under the bubble: hover-revealed edit pencil,
                   then the version pager (always visible when the message has
                   versions). Rendered only when it has something to offer, so
@@ -342,6 +413,7 @@ function Chat({
   modelOverrides,
   visible,
   initialMessage,
+  initialUploadIds,
   pending = false,
   creationError = null,
   onTitle,
@@ -365,6 +437,11 @@ function Chat({
       : [],
   );
   const [input, setInput] = useState("");
+  // Staged file attachments for the next send (browser upload / clipboard
+  // paste). Uploads run in the background as files are added; sendMessage awaits
+  // them for the ids. Scoped to this instance's bind-mounted uploads dir.
+  const attachments = useAttachments(instanceId);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [streaming, setStreaming] = useState(!!initialMessage);
   // Which branch of the message tree is visible: the id of the path's last
   // message (or any message on it). Seeded from the persisted chat row,
@@ -1174,15 +1251,24 @@ function Chat({
   );
 
   const sendMessage = useCallback(
-    async (override?: string, force = false) => {
+    async (override?: string, force = false, overrideUploadIds?: string[]) => {
       const content = (override ?? input).trim();
-      if (!content) return;
+      // For a normal send, await any in-flight composer uploads and collect
+      // their ids. For a bootstrap/override send (the new-chat first message),
+      // the ids were resolved in the empty-state pane and passed in directly.
+      const uploads = override === undefined ? await attachments.resolveUploads() : [];
+      const uploadIds =
+        override === undefined ? uploads.map((u) => u.id) : (overrideUploadIds ?? []);
+      if (!content && uploadIds.length === 0) return;
       // `force` bypasses the streaming guard for the bootstrap re-entry where
       // the optimistic state already has `streaming=true` from the useState
       // initializer.
       if (streaming && !force) return;
 
-      if (override === undefined) setInput("");
+      if (override === undefined) {
+        setInput("");
+        attachments.clear();
+      }
       setStreaming(true);
       setStreamingChunks([]);
 
@@ -1212,6 +1298,9 @@ function Chat({
           role: "user",
           content,
           parentId: thread.tipId,
+          // Already uploaded, so the previews resolve immediately (before the
+          // server's user_message frame swaps in the persisted row).
+          uploads: uploads.length > 0 ? uploads : undefined,
           createdAt: new Date(),
         };
         setMessages((prev) => [...prev, optimistic]);
@@ -1228,6 +1317,7 @@ function Chat({
             instanceId,
             chatId,
             content,
+            uploadIds,
             onEvent,
             signal: ac.signal,
           }),
@@ -1239,6 +1329,7 @@ function Chat({
     },
     [
       input,
+      attachments,
       streaming,
       instanceId,
       chatId,
@@ -1253,14 +1344,30 @@ function Chat({
     ],
   );
 
+  // Pull image (and any file) blobs out of a paste and stage them as
+  // attachments. Only prevents the default paste when there's actually a file,
+  // so pasting text still works normally.
+  const handlePaste = useCallback(
+    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+      const files = Array.from(e.clipboardData.items)
+        .filter((it) => it.kind === "file")
+        .map((it) => it.getAsFile())
+        .filter((f): f is File => f !== null);
+      if (files.length === 0) return;
+      e.preventDefault();
+      attachments.add(files);
+    },
+    [attachments],
+  );
+
   // Edit a user message: renders a sibling version optimistically (the path
   // switches to the new branch immediately) and streams the recomputed
   // answer through the same drain machinery as a normal send. The server
   // forks the provider session at the point before the edited message.
   const sendEdit = useCallback(
-    async (messageId: string, content: string) => {
+    async (messageId: string, content: string, uploads: Upload[]) => {
       const trimmed = content.trim();
-      if (!trimmed || streamingRef.current) return;
+      if ((!trimmed && uploads.length === 0) || streamingRef.current) return;
       const edited = messages.find((m) => m.id === messageId);
       if (!edited) return;
 
@@ -1288,6 +1395,7 @@ function Chat({
         role: "user",
         content: trimmed,
         parentId: edited.parentId ?? null,
+        uploads: uploads.length > 0 ? uploads : undefined,
         createdAt: new Date(),
       };
       setMessages((prev) => [...prev, optimistic]);
@@ -1303,6 +1411,7 @@ function Chat({
             instanceId,
             chatId,
             content: trimmed,
+            uploadIds: uploads.map((upload) => upload.id),
             editMessageId: messageId,
             onEvent,
             signal: ac.signal,
@@ -1332,8 +1441,8 @@ function Chat({
   }, []);
   const handleCancelEdit = useCallback(() => setEditingId(null), []);
   const handleSubmitEdit = useCallback(
-    (id: string, content: string) => {
-      void sendEdit(id, content);
+    (id: string, content: string, uploads: Upload[]) => {
+      void sendEdit(id, content, uploads);
     },
     [sendEdit],
   );
@@ -1423,8 +1532,8 @@ function Chat({
     const sig = `${chatId}:${initialMessage}`;
     if (initialFiredRef.current === sig) return;
     initialFiredRef.current = sig;
-    void sendMessage(initialMessage, true);
-  }, [pending, chatId, initialMessage, sendMessage]);
+    void sendMessage(initialMessage, true, initialUploadIds);
+  }, [pending, chatId, initialMessage, initialUploadIds, sendMessage]);
 
   // VM/chat creation failed in the parent. Surface it through the regular
   // assistant-message path (same rendering as a stream failure) so the chat
@@ -1481,6 +1590,7 @@ function Chat({
               <MessageRow
                 key={msg.role === "user" ? `user-pos-${i}` : msg.id}
                 msg={msg}
+                instanceId={instanceId}
                 chunks={messageChunks[msg.id]}
                 showDebug={showDebug}
                 userFontFamily={userFontFamily}
@@ -1547,6 +1657,20 @@ function Chat({
         className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center pb-3"
       >
         <div className="pointer-events-auto w-full max-w-3xl px-4">
+          {/* Hidden picker driven by the composer's paperclip button. */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files && e.target.files.length > 0) {
+                attachments.add(Array.from(e.target.files));
+              }
+              // Reset so re-picking the same file fires change again.
+              e.target.value = "";
+            }}
+          />
           <MessageBox
             className="backdrop-blur-md"
             value={input}
@@ -1564,6 +1688,12 @@ function Chat({
             loading={streaming}
             autoFocus
             placeholder="Message... (Enter to send, Shift+Enter for newline)"
+            onAttachClick={() => fileInputRef.current?.click()}
+            onPaste={handlePaste}
+            hasAttachments={attachments.items.length > 0}
+            attachments={
+              <AttachmentStrip items={attachments.items} onRemove={attachments.remove} />
+            }
             leftToolbar={
               <ModelEffortPicker
                 models={sameProviderModels}

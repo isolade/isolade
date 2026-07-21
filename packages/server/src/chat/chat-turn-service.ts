@@ -1,14 +1,30 @@
 import { randomUUID } from "node:crypto";
 import type { Chat, ChatManager } from "../chats";
-import type { UsageStats } from "../contracts";
+import type { Upload, UsageStats } from "../contracts";
 import type { ChatMessage } from "../db/schema";
 import type { DiffStatsPoller } from "../diff-stats";
 import type { InstanceManager } from "../instances";
 import type { ProfileManager } from "../profiles";
 import type { TitleVmManager } from "../title-vm-manager";
-import type { ChatBackend } from "./backend";
+import { toUpload, type UploadStore, uploadGuestPath } from "../uploads";
+import type { ChatBackend, UploadAttachment } from "./backend";
 import type { ChatStreamHub } from "./stream-hub";
 import { computeSubscriptionShare } from "./subscription-share";
+
+// The bytes are cited to the model by absolute path; this block tells the agent
+// what was attached and where to find it. Claude reads them with its Read tool,
+// and codex uses view_image or the shell. Kept out of the stored message content
+// (like the prelude), so the transcript shows only the user's own text.
+function buildAttachmentsPreamble(uploads: UploadAttachment[]): string {
+  const lines = uploads.map((u) => `- ${u.guestPath} (${u.mediaType})`);
+  return (
+    "<attachments>\n" +
+    "The user attached these files. They are available at these absolute paths " +
+    "inside the workspace:\n" +
+    `${lines.join("\n")}\n` +
+    "</attachments>"
+  );
+}
 
 // The instance row shape the turn orchestration reads (profile/vm/title). Taken
 // from InstanceManager.get so it tracks the manager without a hand-written type.
@@ -16,6 +32,7 @@ type InstanceRecord = NonNullable<ReturnType<InstanceManager["get"]>>;
 
 export interface ChatTurnDeps {
   chatManager: ChatManager;
+  uploadStore: UploadStore;
   instances: InstanceManager;
   profiles: ProfileManager;
   titleVmManager: TitleVmManager;
@@ -50,12 +67,20 @@ export class ChatTurnService {
   // is forked at the nearest anchored turn before it, so the model answers
   // with exactly the context that preceded the edited message. The original
   // branch (messages and session) stays intact and navigable.
-  start(opts: { instance: InstanceRecord; chat: Chat; content: string; edit?: ChatMessage }): {
+  start(opts: {
+    instance: InstanceRecord;
+    chat: Chat;
+    content: string;
+    // Ids of files staged via the upload endpoint to attach to this message.
+    uploadIds?: string[];
+    edit?: ChatMessage;
+  }): {
     assistantMessageId: string;
-    userMessage: ChatMessage;
+    userMessage: ChatMessage & { uploads?: Upload[] };
   } {
     const {
       chatManager,
+      uploadStore,
       instances,
       profiles,
       titleVmManager,
@@ -65,7 +90,7 @@ export class ChatTurnService {
       codexBackend,
       profileUsageStats,
     } = this.deps;
-    const { instance, chat, content, edit } = opts;
+    const { instance, chat, content, uploadIds, edit } = opts;
     const instanceId = instance.id;
     const chatId = chat.id;
 
@@ -117,6 +142,20 @@ export class ChatTurnService {
     const userMessage = chatManager.addMessage(chatId, "user", content, { parentId });
     chatManager.setActiveLeaf(chatId, userMessage.id);
     instances.touch(instanceId);
+
+    // Claim the staged uploads for this message. Their bytes are already in the
+    // VM, so we only need the guest paths to cite them to the model.
+    const uploadRows = uploadStore.attach(instanceId, chatId, userMessage.id, uploadIds ?? []);
+    const uploads: UploadAttachment[] = uploadRows.map((row) => ({
+      id: row.id,
+      filename: row.filename,
+      mediaType: row.mediaType,
+      guestPath: uploadGuestPath(row.id, row.filename),
+    }));
+    // Decorate the row the caller streams back so the client's optimistic
+    // bubble reconciles with the persisted attachments (id + preview).
+    const userMessageWithUploads: ChatMessage & { uploads?: Upload[] } =
+      uploads.length > 0 ? { ...userMessage, uploads: uploadRows.map(toUpload) } : userMessage;
 
     // Reserve the assistant message id up front so every chat_events
     // row can link to it (even though the chat_messages row only gets
@@ -186,9 +225,16 @@ export class ChatTurnService {
           // as fresh, so it needs the prelude again.)
           const prelude =
             sessionId || !instance.profileId ? null : profiles.getPrelude(instance.profileId);
-          const outgoingMessage = prelude
-            ? `<prelude>\n${prelude}\n</prelude>\n\n${content}`
-            : content;
+          // Compose the message actually sent to the model: optional prelude,
+          // optional attachments block (cites each file's absolute VM path),
+          // then the user's own text. The DB row keeps only `content`, so
+          // neither the prelude nor the attachments block shows in the UI.
+          const parts: string[] = [];
+          if (prelude) parts.push(`<prelude>\n${prelude}\n</prelude>`);
+          if (uploads.length > 0) parts.push(buildAttachmentsPreamble(uploads));
+          // Content can be empty when the message is attachments-only.
+          if (content.length > 0) parts.push(content);
+          const outgoingMessage = parts.join("\n\n");
           const result = await backend.sendMessage({
             vmId: instance.vmId,
             chatId,
@@ -285,6 +331,6 @@ export class ChatTurnService {
       },
     });
 
-    return { assistantMessageId, userMessage };
+    return { assistantMessageId, userMessage: userMessageWithUploads };
   }
 }

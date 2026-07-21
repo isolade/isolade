@@ -206,6 +206,19 @@ export const contextBreakdownSchema = z.discriminatedUnion("available", [
   }),
 ]);
 
+// A file the user attached to a message (uploaded from the browser, or pasted
+// from the clipboard). The bytes live host-side and are bind-mounted into the
+// VM so the agent can read them by path; this metadata is all the client and
+// the message row need. `mediaType` is the browser-reported MIME type (used to
+// decide whether to render an inline preview), `size` is bytes.
+export const uploadSchema = z.object({
+  id: z.string(),
+  filename: z.string(),
+  mediaType: z.string(),
+  size: z.number().int().nonnegative(),
+});
+export type Upload = z.infer<typeof uploadSchema>;
+
 export const chatMessageSchema = z.object({
   id: z.string(),
   chatId: z.string(),
@@ -216,6 +229,10 @@ export const chatMessageSchema = z.object({
   // message's versions are its parentId group in list order. Optional so
   // producers that predate the tree (mocks, old servers) still parse.
   parentId: z.string().nullable().optional(),
+  // Files attached to this (user) message. Absent/empty for messages with no
+  // attachments and for every assistant message. Optional so older producers
+  // still parse.
+  uploads: z.array(uploadSchema).optional(),
   createdAt: dateLikeSchema,
 });
 export const chatMessageArraySchema = z.array(chatMessageSchema);

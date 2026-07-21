@@ -20,6 +20,9 @@ export interface RunChatTurnOptions {
   instanceId: string;
   chatId: string;
   content: string;
+  // Ids of files staged via uploadFile() to attach to this message. The server
+  // associates them with the created message and cites their paths to the model.
+  uploadIds?: string[];
   // When set, the turn is an *edit* of this user message: the server inserts
   // the content as a sibling version and recomputes the answer from that
   // point (same SSE stream shape as a normal send).
@@ -208,7 +211,7 @@ export async function runChatTurn(opts: RunChatTurnOptions): Promise<void> {
     const resp = await apiFetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: opts.content }),
+      body: JSON.stringify({ content: opts.content, uploadIds: opts.uploadIds }),
       signal: opts.signal,
     });
     if (!resp.ok) {

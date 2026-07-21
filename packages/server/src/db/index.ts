@@ -40,8 +40,15 @@ function defaultDbPath(): string {
  * existing chats), `chat_messages.session_id` / `anchor_id` (per-turn
  * provider-session snapshot so a later edit can fork the session at that
  * point), and `chats.active_leaf_id` (which branch the chat shows).
+ *
+ * Version 4 adds the `uploads` table backing message file attachments (browser
+ * upload / clipboard paste). No backfill: older messages simply have no
+ * attachments.
+ *
+ * Version 5 adds the `message_uploads` junction table so edited versions can
+ * retain a file without removing it from the original message.
  */
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 5;
 
 /**
  * The complete, current schema: one CREATE TABLE (plus indexes) per table in
@@ -260,6 +267,39 @@ function createSchema(sqlite: Database): void {
       value TEXT NOT NULL
     )
   `);
+
+  // Files attached to a user message. Bytes live on the host and are
+  // bind-mounted into the instance's VM (see uploads.ts). message_id is null
+  // while an upload is staged (uploaded but not yet sent) and set when it's
+  // attached to a sent message.
+  sqlite.run(`
+    CREATE TABLE IF NOT EXISTS uploads (
+      id TEXT PRIMARY KEY,
+      instance_id TEXT NOT NULL,
+      chat_id TEXT,
+      message_id TEXT,
+      filename TEXT NOT NULL,
+      media_type TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch())
+    )
+  `);
+  sqlite.run(`
+    CREATE INDEX IF NOT EXISTS idx_uploads_message ON uploads (message_id)
+  `);
+  sqlite.run(`
+    CREATE TABLE IF NOT EXISTS message_uploads (
+      chat_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      upload_id TEXT NOT NULL,
+      position INTEGER NOT NULL,
+      PRIMARY KEY (message_id, upload_id)
+    )
+  `);
+  sqlite.run(`
+    CREATE INDEX IF NOT EXISTS idx_message_uploads_chat
+    ON message_uploads (chat_id, message_id)
+  `);
 }
 
 /**
@@ -310,6 +350,47 @@ const migrations: Record<number, (sqlite: Database) => void> = {
         WHERE m.chat_id = chats.id
         ORDER BY m.rowid DESC LIMIT 1
       )
+    `);
+  },
+  4: (sqlite) => {
+    sqlite.run(`
+      CREATE TABLE IF NOT EXISTS uploads (
+        id TEXT PRIMARY KEY,
+        instance_id TEXT NOT NULL,
+        chat_id TEXT,
+        message_id TEXT,
+        filename TEXT NOT NULL,
+        media_type TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch())
+      )
+    `);
+    sqlite.run(`
+      CREATE INDEX IF NOT EXISTS idx_uploads_message ON uploads (message_id)
+    `);
+  },
+  5: (sqlite) => {
+    sqlite.run(`
+      CREATE TABLE IF NOT EXISTS message_uploads (
+        chat_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        upload_id TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        PRIMARY KEY (message_id, upload_id)
+      )
+    `);
+    sqlite.run(`
+      CREATE INDEX IF NOT EXISTS idx_message_uploads_chat
+      ON message_uploads (chat_id, message_id)
+    `);
+    // Preserve associations made by version 4. rowid reflects attachment
+    // insertion order and gives each message a stable display position.
+    sqlite.run(`
+      INSERT OR IGNORE INTO message_uploads (chat_id, message_id, upload_id, position)
+      SELECT chat_id, message_id, id,
+        ROW_NUMBER() OVER (PARTITION BY message_id ORDER BY rowid) - 1
+      FROM uploads
+      WHERE chat_id IS NOT NULL AND message_id IS NOT NULL
     `);
   },
 };

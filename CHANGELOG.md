@@ -6,6 +6,18 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+### Added
+
+- Chat messages can now carry file attachments. Use the paperclip on the
+  bottom-left of the composer, or paste an image straight from the clipboard
+  (Cmd+V), and it shows up as a preview before you send. Attachments are placed
+  in the VM for the agent to open.
+
+### Changed
+
+- The chat composer's model picker and send button now sit on a row below the
+  text instead of sharing its line.
+
 ### Fixed
 
 - Codex chats no longer unintentionally expose the built-in subagent tools.

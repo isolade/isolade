@@ -251,6 +251,51 @@ export const chatMessages = sqliteTable("chat_messages", {
     .$defaultFn(() => new Date()),
 });
 
+// Files attached to a user message (browser upload or clipboard paste). The
+// bytes live on the host under stateDir()/uploads/<instanceId>/<id>/<filename>
+// and are bind-mounted into the instance's VM so the agent can read them by
+// path (see uploads.ts). This row is just the metadata. `messageId` is null
+// between staging (the upload endpoint) and send (when the message row is
+// created and the upload is associated with it); a staged-but-never-sent
+// upload keeps a null messageId and is swept later. `instanceId` scopes the
+// upload to one VM's mount, and drives download authorization.
+export const uploads = sqliteTable(
+  "uploads",
+  {
+    id: text("id").primaryKey(),
+    instanceId: text("instance_id").notNull(),
+    // Set when the upload is attached to a sent message. Null while staged.
+    chatId: text("chat_id"),
+    messageId: text("message_id"),
+    filename: text("filename").notNull(),
+    mediaType: text("media_type").notNull(),
+    size: integer("size").notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" })
+      .notNull()
+      .$defaultFn(() => new Date()),
+  },
+  (t) => [index("idx_uploads_message").on(t.messageId)],
+);
+
+// A message can reference uploads that were already attached to an earlier
+// version of that message. Keeping the association in a junction table lets an
+// edit retain or drop each attachment without moving it off the original
+// branch. `uploads.chatId/messageId` above remain the upload's first claim,
+// which prevents a staged id from being reused across chats.
+export const messageUploads = sqliteTable(
+  "message_uploads",
+  {
+    chatId: text("chat_id").notNull(),
+    messageId: text("message_id").notNull(),
+    uploadId: text("upload_id").notNull(),
+    position: integer("position").notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.messageId, t.uploadId] }),
+    index("idx_message_uploads_chat").on(t.chatId, t.messageId),
+  ],
+);
+
 // One row per SSE event emitted during an assistant turn: tool calls,
 // thinking blocks, deltas, raw debug events, usage snapshots, etc. The
 // `messageId` is generated server-side at the start of a turn and emitted
@@ -358,6 +403,8 @@ export type ChatMessage = typeof chatMessages.$inferSelect;
 export type NewChatMessage = typeof chatMessages.$inferInsert;
 export type ChatEvent = typeof chatEvents.$inferSelect;
 export type NewChatEvent = typeof chatEvents.$inferInsert;
+export type UploadRow = typeof uploads.$inferSelect;
+export type NewUploadRow = typeof uploads.$inferInsert;
 export type UsageEvent = typeof usageEvents.$inferSelect;
 export type NewUsageEvent = typeof usageEvents.$inferInsert;
 export type AppStateRow = typeof appState.$inferSelect;
