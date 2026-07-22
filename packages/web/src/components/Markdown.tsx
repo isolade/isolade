@@ -136,11 +136,16 @@ const components: Components = {
   code: CodeRenderer,
   // Block elements
   p: Paragraph,
+  // `pl-6` (not the tighter `pl-4`) so the outside list markers have room to
+  // sit inside the padding. With less padding a disc or a multi-digit number
+  // overhangs to the left of the list box and gets clipped whenever the list
+  // is flush against a clipping ancestor (the chat scroll area, or the
+  // overflow-hidden wrappers around collapsible tool/thinking blocks).
   ul({ children }) {
-    return <ul className="mb-2 last:mb-0 pl-4 list-disc space-y-1">{children}</ul>;
+    return <ul className="mb-2 last:mb-0 pl-6 list-disc space-y-1">{children}</ul>;
   },
   ol({ children }) {
-    return <ol className="mb-2 last:mb-0 pl-4 list-decimal space-y-1">{children}</ol>;
+    return <ol className="mb-2 last:mb-0 pl-6 list-decimal space-y-1">{children}</ol>;
   },
   li({ children }) {
     return <li className="leading-relaxed">{children}</li>;
