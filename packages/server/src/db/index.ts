@@ -50,8 +50,12 @@ function defaultDbPath(): string {
  *
  * Version 6 adds indexed bounded transcript pagination, an O(1) in-flight
  * turn pointer, and persisted full and bounded structural render projections.
+ *
+ * Version 7 adds `instances.layout` (the JSON-encoded dockable panel layout for
+ * an instance's workspace). Existing rows remain null so the client can build a
+ * default layout from the instance's chats when it first opens the workspace.
  */
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 /**
  * The complete, current schema: one CREATE TABLE (plus indexes) per table in
@@ -100,7 +104,8 @@ function createSchema(sqlite: Database): void {
       expose_sandbox INTEGER NOT NULL DEFAULT 0,
       seed_profiles TEXT,
       created_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER)),
-      updated_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER))
+      updated_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER)),
+      layout TEXT
     )
   `);
 
@@ -455,6 +460,12 @@ const migrations: Record<number, (sqlite: Database) => void> = {
         SELECT 1 FROM chat_events AS event WHERE event.chat_id = chats.id
       )
     `);
+  },
+  7: (sqlite) => {
+    const layoutColumn = sqlite
+      .query("SELECT name FROM pragma_table_info('instances') WHERE name = 'layout'")
+      .get();
+    if (!layoutColumn) sqlite.run(`ALTER TABLE instances ADD COLUMN layout TEXT`);
   },
 };
 

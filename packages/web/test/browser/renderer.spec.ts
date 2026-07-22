@@ -62,6 +62,7 @@ async function openProductionHarness(
     messages?: number;
     wrappingRows?: boolean;
     thoughts?: boolean;
+    crossProviderPicker?: boolean;
   } = {},
 ) {
   const transcriptRequests: string[] = [];
@@ -87,6 +88,7 @@ async function openProductionHarness(
   if (options.chatsPerInstance) {
     parameters.set("chatsPerInstance", String(options.chatsPerInstance));
   }
+  if (options.crossProviderPicker) parameters.set("crossProviderPicker", "1");
   await page.goto(`/test/browser/harness/index.html?${parameters}`);
   await page.waitForFunction(
     () => document.documentElement.dataset.productionHarnessReady === "true",
@@ -120,6 +122,433 @@ test.describe("message renderer browser gate", () => {
     await expect(thought).toContainText(
       "I checked the request, the current state, and the relevant implementation details.",
     );
+  });
+
+  test("keeps a gap between expanded sidebar and its panel tabs", async ({ page }) => {
+    await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
+      await route.fulfill({
+        json: {
+          layout: {
+            type: "panel",
+            id: "sidebar-gap-panel",
+            tabs: [{ id: "sidebar-gap-tab", kind: "browser" }],
+            activeTabId: "sidebar-gap-tab",
+          },
+        },
+      });
+    });
+    await page.goto("/test/browser/harness/index.html?panelGesture=1&sidebarExpanded=1");
+
+    const panel = page.locator('[data-panel-id="sidebar-gap-panel"]');
+    const tab = page.locator('[data-tab-id="sidebar-gap-tab"]');
+    await expect
+      .poll(async () => {
+        const [panelBounds, tabBounds] = await Promise.all([
+          panel.boundingBox(),
+          tab.boundingBox(),
+        ]);
+        if (!panelBounds || !tabBounds) return null;
+        return tabBounds.x - panelBounds.x;
+      })
+      .toBe(6);
+  });
+
+  test("keeps collapsed-sidebar tabs clear of the window controls", async ({ page }) => {
+    await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
+      await route.fulfill({
+        json: {
+          layout: {
+            type: "panel",
+            id: "chrome-inset-panel",
+            tabs: [{ id: "chrome-inset-tab", kind: "browser" }],
+            activeTabId: "chrome-inset-tab",
+          },
+        },
+      });
+    });
+    await page.goto("/test/browser/harness/index.html?panelGesture=1&chromeInset=1");
+
+    const settings = page.getByRole("button", { name: "Settings" });
+    const tab = page.locator('[data-tab-id="chrome-inset-tab"]');
+    await expect
+      .poll(async () => {
+        const [settingsBounds, tabBounds] = await Promise.all([
+          settings.boundingBox(),
+          tab.boundingBox(),
+        ]);
+        if (!settingsBounds || !tabBounds) return null;
+        return tabBounds.x - (settingsBounds.x + settingsBounds.width);
+      })
+      .toBeGreaterThanOrEqual(0);
+  });
+
+  test("scrolls overflowing panel tabs and keeps the active tab visible", async ({ page }) => {
+    await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
+      if (route.request().method() === "PATCH") {
+        await route.fulfill({ json: {} });
+        return;
+      }
+      await route.fulfill({
+        json: {
+          layout: {
+            type: "panel",
+            id: "overflow-panel",
+            tabs: Array.from({ length: 12 }, (_, index) => ({
+              id: `overflow-tab-${index}`,
+              kind: "browser",
+            })),
+            activeTabId: "overflow-tab-0",
+          },
+        },
+      });
+    });
+    await page.goto("/test/browser/harness/index.html?panelGesture=1");
+
+    const panel = page.locator('[data-panel-id="overflow-panel"]');
+    const firstTab = page.locator('[data-tab-id="overflow-tab-0"]');
+    const scroller = page.locator('[data-panel-tabs-scroll="overflow-panel"]');
+    const scrollRight = page.locator('[data-panel-tabs-scroll-right="overflow-panel"]');
+    await expect
+      .poll(async () => {
+        const [panelBounds, tabBounds] = await Promise.all([
+          panel.boundingBox(),
+          firstTab.boundingBox(),
+        ]);
+        if (!panelBounds || !tabBounds) return null;
+        return Math.abs(tabBounds.x - panelBounds.x);
+      })
+      .toBeLessThanOrEqual(1);
+    await expect(scrollRight).toBeVisible();
+    expect(await scroller.evaluate((element) => element.scrollLeft)).toBe(0);
+
+    await scrollRight.click();
+    await expect.poll(() => scroller.evaluate((element) => element.scrollLeft)).toBeGreaterThan(0);
+    await expect(page.locator('[data-panel-tabs-scroll-left="overflow-panel"]')).toBeVisible();
+
+    await scroller.evaluate((element) => {
+      element.scrollLeft = 0;
+    });
+    await scroller.dispatchEvent("wheel", { deltaX: 0, deltaY: 100 });
+    await expect.poll(() => scroller.evaluate((element) => element.scrollLeft)).toBeGreaterThan(0);
+
+    const lastTab = page.locator('[data-tab-id="overflow-tab-11"]');
+    await lastTab.evaluate((element) => element.click());
+    await expect(lastTab).toHaveAttribute("aria-selected", "true");
+    await expect
+      .poll(() =>
+        lastTab.evaluate((tab) => {
+          const viewport = tab.parentElement;
+          if (!viewport) return false;
+          const tabRect = tab.getBoundingClientRect();
+          const viewportRect = viewport.getBoundingClientRect();
+          // Subpixel flex rounding can put an edge fractionally outside the
+          // viewport even though every rendered pixel is visible.
+          return tabRect.left >= viewportRect.left - 1 && tabRect.right <= viewportRect.right + 1;
+        }),
+      )
+      .toBe(true);
+
+    await scroller.evaluate((element) => {
+      element.scrollLeft = element.scrollWidth;
+    });
+    const addButton = page.getByRole("button", { name: "New tab" });
+    await expect
+      .poll(async () => {
+        const [lastBounds, addBounds] = await Promise.all([
+          lastTab.boundingBox(),
+          addButton.boundingBox(),
+        ]);
+        if (!lastBounds || !addBounds) return null;
+        return addBounds.x - (lastBounds.x + lastBounds.width);
+      })
+      .toBeGreaterThanOrEqual(-1);
+    const [lastBounds, addBounds] = await Promise.all([
+      lastTab.boundingBox(),
+      addButton.boundingBox(),
+    ]);
+    if (!lastBounds || !addBounds) throw new Error("Missing tab-strip control bounds");
+    expect(addBounds.x - (lastBounds.x + lastBounds.width)).toBeLessThanOrEqual(1);
+    const panelBounds = await panel.boundingBox();
+    if (!panelBounds) throw new Error("Missing panel bounds");
+    expect(
+      Math.abs(panelBounds.x + panelBounds.width - (addBounds.x + addBounds.width)),
+    ).toBeLessThanOrEqual(1);
+  });
+
+  test("emphasizes the active tab only in the focused panel", async ({ page }) => {
+    await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
+      await route.fulfill({
+        json: {
+          layout: {
+            type: "split",
+            id: "gesture-split",
+            direction: "row",
+            sizes: [0.5, 0.5],
+            children: [
+              {
+                type: "panel",
+                id: "left-panel",
+                tabs: [{ id: "left-tab", kind: "browser" }],
+                activeTabId: "left-tab",
+              },
+              {
+                type: "panel",
+                id: "right-panel",
+                tabs: [{ id: "right-tab", kind: "browser" }],
+                activeTabId: "right-tab",
+              },
+            ],
+          },
+        },
+      });
+    });
+    await page.goto("/test/browser/harness/index.html?panelGesture=1");
+
+    const leftPanel = page.locator('[data-panel-id="left-panel"]');
+    const rightPanel = page.locator('[data-panel-id="right-panel"]');
+    const leftTab = page.locator('[data-tab-id="left-tab"]');
+    const rightTab = page.locator('[data-tab-id="right-tab"]');
+    await expect(leftTab).toBeVisible();
+    expect(await leftTab.evaluate((tab) => getComputedStyle(tab).transitionDuration)).toBe("0s");
+    expect(
+      await leftTab
+        .getByRole("button", { name: "Close tab" })
+        .evaluate((button) => getComputedStyle(button).transitionDuration),
+    ).toBe("0s");
+    await expect(leftPanel).toHaveAttribute("data-panel-focused", "true");
+    await expect(rightPanel).toHaveAttribute("data-panel-focused", "false");
+    expect(await leftTab.evaluate((tab) => getComputedStyle(tab, "::after").opacity)).toBe("1");
+    expect(await rightTab.evaluate((tab) => getComputedStyle(tab, "::after").opacity)).toBe("0.35");
+
+    await page.locator('[data-body-id="right-panel"]').click({ position: { x: 100, y: 100 } });
+    await expect(leftPanel).toHaveAttribute("data-panel-focused", "false");
+    await expect(rightPanel).toHaveAttribute("data-panel-focused", "true");
+    await expect
+      .poll(() => leftTab.evaluate((tab) => getComputedStyle(tab, "::after").opacity))
+      .toBe("0.35");
+    await expect
+      .poll(() => rightTab.evaluate((tab) => getComputedStyle(tab, "::after").opacity))
+      .toBe("1");
+  });
+
+  test("resizes panels and ends resizing when the window loses focus", async ({ page }) => {
+    await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
+      if (route.request().method() === "PATCH") {
+        await route.fulfill({ json: {} });
+        return;
+      }
+      await route.fulfill({
+        json: {
+          layout: {
+            type: "split",
+            id: "resize-split",
+            direction: "row",
+            sizes: [0.5, 0.5],
+            children: [
+              {
+                type: "panel",
+                id: "resize-left-panel",
+                tabs: [{ id: "resize-left-tab", kind: "browser" }],
+                activeTabId: "resize-left-tab",
+              },
+              {
+                type: "panel",
+                id: "resize-right-panel",
+                tabs: [{ id: "resize-right-tab", kind: "browser" }],
+                activeTabId: "resize-right-tab",
+              },
+            ],
+          },
+        },
+      });
+    });
+    await page.goto("/test/browser/harness/index.html?panelGesture=1");
+
+    const divider = page.getByRole("separator", { name: "Resize panels" });
+    const leftPanel = page.locator('[data-panel-id="resize-left-panel"]');
+    const bounds = await divider.boundingBox();
+    if (!bounds) throw new Error("Missing panel divider bounds");
+    const initialWidth = await leftPanel.evaluate(
+      (element) => element.getBoundingClientRect().width,
+    );
+    await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(bounds.x + 50, bounds.y + bounds.height / 2);
+    await expect(page.locator("[data-panel-resize-overlay]")).toBeVisible();
+    await expect
+      .poll(() => leftPanel.evaluate((element) => element.getBoundingClientRect().width))
+      .toBeGreaterThan(initialWidth + 25);
+
+    await page.evaluate(() => window.dispatchEvent(new Event("blur")));
+    await expect(page.locator("[data-panel-resize-overlay]")).toHaveCount(0);
+    await page.mouse.up();
+
+    const resumedBounds = await divider.boundingBox();
+    if (!resumedBounds) throw new Error("Missing resized panel divider bounds");
+    const resumedWidth = await leftPanel.evaluate(
+      (element) => element.getBoundingClientRect().width,
+    );
+    await page.mouse.move(
+      resumedBounds.x + resumedBounds.width / 2,
+      resumedBounds.y + resumedBounds.height / 2,
+    );
+    await page.mouse.down();
+    await page.mouse.move(resumedBounds.x - 30, resumedBounds.y + resumedBounds.height / 2);
+    await expect(page.locator("[data-panel-resize-overlay]")).toBeVisible();
+    await expect
+      .poll(() => leftPanel.evaluate((element) => element.getBoundingClientRect().width))
+      .toBeLessThan(resumedWidth - 15);
+    await page.mouse.up();
+    await expect(page.locator("[data-panel-resize-overlay]")).toHaveCount(0);
+  });
+
+  test("offers Opus in a fresh Codex chat's composer", async ({ page }) => {
+    let createBody: Record<string, unknown> | null = null;
+    await page.route("**/api/instances/instance-production-harness/chats/chat-a", async (route) => {
+      createBody = route.request().postDataJSON() as Record<string, unknown>;
+      await route.fulfill({
+        json: {
+          id: "chat-a",
+          instanceId: "instance-production-harness",
+          model: "claude-opus-4-8",
+          provider: "anthropic",
+          effort: "high",
+          claudeSessionId: null,
+          codexThreadId: null,
+          inputTokens: null,
+          cachedInputTokens: null,
+          cacheCreationInputTokens: null,
+          outputTokens: null,
+          reasoningOutputTokens: null,
+          costUsd: null,
+          lastInputTokens: null,
+          lastCachedInputTokens: null,
+          lastCacheCreationInputTokens: null,
+          lastOutputTokens: null,
+          lastReasoningOutputTokens: null,
+          modelContextWindow: null,
+          compacted: null,
+          activeLeafId: null,
+          createdAt: new Date(0).toISOString(),
+        },
+      });
+    });
+    await openProductionHarness(page, 1, { messages: 0, crossProviderPicker: true });
+
+    await page.locator('[data-demo="model-picker"]').click();
+    await expect(page.getByRole("radio", { name: "Opus 4.8" })).toBeVisible();
+    await page.getByRole("radio", { name: "Opus 4.8" }).click();
+
+    await expect.poll(() => createBody).toEqual({ model: "claude-opus-4-8" });
+    expect(await page.evaluate(() => window.localStorage.getItem("isolade.lastModelId"))).toBe(
+      "claude-opus-4-8",
+    );
+  });
+
+  test("fills a flex creation container without a narrow intermediate width", async ({ page }) => {
+    await openProductionHarness(page, 1, { messages: 0 });
+
+    const pane = page.locator('[data-production-chat="chat-a"]');
+    const chat = pane.locator("[data-chat-root]");
+    await expect
+      .poll(async () => {
+        const [paneBounds, chatBounds] = await Promise.all([
+          pane.boundingBox(),
+          chat.boundingBox(),
+        ]);
+        if (!paneBounds || !chatBounds) return null;
+        return Math.abs(paneBounds.width - chatBounds.width);
+      })
+      .toBeLessThanOrEqual(1);
+  });
+
+  test("keeps a panel's only tab when it is dragged within its own strip", async ({ page }) => {
+    await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
+      if (route.request().method() === "PATCH") {
+        await route.fulfill({ json: {} });
+        return;
+      }
+      await route.fulfill({
+        json: {
+          layout: {
+            type: "panel",
+            id: "single-tab-panel",
+            tabs: [{ id: "single-tab", kind: "browser" }],
+            activeTabId: "single-tab",
+          },
+        },
+      });
+    });
+    await page.goto("/test/browser/harness/index.html?panelGesture=1");
+
+    const tab = page.locator('[data-tab-id="single-tab"]');
+    await expect(tab).toBeVisible();
+    for (const horizontalPosition of [0.1, 0.5, 0.9]) {
+      const bounds = await tab.boundingBox();
+      if (!bounds) throw new Error("Missing single panel tab bounds");
+      const centerX = bounds.x + bounds.width / 2;
+      const centerY = bounds.y + bounds.height / 2;
+      await page.mouse.move(centerX, centerY);
+      await page.mouse.down();
+      await page.mouse.move(centerX, centerY + 8);
+      await page.mouse.move(bounds.x + bounds.width * horizontalPosition, centerY);
+      await page.mouse.up();
+      await expect(tab).toBeVisible();
+      await expect(page.getByRole("tab")).toHaveCount(1);
+    }
+  });
+
+  test("prevents text selection throughout a panel tab drag", async ({ page }) => {
+    await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
+      if (route.request().method() === "PATCH") {
+        await route.fulfill({ json: {} });
+        return;
+      }
+      await route.fulfill({
+        json: {
+          layout: {
+            type: "panel",
+            id: "gesture-panel",
+            tabs: [
+              { id: "gesture-tab-1", kind: "browser" },
+              { id: "gesture-tab-2", kind: "browser" },
+            ],
+            activeTabId: "gesture-tab-1",
+          },
+        },
+      });
+    });
+    await page.goto("/test/browser/harness/index.html?panelGesture=1");
+
+    const tabs = page.getByRole("tab");
+    await expect(tabs).toHaveCount(2);
+    const firstTab = await tabs.first().boundingBox();
+    if (!firstTab) throw new Error("Missing first panel tab bounds");
+    await page.mouse.move(firstTab.x + firstTab.width / 2, firstTab.y + firstTab.height / 2);
+    await page.mouse.down();
+
+    expect(await page.evaluate(() => document.documentElement.style.userSelect)).toBe("none");
+    await page.mouse.move(30, 20, { steps: 5 });
+    await expect(page.locator("[data-panel-drag-ghost]")).toBeVisible();
+    expect(await page.evaluate(() => window.getSelection()?.toString())).toBe("");
+
+    await page.mouse.up();
+    expect(await page.evaluate(() => document.documentElement.style.userSelect)).toBe("");
+    await expect(page.locator("[data-panel-drag-ghost]")).toHaveCount(0);
+
+    await tabs.nth(1).click();
+    await expect(tabs.nth(1)).toHaveAttribute("aria-selected", "true");
+  });
+
+  test("positions panel drag feedback in viewport coordinates", async ({ page }) => {
+    await page.goto("/test/browser/harness/index.html?dragLayer=1");
+
+    const preview = page.locator("[data-panel-drag-preview]");
+    const ghost = page.locator("[data-panel-drag-ghost]");
+    await expect(preview).toHaveCSS("position", "fixed");
+    expect(await preview.evaluate((element) => element.parentElement === document.body)).toBe(true);
+    expect(await preview.boundingBox()).toEqual({ x: 160, y: 120, width: 240, height: 180 });
+    expect(await ghost.boundingBox()).toMatchObject({ x: 212, y: 172, height: 28 });
   });
 
   test("retains an instance chat's DOM and reading position across sidebar switches", async ({

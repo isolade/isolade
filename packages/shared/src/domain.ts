@@ -129,6 +129,83 @@ export const terminalSchema = z.object({
 });
 export const terminalArraySchema = z.array(terminalSchema);
 
+// ---- Panel layout (the dockable workspace) ----
+//
+// Each instance's workspace is a binary tree of panels, stored per instance and
+// persisted server-side (instances.layout). A leaf PanelNode holds an ordered
+// list of tabs with one active. A SplitNode divides its space between exactly
+// two children, laid out as a row (left | right) or a column (top / bottom),
+// with resizable fractional sizes that sum to 1. Dragging a tab onto a panel's
+// edge splits it; dropping in the centre just moves the tab into that panel.
+//
+// A tab is a chat, a terminal, or one of the stateless per-instance utilities
+// (browser / files / review / ports). Every tab carries its own stable `id`.
+// Chat and terminal tabs additionally point at their backing server row via
+// `resourceId`; the utilities have no backing row, so the tab id is their only
+// identity (and any number of them may coexist).
+export const tabKindSchema = z.enum(["chat", "terminal", "browser", "files", "review", "ports"]);
+export type TabKind = z.infer<typeof tabKindSchema>;
+
+export const panelTabSchema = z.object({
+  id: z.string(),
+  kind: tabKindSchema,
+  // chats.id for a "chat" tab, terminals.id for a "terminal" tab. Null/absent
+  // for the utilities, whose only identity is the tab id above.
+  resourceId: z.string().nullable().optional(),
+});
+export type PanelTab = z.infer<typeof panelTabSchema>;
+
+export const panelNodeSchema = z.object({
+  type: z.literal("panel"),
+  id: z.string(),
+  tabs: z.array(panelTabSchema),
+  activeTabId: z.string().nullable(),
+});
+
+// The recursive tree type. TypeScript can't infer a self-referential zod type,
+// so the union is written out here and z.lazy defers the self-reference in the
+// schema below.
+export type LayoutNode =
+  | z.infer<typeof panelNodeSchema>
+  | {
+      type: "split";
+      id: string;
+      direction: "row" | "column";
+      children: [LayoutNode, LayoutNode];
+      sizes: [number, number];
+    };
+
+export const layoutNodeSchema: z.ZodType<LayoutNode> = z.lazy(() =>
+  z.union([
+    panelNodeSchema,
+    z.object({
+      type: z.literal("split"),
+      id: z.string(),
+      direction: z.enum(["row", "column"]),
+      children: z.tuple([layoutNodeSchema, layoutNodeSchema]),
+      sizes: z.tuple([z.number(), z.number()]),
+    }),
+  ]),
+);
+export type PanelNode = z.infer<typeof panelNodeSchema>;
+export type SplitNode = Extract<LayoutNode, { type: "split" }>;
+// The root of an instance's layout tree.
+export type Layout = LayoutNode;
+
+// GET /api/instances/:id/layout. `null` when the instance has no saved layout
+// yet (brand-new, or created before layouts existed): the client builds a
+// default from the instance's chats.
+export const instanceLayoutResponseSchema = z.object({
+  layout: layoutNodeSchema.nullable(),
+});
+export type InstanceLayoutResponse = z.infer<typeof instanceLayoutResponseSchema>;
+
+// PATCH /api/instances/:id/layout body: the full replacement layout tree.
+export const updateInstanceLayoutBodySchema = z.object({
+  layout: layoutNodeSchema,
+});
+export type UpdateInstanceLayoutBody = z.infer<typeof updateInstanceLayoutBodySchema>;
+
 // Per-chat subscription-window share. Mirrors the SubscriptionShare interface
 // in server/src/chat/subscription-share.ts, and declared here so it can ride on
 // both the SSE `usage` event and the persisted chat snapshot the GET

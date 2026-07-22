@@ -107,6 +107,14 @@ interface SettingsPaneProps {
   // Shared with the instances sidebar: the title-bar toggle collapses whichever
   // sidebar occupies the slot, so the section nav hides when collapsed too.
   sidebarCollapsed: boolean;
+  // The settings surface reaches the top of the window. These blank drag rows
+  // keep its content below the floating traffic lights and controls while the
+  // sidebar background continues behind them.
+  topInset?: number;
+  topDrag?: {
+    onMouseDown: (e: React.MouseEvent) => void;
+    onDoubleClick: (e: React.MouseEvent) => void;
+  };
 }
 
 // Picks a typeface for one text role. Three generic defaults are always
@@ -214,6 +222,8 @@ export default function SettingsPane({
   chatModels,
   onSectionChange,
   sidebarCollapsed,
+  topInset = 0,
+  topDrag,
 }: SettingsPaneProps) {
   const debug = useDebugSetting();
   const agentFont = useAgentFontSetting();
@@ -258,18 +268,15 @@ export default function SettingsPane({
   // returns to a matching layout.
   const { width, beginResize } = useResizableSidebarWidth();
 
-  // The content card borders + rounds only where it meets chrome. With the nav
-  // shown that's the title bar (top) and the nav (left), so the top-left corner
-  // rounds. Collapsed, the left edge meets the window instead, so we drop the
-  // left border/rounding and inset 1px to clear the window's bright highlight
-  // (mirrors HomeTab's contentFrame, and settings never has a right panel).
+  // Only the edge beside the section nav needs a divider. Edges that coincide
+  // with the window stay flush and unframed, matching the panel workspace.
   const contentFrame = cn(
-    "flex-1 min-w-0 min-h-0 flex flex-col bg-background overflow-hidden border-t border-border mr-px",
-    sidebarCollapsed ? "ml-px" : "border-l rounded-tl-2xl mb-px",
+    "flex-1 min-w-0 min-h-0 flex flex-col bg-background overflow-hidden",
+    !sidebarCollapsed && "border-l border-border",
   );
 
   return (
-    <main className="flex-1 min-w-0 min-h-0 flex flex-col">
+    <main className="flex-1 min-w-0 min-h-0 flex flex-col bg-muted/30">
       <Tabs
         orientation="vertical"
         value={section}
@@ -277,10 +284,18 @@ export default function SettingsPane({
         className="flex-1 min-h-0 gap-0"
       >
         {/* The section nav is chrome: transparent so the muted body field shows
-            through, matching the instances sidebar (the title bar carries the
-            Back control). Collapses with the shared sidebar toggle. */}
+            through, matching the instances sidebar. It extends behind the
+            floating window controls, then starts its rows below them. */}
         {!sidebarCollapsed && (
           <aside className="relative flex-shrink-0 flex flex-col" style={{ width }}>
+            {topInset > 0 && (
+              // eslint-disable-next-line jsx-a11y/no-static-element-interactions
+              <div
+                className="flex-shrink-0 select-none"
+                style={{ height: topInset }}
+                {...topDrag}
+              />
+            )}
             {/* pt-px matches the instances sidebar's New-chat row so the first
               nav row sits just below the title bar at the same y; pl-[7px] pr-2
               matches the chat-list insets so the rows align pixel-for-pixel. */}
@@ -369,6 +384,10 @@ export default function SettingsPane({
             bordered only where it meets chrome, with the top-left corner rounded
             when the nav is alongside it. */}
         <div className={contentFrame}>
+          {topInset > 0 && (
+            // eslint-disable-next-line jsx-a11y/no-static-element-interactions
+            <div className="flex-shrink-0 select-none" style={{ height: topInset }} {...topDrag} />
+          )}
           <TabsContent value="about" className="flex-1 min-w-0 min-h-0">
             <AboutTab />
           </TabsContent>

@@ -1,7 +1,7 @@
 import { randomUUID } from "crypto";
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import { AUTH_MOUNT, seedVmAuth } from "./auth-sync";
-import type { PortProbe } from "./contracts";
+import type { Layout, PortProbe } from "./contracts";
 import type { Db } from "./db";
 import { schema } from "./db";
 import type { GitConfigManager } from "./git-config";
@@ -148,12 +148,34 @@ export class InstanceManager {
     // just their instance's PRs.
     prsByInstance?: Map<string, ReturnType<PrAttachmentManager["listFor"]>>,
   ) {
+    // Drop the panel layout blob from the contract: it's served/saved through
+    // the dedicated .../layout endpoints, never on the (1s-polled) instance
+    // list. See the `layout` column note in db/schema.ts.
+    const { layout: _layout, ...rest } = instance as T & { layout?: unknown };
     return {
-      ...instance,
+      ...rest,
       working: active.has(instance.id),
       ports: this.portForwards.get(instance.id) ?? [],
       prs: prsByInstance ? (prsByInstance.get(instance.id) ?? []) : this.prs.listFor(instance.id),
     };
+  }
+
+  // The dockable panel layout for this instance's workspace, or null when none
+  // has been saved yet (the client then builds a default from its chats). Read
+  // straight off the row, bypassing decorate (which strips it).
+  getLayout(id: string): Layout | null {
+    const row = this.db
+      .select({ layout: schema.instances.layout })
+      .from(schema.instances)
+      .where(eq(schema.instances.id, id))
+      .get();
+    return row?.layout ?? null;
+  }
+
+  // Persist the instance's panel layout. Does NOT bump updatedAt: rearranging
+  // panels shouldn't reorder the recency-sorted sidebar.
+  setLayout(id: string, layout: Layout): void {
+    this.db.update(schema.instances).set({ layout }).where(eq(schema.instances.id, id)).run();
   }
 
   async create(opts: { title?: string | null; profileId: string }) {

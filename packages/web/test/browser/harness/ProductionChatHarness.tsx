@@ -27,7 +27,7 @@ const ProductionChatPane = memo(function ProductionChatPane({
       data-active={visible ? "true" : "false"}
       aria-hidden={!visible}
       inert={!visible}
-      className="absolute inset-0 h-full min-h-0"
+      className="absolute inset-0 flex h-full min-h-0"
       style={{
         contain: "strict",
         opacity: visible ? 1 : 0,
@@ -64,6 +64,7 @@ export function ProductionChatHarness() {
   const parameters = useMemo(() => new URLSearchParams(window.location.search), []);
   const chatCount = Number(parameters.get("chats") ?? 2);
   const retainInstances = parameters.get("instancePanes") === "1";
+  const crossProviderPicker = parameters.get("crossProviderPicker") === "1";
   const chatsPerInstance = Math.max(1, Number(parameters.get("chatsPerInstance") ?? 1));
   const chats = useMemo<ChatRow[]>(
     () =>
@@ -74,9 +75,9 @@ export function ProductionChatHarness() {
           instanceId: retainInstances
             ? `instance-${String.fromCharCode(97 + Math.floor(index / chatsPerInstance))}`
             : "instance-production-harness",
-          model: "claude-sonnet-5",
-          provider: "anthropic",
-          effort: "high",
+          model: crossProviderPicker ? "gpt-5.6-sol" : "claude-sonnet-5",
+          provider: crossProviderPicker ? "openai" : "anthropic",
+          effort: crossProviderPicker ? "ultra" : "high",
           claudeSessionId: null,
           codexThreadId: null,
           inputTokens: null,
@@ -96,7 +97,7 @@ export function ProductionChatHarness() {
           createdAt: new Date(index * 1_000),
         };
       }),
-    [chatCount, chatsPerInstance, retainInstances],
+    [chatCount, chatsPerInstance, crossProviderPicker, retainInstances],
   );
   const instances = useMemo<Instance[]>(
     () =>
@@ -134,9 +135,12 @@ export function ProductionChatHarness() {
     return grouped;
   }, [chats]);
   const chatModels = useMemo(() => {
-    const model = findChatModel("claude-sonnet-5");
-    return model ? [model] : [];
-  }, []);
+    const ids = crossProviderPicker ? ["claude-opus-4-8", "gpt-5.6-sol"] : ["claude-sonnet-5"];
+    return ids.flatMap((id) => {
+      const model = findChatModel(id);
+      return model ? [model] : [];
+    });
+  }, [crossProviderPicker]);
   const [activeChat, setActiveChat] = useState(chats[0]!.id);
   const [retainedMounted, setRetainedMounted] = useState(true);
 

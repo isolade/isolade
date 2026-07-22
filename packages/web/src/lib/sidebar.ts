@@ -56,7 +56,9 @@ export const SIDEBAR_TABS_TRIGGER_CLASS = cn(
 
 // Geometry for the left sidebar, shared so the instances list and the settings
 // pane render at the same width and resize in lockstep.
-const MIN_WIDTH = 120;
+// Clears the full floating window-chrome cluster at the top of the instances
+// sidebar, including the Settings icon's slight negative horizontal margins.
+const MIN_WIDTH = 128;
 const MAX_WIDTH = 480;
 const DEFAULT_WIDTH = 256;
 const WIDTH_STORAGE_KEY = "isolade.sidebarWidth";

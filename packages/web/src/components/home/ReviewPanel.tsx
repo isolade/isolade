@@ -586,6 +586,6 @@ function IconButton({
   );
 }
 
-// Memoized: its props (instanceId, active) are stable while the parent SidePanel
+// Memoized: its props (instanceId, active) are stable while the parent panel
 // re-renders for unrelated reasons, so a large diff isn't reconciled needlessly.
 export default memo(ReviewPanel);

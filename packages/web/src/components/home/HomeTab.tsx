@@ -1,10 +1,9 @@
-import { ChevronLeft, PanelLeft, PanelRight, Settings } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { PromptDialog } from "@/components/ui/prompt-dialog";
-import { TRAFFIC_LIGHT_GAP } from "@/lib/tauri";
+import { TITLE_BAR_WITH_INSET_HEIGHT } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
+import { useWindowDrag } from "@/lib/window-drag";
 import { getClientId, resolveActiveProfileId } from "../../lib/activeProfile";
 import {
   activateProfile,
@@ -12,7 +11,6 @@ import {
   beaconDeactivateProfile,
   clearArchive,
   createChat,
-  createTerminal,
   detachInstancePr,
   getProfileModelOverrides,
   listChatModels,
@@ -37,19 +35,17 @@ import type {
   Terminal,
 } from "../../lib/contracts";
 import { DEFAULT_CHAT_MODEL_ID } from "../../lib/contracts";
+import ChatView from "../Chat";
 import SettingsPane, {
   DEFAULT_SETTINGS_SECTION,
   isSettingsSection,
   type SettingsSection,
 } from "../SettingsPane";
-import TitleBar from "../TitleBar";
-import TitleBarPrs from "../TitleBarPrs";
 import UpdateBanner from "../UpdateBanner";
 import InstancesSidebar from "./InstancesSidebar";
-import InstanceView from "./InstanceView";
 import NewInstancePane from "./NewInstancePane";
-import RetainedInstanceViews from "./RetainedInstanceViews";
-import SidePanel, { type PanelMode } from "./SidePanel";
+import PanelWorkspace from "./PanelWorkspace";
+import WindowChrome from "./WindowChrome";
 
 type View =
   | { kind: "drafting" }
@@ -71,8 +67,6 @@ type View =
       id: string;
       pendingFirstMessage?: { chatId: string; content: string; uploadIds?: string[] };
     };
-
-const NOOP = () => {};
 
 function apiValueEqual(left: unknown, right: unknown): boolean {
   if (Object.is(left, right)) return true;
@@ -130,43 +124,6 @@ function parseSettingsSection(pathname: string): SettingsSection | null {
 
 interface HomeTabProps {
   isTauri: boolean;
-}
-
-// Right-panel layout (collapsed + width + which body is shown) is remembered
-// per chat instance, keyed by instance id. New instances start collapsed. The
-// panel is opt-in, and opening it in terminal mode lazily spawns a shell in the
-// VM, so we don't attach one on every instance. The storage key keeps its
-// historical name for backward compatibility with already-persisted layouts.
-const PANEL_LAYOUT_KEY = "isolade.terminalLayoutByInstance";
-
-interface PanelLayout {
-  collapsed: boolean;
-  width: number;
-  mode: PanelMode;
-}
-
-const DEFAULT_PANEL_LAYOUT: PanelLayout = {
-  collapsed: true,
-  width: 380,
-  mode: "terminal",
-};
-
-function loadPanelLayouts(): Record<string, Partial<PanelLayout>> {
-  try {
-    const raw = window.localStorage.getItem(PANEL_LAYOUT_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return {};
-    const layouts = parsed as Record<string, Partial<PanelLayout>>;
-    // Migrate the legacy "preview" panel mode to its current name, so layouts
-    // persisted before the rename still open onto the browser tab.
-    for (const layout of Object.values(layouts)) {
-      if ((layout.mode as string) === "preview") layout.mode = "browser";
-    }
-    return layouts;
-  } catch {
-    return {};
-  }
 }
 
 // Left-sidebar collapse lives here (not in InstancesSidebar) because the title
@@ -250,9 +207,6 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     };
   }, [activeProfileId]);
 
-  const [panelLayouts, setPanelLayouts] =
-    useState<Record<string, Partial<PanelLayout>>>(loadPanelLayouts);
-
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(loadSidebarCollapsed);
   const toggleSidebar = useCallback(() => {
     setSidebarCollapsed((prev) => {
@@ -264,13 +218,12 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     });
   }, []);
 
-  // The sidebar toggle sits in the macOS title bar, where, on the native build,
+  // The sidebar toggle sits in the window chrome, where, on the native build,
   // some clicks land on a spot whose mousedown the OS swallows before the
   // webview sees it. No mousedown means the browser never synthesises a `click`,
   // so an `onClick` handler silently misses those presses. The mouse*up* does
-  // reach us, though, so we fire the toggle from both `click` (normal presses +
-  // keyboard) and `mouseup` (recovers the swallowed-mousedown presses), deduped
-  // so a normal press (which delivers both) only toggles once.
+  // reach us, though, so WindowChrome fires the toggle from both `click` and
+  // `mouseup`, deduped here so a normal press (which delivers both) toggles once.
   const lastToggleRef = useRef(0);
   const fireToggle = useCallback(() => {
     const now = Date.now();
@@ -279,57 +232,13 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     toggleSidebar();
   }, [toggleSidebar]);
 
-  // TEMP DEBUG: remove once the sidebar-toggle click bug is diagnosed.
-  // Capture-phase listeners on window: they fire for EVERY pointer/mouse event
-  // before any React handler. If you click the toggle and see NO "[tb ...]" line
-  // at all, the native macOS layer swallowed the event before the webview ever
-  // saw it (a native window-controls / drag region on top). If lines DO appear,
-  // compare `target` and `elementFromPoint`. If they aren't the toggle button,
-  // something inside the page is intercepting.
-  useEffect(() => {
-    // Track whether a pointerdown was actually delivered to the webview for the
-    // current press. If a pointerup arrives with no preceding pointerdown, macOS
-    // swallowed the down (native title-bar), so that's a dead click.
-    let sawDown = false;
-    const onDown = (e: Event) => {
-      const me = e as MouseEvent;
-      if (typeof me.clientY !== "number" || me.clientY > 44) return;
-      sawDown = true;
-    };
-    const onUp = (e: Event) => {
-      const me = e as MouseEvent;
-      if (typeof me.clientY !== "number" || me.clientY > 44) return;
-      const x = Math.round(me.clientX),
-        y = Math.round(me.clientY);
-      const btn = (e.target as Element)?.closest?.("button")?.getAttribute("aria-label") ?? "none";
-      const verdict = sawDown ? "OK       " : "SWALLOWED";
-      // eslint-disable-next-line no-console
-      console.log(`[verdict ${verdict}] x=${x} y=${y} over=${btn}`);
-      sawDown = false;
-    };
-    window.addEventListener("pointerdown", onDown, true);
-    window.addEventListener("pointerup", onUp, true);
-    // eslint-disable-next-line no-console
-    console.log(
-      "[tb] verdict logger active. Click around the white toggle box (left/right, top/bottom)",
-    );
-    return () => {
-      window.removeEventListener("pointerdown", onDown, true);
-      window.removeEventListener("pointerup", onUp, true);
-    };
-  }, []);
+  // Measured width of the floating window-chrome cluster, used to inset the
+  // top-left panel's tab strip so its tabs clear the traffic lights / controls.
+  const [chromeWidth, setChromeWidth] = useState(0);
 
-  // Merge a patch into one instance's layout and persist the whole map.
-  const updatePanelLayout = useCallback((instanceId: string, patch: Partial<PanelLayout>) => {
-    setPanelLayouts((prev) => {
-      const current = prev[instanceId] ?? DEFAULT_PANEL_LAYOUT;
-      const next = { ...prev, [instanceId]: { ...current, ...patch } };
-      try {
-        window.localStorage.setItem(PANEL_LAYOUT_KEY, JSON.stringify(next));
-      } catch {}
-      return next;
-    });
-  }, []);
+  // Window-drag handlers reused by the sidebar's top strip and the settings
+  // overlay's top strip (the panel tab strips get their own inside the workspace).
+  const windowDrag = useWindowDrag(isTauri);
 
   const refreshInstances = useCallback(async () => {
     try {
@@ -356,26 +265,33 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     } catch {}
   }, []);
 
-  // Tracks per-instance shell creation so the panel's open-with-no-terminal
-  // effect can fire repeatedly without spawning duplicate shells.
-  const ensuringTerminalRef = useRef<Set<string>>(new Set());
-  const ensureTerminalFor = useCallback(async (instanceId: string) => {
-    if (ensuringTerminalRef.current.has(instanceId)) return;
-    ensuringTerminalRef.current.add(instanceId);
-    try {
-      // List first so we don't create a duplicate when a shell already
-      // exists server-side, e.g. reopening a remembered-open instance
-      // before its terminals have loaded into client state.
-      let list = await listTerminals(instanceId);
-      if (list.length === 0) {
-        await createTerminal(instanceId);
-        list = await listTerminals(instanceId);
+  // Optimistic resource-set sync for the panel workspace: a tab's "+" creates a
+  // chat/terminal and immediately registers it here, so it's in the live set
+  // before the next poll and the workspace's reconcile can't drop its new tab.
+  // Closing a tab unregisters it the same way.
+  const registerChat = useCallback((chat: Chat) => {
+    setAllChats((prev) => [...prev.filter((c) => c.id !== chat.id), chat]);
+  }, []);
+  const unregisterChat = useCallback((chatId: string) => {
+    setAllChats((prev) => prev.filter((c) => c.id !== chatId));
+  }, []);
+  const registerTerminal = useCallback((terminal: Terminal) => {
+    setTerminalsByInstance((prev) => ({
+      ...prev,
+      [terminal.instanceId]: [
+        ...(prev[terminal.instanceId] ?? []).filter((t) => t.id !== terminal.id),
+        terminal,
+      ],
+    }));
+  }, []);
+  const unregisterTerminal = useCallback((terminalId: string) => {
+    setTerminalsByInstance((prev) => {
+      const next: Record<string, Terminal[]> = {};
+      for (const [key, list] of Object.entries(prev)) {
+        next[key] = list.filter((t) => t.id !== terminalId);
       }
-      setTerminalsByInstance((prev) => ({ ...prev, [instanceId]: list }));
-    } catch {
-    } finally {
-      ensuringTerminalRef.current.delete(instanceId);
-    }
+      return next;
+    });
   }, []);
 
   useEffect(() => {
@@ -637,14 +553,6 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     setInstances((prev) => prev.map((c) => (c.id === instanceId ? { ...c, title } : c)));
   }, []);
 
-  const handleInstanceResourceChange = useCallback(
-    (instanceId: string) => {
-      void refreshChats();
-      void refreshTerminalsFor(instanceId);
-    },
-    [refreshChats, refreshTerminalsFor],
-  );
-
   // Detach a PR badge from a chat. Optimistic: drop it locally so it disappears
   // at once, then persist. The 1s instance poll reconciles either way, so a
   // failed request just self-heals on the next round.
@@ -780,8 +688,9 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     }
   };
 
-  // Drop all client-side state tied to a set of just-deleted instances (chats,
-  // terminals, and their remembered right-panel layouts).
+  // Drop all client-side state tied to a set of just-deleted instances (chats
+  // and terminals). Their panel layouts live in the DB and vanish with the
+  // instance row.
   const forgetInstances = (ids: Set<string>) => {
     if (ids.size === 0) return;
     setInstances((prev) => prev.filter((c) => !ids.has(c.id)));
@@ -789,15 +698,6 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     setTerminalsByInstance((prev) => {
       const next = { ...prev };
       for (const id of ids) delete next[id];
-      return next;
-    });
-    setPanelLayouts((prev) => {
-      if (![...ids].some((id) => id in prev)) return prev;
-      const next = { ...prev };
-      for (const id of ids) delete next[id];
-      try {
-        window.localStorage.setItem(PANEL_LAYOUT_KEY, JSON.stringify(next));
-      } catch {}
       return next;
     });
   };
@@ -874,7 +774,6 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
       ),
     [activeInstanceId, activeProfileId, instances],
   );
-
   // Sidebar only shows instances whose title has landed (either the
   // auto-generated one or the server-side truncation fallback). Untitled
   // rows include pre-submit drafts and the brief window between submit and
@@ -894,132 +793,23 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     setSettingsSection(null);
   };
 
-  // The right panel only exists alongside a live instance. Its terminal needs
-  // a running VM and its preview needs the VM's forwarded ports. The title bar
-  // owns its toggle. The body mounts the panel only while it's open.
-  const showSidePanel = view.kind === "instance" && activeInstance != null;
-  const sidebarTerminal =
-    activeInstanceId != null ? ((terminalsByInstance[activeInstanceId] ?? [])[0] ?? null) : null;
-
-  // Per-instance layout, spread over the default so partial (e.g. pre-`mode`)
-  // persisted entries still resolve every field.
-  const activeLayout: PanelLayout = {
-    ...DEFAULT_PANEL_LAYOUT,
-    ...(activeInstanceId != null ? panelLayouts[activeInstanceId] : null),
-  };
-
   const settingsOpen = settingsSection !== null;
-  const panelOpen = showSidePanel && !activeLayout.collapsed;
 
-  // Border + rounding only along the edges that meet chrome: the title bar on
-  // top (always), and a sidebar on the left/right when it's extended. A corner
-  // rounds only where both of its edges are bordered.
-  //
-  // On the sides that meet the WINDOW edge (the bottom, plus any collapsed
-  // side) we instead inset by 1px. The window paints a bright inset highlight
-  // along its inner edge (the native chrome in Tauri, .mac-window::after in the
-  // browser). Without the gap, the end of our border line would sit under it
-  // and flare into a bright pip. The 1px gap keeps the border clear of it.
-  const contentFrame = cn(
-    "border-t border-border",
-    !sidebarCollapsed ? "border-l rounded-tl-2xl" : "ml-px",
-    panelOpen ? "border-r rounded-tr-2xl" : "mr-px",
-    (!sidebarCollapsed || panelOpen) && "mb-px",
-  );
-
-  // Title-bar chrome. The sidebar toggle and the settings gear sit together in
-  // the left cluster (gear right of the toggle). The history back/forward
-  // arrows sit just left of the search field. The toggle and arrows are present
-  // in both modes. Only the gear's slot swaps: the settings gear in the
-  // workspace, the "Back" control that closes settings while it's open.
-  //
-  // These ghost buttons drop the default hover fill and focus ring: in the
-  // window chrome a tinted rectangle on hover/click reads as a stray box, so we
-  // signal interactivity with the icon colour shift (muted → foreground) alone.
-  //
-  // `transition-colors` (not the Button base's `transition-all`): the gear and
-  // the settings "Back" share one DOM node across the mode swap, so animating
-  // size/position would make Back appear to grow and slide in as it morphs from
-  // the gear. We want only the hover colour to ease. The box change is instant.
-  const chromeBase =
-    "text-muted-foreground hover:text-foreground hover:bg-transparent dark:hover:bg-transparent transition-colors focus-visible:ring-0";
-  const titleLeft = (
-    <div className="inline-flex h-full items-center" style={{ gap: TRAFFIC_LIGHT_GAP }}>
-      <button
-        className={chromeBase}
-        onMouseUp={(e) => {
-          if (e.button === 0) fireToggle();
-        }}
-        onClick={fireToggle}
-        aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-      >
-        <PanelLeft size={17} />
-      </button>
-      {/* Immediately right of the sidebar toggle: the settings gear in the
-          workspace, swapped for the "Back" control that closes the settings
-          overlay while it's open. The two share one DOM node across the swap
-          (see the chromeBase note above) so only the hover colour eases. */}
-      {settingsOpen ? (
-        <Button
-          variant="ghost"
-          size="xs"
-          className={chromeBase}
-          onClick={handleCloseSettings}
-          aria-label="Back"
-          data-demo="settings-back"
-        >
-          <ChevronLeft className="size-3.5" />
-          Back
-        </Button>
-      ) : (
-        <button
-          style={{ marginLeft: -2, marginRight: -2 }}
-          className={chromeBase}
-          onClick={handleOpenSettings}
-          aria-label="Settings"
-        >
-          <Settings size={17} />
-        </button>
-      )}
-    </div>
-  );
-  // The active chat's attached PRs, centred in the title bar. Hidden while
-  // settings is open (there's no chat in focus then).
-  const titleCenter =
-    !settingsOpen && activeInstance && (activeInstance.prs?.length ?? 0) > 0 ? (
-      <TitleBarPrs
-        prs={activeInstance.prs ?? []}
-        onDetach={(pr) => handleDetachPr(activeInstance.id, pr)}
-      />
-    ) : null;
-  const titleRight =
-    !settingsOpen && showSidePanel && activeInstanceId ? (
-      <button
-        className={chromeBase}
-        onClick={() =>
-          updatePanelLayout(activeInstanceId, {
-            collapsed: !activeLayout.collapsed,
-          })
-        }
-        aria-label={activeLayout.collapsed ? "Show panel" : "Hide panel"}
-      >
-        <PanelRight size={17} />
-      </button>
-    ) : null;
+  // Only draw an edge where the content meets another surface. Window edges
+  // stay flush and unframed; internal panel boundaries are owned by the panel
+  // tree itself.
+  const contentFrame = !sidebarCollapsed ? "border-l border-border" : undefined;
 
   return (
     <div className="flex-1 min-h-0 flex flex-col">
-      <TitleBar isTauri={isTauri} left={titleLeft} right={titleRight} center={titleCenter} />
-
       <UpdateBanner />
 
-      {/* Body region: the muted chrome field. The content card floats on it and
-          rounds against it on the sidebar-adjacent sides. */}
+      {/* Body region: the muted chrome field. The panel workspace floats on it,
+          and the window-chrome cluster floats above everything at the top-left. */}
       <div className="relative flex-1 min-h-0 bg-muted/30">
         {/* The workspace stays mounted while settings is open so its transient
-            UI state (chat scroll position, composer drafts, terminal
-            scrollback) survives the round-trip. `inert` while covered keeps it
-            out of the tab order and unfocusable. */}
+            UI state (chat scroll, composer drafts, terminal scrollback) survives
+            the round-trip. `inert` while covered keeps it out of the tab order. */}
         <div className="flex h-full w-full min-w-0" inert={settingsOpen}>
           {!sidebarCollapsed && (
             <InstancesSidebar
@@ -1028,6 +818,8 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
               archivedInstances={archivedInstances}
               selectedId={view.kind === "instance" ? view.id : null}
               isDrafting={view.kind === "drafting"}
+              topInset={TITLE_BAR_WITH_INSET_HEIGHT}
+              topDrag={windowDrag}
               onNew={handleNew}
               onSelect={handleSelect}
               onRename={handleRename}
@@ -1050,6 +842,13 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
             <div className="relative min-h-0 flex-1">
               {view.kind === "drafting" && (
                 <div className="absolute inset-0 flex min-h-0">
+                  <div
+                    data-demo="new-chat-window-drag"
+                    className="absolute inset-x-0 top-0 z-10 flex-shrink-0 select-none"
+                    style={{ height: TITLE_BAR_WITH_INSET_HEIGHT }}
+                    aria-hidden
+                    {...windowDrag}
+                  />
                   <NewInstancePane
                     profileId={activeProfileId}
                     chatModels={chatModels}
@@ -1060,36 +859,64 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
                 </div>
               )}
 
-              <RetainedInstanceViews
-                instances={retainedInstances}
-                chatsByInstance={chatsByInstance}
-                activeInstanceId={activeInstanceId}
-                pendingFirstMessage={
-                  view.kind === "instance" ? (view.pendingFirstMessage ?? null) : null
-                }
-                chatModels={chatModels}
-                modelOverrides={modelOverrides}
-                onTitleAutoUpdated={handleTitleAutoUpdated}
-                onResourceChange={handleInstanceResourceChange}
-              />
+              {retainedInstances.map((instance) => {
+                const isActive = instance.id === activeInstanceId;
+                return (
+                  <div
+                    key={instance.id}
+                    data-retained-instance={instance.id}
+                    className="absolute inset-0 flex min-h-0"
+                    aria-hidden={!isActive}
+                    inert={!isActive}
+                    style={{
+                      contain: "strict",
+                      opacity: isActive ? 1 : 0,
+                      pointerEvents: isActive ? "auto" : "none",
+                    }}
+                  >
+                    <PanelWorkspace
+                      instance={instance}
+                      chats={chatsByInstance.get(instance.id) ?? []}
+                      terminals={terminalsByInstance[instance.id] ?? []}
+                      ports={instance.ports ?? []}
+                      prs={instance.prs ?? []}
+                      chatModels={chatModels}
+                      modelOverrides={modelOverrides}
+                      pendingFirstMessage={
+                        isActive && view.kind === "instance"
+                          ? (view.pendingFirstMessage ?? null)
+                          : null
+                      }
+                      visible={isActive}
+                      sidebarCollapsed={sidebarCollapsed}
+                      chromeInset={chromeWidth}
+                      isTauri={isTauri}
+                      onTitleAutoUpdated={handleTitleAutoUpdated}
+                      onDetachPr={(pr) => handleDetachPr(instance.id, pr)}
+                      onChatCreated={registerChat}
+                      onChatDeleted={unregisterChat}
+                      onTerminalCreated={registerTerminal}
+                      onTerminalDeleted={unregisterTerminal}
+                    />
+                  </div>
+                );
+              })}
 
               {view.kind === "creating" && (
                 <div className="absolute inset-0 flex min-h-0">
-                  <InstanceView
+                  <ChatView
                     instanceId={view.synth.id}
-                    chats={[view.synthChat]}
+                    chatId={view.synthChat.id}
+                    model={view.synthChat.model}
+                    effort={view.synthChat.effort}
+                    chat={view.synthChat}
                     chatModels={chatModels}
                     modelOverrides={modelOverrides}
                     visible
-                    pendingFirstMessage={{
-                      chatId: view.synthChat.id,
-                      content: view.firstMessage,
-                      uploadIds: view.firstUploadIds,
-                    }}
+                    initialMessage={view.firstMessage}
+                    initialUploadIds={view.firstUploadIds}
                     pending
                     creationError={view.error}
-                    onTitleAutoUpdated={NOOP}
-                    onResourceChange={NOOP}
                   />
                 </div>
               )}
@@ -1101,39 +928,37 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
               )}
             </div>
           </div>
-
-          {panelOpen && activeInstanceId && (
-            <SidePanel
-              instanceId={activeInstanceId}
-              terminal={sidebarTerminal}
-              ports={activeInstance?.ports ?? []}
-              width={activeLayout.width}
-              mode={activeLayout.mode}
-              onModeChange={(mode) => updatePanelLayout(activeInstanceId, { mode })}
-              onWidthChange={(w) => updatePanelLayout(activeInstanceId, { width: w })}
-              onEnsureTerminal={() => void ensureTerminalFor(activeInstanceId)}
-            />
-          )}
         </div>
 
-        {/* Settings overlay, covering the body region below the title bar (the
-            bar stays put and swaps its left controls to Back). Opaque base so
-            the inert workspace behind never shows through; the inner layer
-            paints the same muted chrome field as the workspace. */}
+        {/* Settings overlay covers the whole body region, including behind the
+            floating window controls. SettingsPane reserves its own top rows so
+            the sidebar background reaches the window edge while content clears
+            the controls. */}
         {settingsSection !== null && (
-          <div className="absolute inset-0 z-40 bg-background">
-            <div className="flex h-full w-full bg-muted/30">
-              <SettingsPane
-                isTauri={isTauri}
-                section={settingsSection}
-                activeProfileId={activeProfileId}
-                chatModels={chatModels}
-                onSectionChange={setSettingsSection}
-                sidebarCollapsed={sidebarCollapsed}
-              />
-            </div>
+          <div className="absolute inset-0 z-40 flex bg-background">
+            <SettingsPane
+              isTauri={isTauri}
+              section={settingsSection}
+              activeProfileId={activeProfileId}
+              chatModels={chatModels}
+              onSectionChange={setSettingsSection}
+              sidebarCollapsed={sidebarCollapsed}
+              topInset={TITLE_BAR_WITH_INSET_HEIGHT}
+              topDrag={windowDrag}
+            />
           </div>
         )}
+
+        {/* Window-chrome cluster: traffic lights, sidebar toggle, and settings
+            toggle. Floats above both the workspace and settings overlay. */}
+        <WindowChrome
+          isTauri={isTauri}
+          settingsOpen={settingsOpen}
+          onToggleSidebar={fireToggle}
+          onOpenSettings={handleOpenSettings}
+          onCloseSettings={handleCloseSettings}
+          onWidthChange={setChromeWidth}
+        />
       </div>
 
       <PromptDialog

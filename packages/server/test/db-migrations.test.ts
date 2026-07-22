@@ -9,11 +9,31 @@ import { createDb, schema } from "../src/db";
 
 // Build a database at the version-2 shape for the tables migration 3 touches
 // (chats without active_leaf_id, chat_messages without the tree columns), so
-// createDb has to run the real upgrade ladder against it. The other tables are
-// left absent: createSchema's IF NOT EXISTS installs them at the current shape,
-// which is identical for them across v2 → v3.
+// createDb has to run the real upgrade ladder against it. The instances table
+// is also kept at its pre-layout shape so migration 7 exercises its ALTER.
 function seedV2Db(path: string): { chatId: string; emptyChatId: string; messageIds: string[] } {
   const sqlite = new Database(path);
+  sqlite.run(`
+    CREATE TABLE instances (
+      id TEXT PRIMARY KEY,
+      vm_id TEXT NOT NULL,
+      title TEXT,
+      status TEXT NOT NULL DEFAULT 'running',
+      last_error TEXT,
+      setup_done INTEGER NOT NULL DEFAULT 0,
+      image TEXT NOT NULL,
+      profile_id TEXT,
+      diff_added INTEGER,
+      diff_deleted INTEGER,
+      unread INTEGER NOT NULL DEFAULT 0,
+      archived INTEGER NOT NULL DEFAULT 0,
+      pinned INTEGER NOT NULL DEFAULT 0,
+      expose_sandbox INTEGER NOT NULL DEFAULT 0,
+      seed_profiles TEXT,
+      created_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER)),
+      updated_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER))
+    )
+  `);
   sqlite.run(`
     CREATE TABLE chats (
       id TEXT PRIMARY KEY,
@@ -155,7 +175,7 @@ function seedV3Db(path: string): { chatId: string; newestOrphanId: string } {
   return { chatId, newestOrphanId };
 }
 
-describe("db migrations 3-6 (message tree, attachments, and rendering)", () => {
+describe("db migrations 3-7 (message tree, attachments, rendering, and panel layout)", () => {
   it("backfills linear parent chains, the active leaf, and the parent index", () => {
     const path = join(tmpdir(), `isolade-mig3-${randomUUID()}.db`);
     try {
@@ -186,7 +206,7 @@ describe("db migrations 3-6 (message tree, attachments, and rendering)", () => {
       const raw = new Database(path);
       const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(6);
+      expect(version).toBe(7);
       // Migration 4 installed the uploads table.
       const uploadsTable = raw
         .query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'uploads'`)
@@ -298,6 +318,59 @@ describe("db migration 5 (message upload associations)", () => {
           position: 0,
         },
       ]);
+    } finally {
+      rmSync(path, { force: true });
+      rmSync(`${path}-wal`, { force: true });
+      rmSync(`${path}-shm`, { force: true });
+    }
+  });
+});
+
+describe("db migration 7 (panel layout)", () => {
+  it("adds a null instances.layout column to an existing database", () => {
+    const path = join(tmpdir(), `isolade-mig7-${randomUUID()}.db`);
+    try {
+      const sqlite = new Database(path);
+      sqlite.run(`
+        CREATE TABLE instances (
+          id TEXT PRIMARY KEY,
+          vm_id TEXT NOT NULL,
+          title TEXT,
+          status TEXT NOT NULL DEFAULT 'running',
+          last_error TEXT,
+          setup_done INTEGER NOT NULL DEFAULT 0,
+          image TEXT NOT NULL,
+          profile_id TEXT,
+          diff_added INTEGER,
+          diff_deleted INTEGER,
+          unread INTEGER NOT NULL DEFAULT 0,
+          archived INTEGER NOT NULL DEFAULT 0,
+          pinned INTEGER NOT NULL DEFAULT 0,
+          expose_sandbox INTEGER NOT NULL DEFAULT 0,
+          seed_profiles TEXT,
+          created_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER)),
+          updated_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER))
+        )
+      `);
+      const instanceId = randomUUID();
+      sqlite.run(`INSERT INTO instances (id, vm_id, image) VALUES (?, 'vm-1', 'img-1')`, [
+        instanceId,
+      ]);
+      sqlite.run(`PRAGMA user_version = 6`);
+      sqlite.close();
+
+      const db = createDb(path);
+      const row = db
+        .select()
+        .from(schema.instances)
+        .where(eq(schema.instances.id, instanceId))
+        .get();
+      expect(row?.layout ?? null).toBeNull();
+
+      const version = (
+        new Database(path).query("PRAGMA user_version").get() as { user_version: number }
+      ).user_version;
+      expect(version).toBe(7);
     } finally {
       rmSync(path, { force: true });
       rmSync(`${path}-wal`, { force: true });

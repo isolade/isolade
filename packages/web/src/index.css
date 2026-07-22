@@ -130,6 +130,25 @@ svg.animate-spin {
   margin-top: 0.75rem;
 }
 
+/* Cheap, library-free virtualization for the chat history. Every mounted tab of
+   a panel stays mounted and is hidden with `display:none` (see PanelWorkspace),
+   so activating a tab flips it back to `display:block` and the
+   browser must lay out and paint the entire message list in one synchronous
+   frame. For a long chat — many messages, big highlighted code blocks — that
+   first layout is what makes the click feel sluggish.
+
+   `content-visibility:auto` lets the browser skip layout+paint for rows
+   outside (and not near) the viewport, so showing a tab only costs the handful
+   of messages actually on screen; the rest render lazily as they scroll in.
+   `contain-intrinsic-size: auto <fallback>` supplies a placeholder height for
+   skipped rows so the scrollbar stays sane, and the `auto` keyword makes the
+   browser remember each row's real size once it has been rendered, so scroll
+   position is stable after the first reveal. */
+.chat-message {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 100px;
+}
+
 .markdown-fragment[data-first-fragment="false"] > h3:first-child {
   margin-top: 0.5rem;
 }

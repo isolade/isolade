@@ -4,6 +4,12 @@ import { MessageBox } from "@/components/MessageBox";
 import { ModelEffortPicker } from "@/components/ModelEffortPicker";
 import { beaconDeleteInstance, createInstance, deleteInstance } from "../../lib/api";
 import {
+  readLastEffort,
+  readLastModelId,
+  writeLastEffort,
+  writeLastModelId,
+} from "../../lib/chat-defaults";
+import {
   type ChatEffort,
   type ChatModelDefinition,
   clampEffortToModel,
@@ -14,26 +20,6 @@ import {
   splitModelsByTier,
 } from "../../lib/contracts";
 import { useAttachments } from "../../lib/use-attachments";
-
-const MODEL_STORAGE_KEY = "isolade.lastModelId";
-const EFFORT_STORAGE_KEY = "isolade.lastEffort";
-
-function readStoredModelId(): string | null {
-  try {
-    return window.localStorage.getItem(MODEL_STORAGE_KEY);
-  } catch {
-    return null;
-  }
-}
-
-function readStoredEffort(): ChatEffort | null {
-  try {
-    // Any non-empty string is a valid effort; the drafter clamps it to the
-    // chosen model's supported set (clampEffortToModel) before it's used.
-    return window.localStorage.getItem(EFFORT_STORAGE_KEY) || null;
-  } catch {}
-  return null;
-}
 
 interface NewInstancePaneProps {
   profileId: string | null;
@@ -58,28 +44,24 @@ export default function NewInstancePane({
   onSubmit,
 }: NewInstancePaneProps) {
   const [input, setInput] = useState("");
-  const [modelId, setModelId] = useState(() => readStoredModelId() ?? defaultModelId);
+  const [modelId, setModelId] = useState(() => readLastModelId() ?? defaultModelId);
   const modelDef = useMemo(
     () => chatModels.find((m) => m.id === modelId) ?? findChatModel(modelId),
     [chatModels, modelId],
   );
   const [effort, setEffort] = useState<ChatEffort>(
-    () => readStoredEffort() ?? modelDef?.defaultEffort ?? "high",
+    () => readLastEffort() ?? modelDef?.defaultEffort ?? "high",
   );
   // Persist only deliberate picker selections. Automatic snapping (effort
   // clamp on model change, catalog-fallback model swap) shouldn't overwrite
   // the user's last explicit choice.
   const handlePickModel = useCallback((next: string) => {
     setModelId(next);
-    try {
-      window.localStorage.setItem(MODEL_STORAGE_KEY, next);
-    } catch {}
+    writeLastModelId(next);
   }, []);
   const handlePickEffort = useCallback((next: ChatEffort) => {
     setEffort(next);
-    try {
-      window.localStorage.setItem(EFFORT_STORAGE_KEY, next);
-    } catch {}
+    writeLastEffort(next);
   }, []);
   // No server in the loop yet. When the user picks a model whose effort
   // menu doesn't include the current value, snap to that model's default.
