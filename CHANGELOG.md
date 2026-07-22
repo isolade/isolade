@@ -6,6 +6,8 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+## [0.3.0] - 2026-07-22
+
 ### Added
 
 - Added chat thinking indicators. Codex shows thinking updates, while Claude
