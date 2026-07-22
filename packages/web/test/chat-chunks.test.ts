@@ -84,6 +84,53 @@ describe("applyEvent", () => {
     });
   });
 
+  it("assembles provider thinking progress into one visible thought", () => {
+    const chunks = fold([
+      ["thinking_start", { id: "reasoning-1", provider: "codex" }],
+      ["thinking_delta", { id: "reasoning-1", provider: "codex", text: "**Checking" }],
+      ["thinking_delta", { id: "reasoning-1", provider: "codex", text: " tests**" }],
+      ["thinking_done", { id: "reasoning-1", provider: "codex", text: "**Checking tests**" }],
+    ]);
+    expect(chunks).toEqual([
+      {
+        kind: "thought",
+        id: "reasoning-1",
+        provider: "codex",
+        text: "**Checking tests**",
+        status: "done",
+      },
+    ]);
+  });
+
+  it("tracks Claude's total thinking-token estimate", () => {
+    const chunks = fold([
+      ["thinking_start", { id: "claude-thinking-0", provider: "claude" }],
+      [
+        "thinking_tokens",
+        { id: "claude-thinking-0", provider: "claude", tokens: 768, tokensDelta: 372 },
+      ],
+      [
+        "thinking_done",
+        {
+          id: "claude-thinking-0",
+          provider: "claude",
+          text: "A useful summary",
+          tokens: 768,
+        },
+      ],
+    ]);
+    expect(chunks).toEqual([
+      {
+        kind: "thought",
+        id: "claude-thinking-0",
+        provider: "claude",
+        text: "A useful summary",
+        tokens: 768,
+        status: "done",
+      },
+    ]);
+  });
+
   it("ignores non-chunk events (usage, title, turn_started)", () => {
     const chunks = fold([
       ["usage", { last: {}, total: {} }],
@@ -136,6 +183,22 @@ describe("live reveal projection", () => {
     expect(revealChunks(chunks, 7)).toEqual([chunks[0], chunks[1], { kind: "text", text: "wo" }]);
     expect(revealChunks(chunks, 10)).toEqual(chunks);
     expect(revealChunks(chunks, 10)).not.toBe(chunks);
+  });
+
+  it("reveals thought summaries as readable content", () => {
+    const chunks = [
+      {
+        kind: "thought",
+        id: "thought-1",
+        provider: "claude",
+        text: "summary",
+        tokens: 100,
+        status: "done",
+      },
+    ] satisfies StreamChunk[];
+
+    expect(revealableLength(chunks)).toBe(7);
+    expect(revealChunks(chunks, 3)).toEqual([{ ...chunks[0], text: "sum" }]);
   });
 
   it("does not expose half of a surrogate pair", () => {

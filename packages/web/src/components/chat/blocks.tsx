@@ -5,21 +5,25 @@
 
 import {
   Bot,
+  ChevronDown,
   FilePen,
   FileText,
   Globe,
   ListChecks,
   type LucideIcon,
   Search,
+  Sparkles,
   Terminal,
   TriangleAlert,
   Wrench,
 } from "lucide-react";
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { summarizeChatToolInput } from "@/lib/contracts";
 import { cn } from "@/lib/utils";
 import StreamingMarkdown from "../StreamingMarkdown";
 import type { StreamChunk, ToolChunk } from "./chunks";
+
+type ThoughtChunk = Extract<StreamChunk, { kind: "thought" }>;
 
 // Visual presentation per tool: icon + present/past verb. Verb-based naming
 // reads more naturally than the raw tool name ("Reading file.ts" vs "Read:
@@ -87,6 +91,125 @@ const ThinkingBlock = memo(function ThinkingBlock({ text }: { text: string }) {
             {text}
           </p>
         ))}
+    </div>
+  );
+});
+
+function useAnimatedInteger(target: number | undefined): number | undefined {
+  const [displayed, setDisplayed] = useState(target === undefined ? undefined : 0);
+  const displayedRef = useRef(displayed ?? 0);
+  useEffect(() => {
+    if (target === undefined) {
+      displayedRef.current = 0;
+      setDisplayed(undefined);
+      return;
+    }
+    if (globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      displayedRef.current = target;
+      setDisplayed(target);
+      return;
+    }
+    const from = displayedRef.current;
+    const startedAt = performance.now();
+    const duration = Math.min(700, Math.max(260, Math.abs(target - from) * 0.8));
+    let frame = 0;
+    const tick = (now: number) => {
+      const progress = Math.min(1, (now - startedAt) / duration);
+      const eased = 1 - (1 - progress) ** 3;
+      const next = Math.round(from + (target - from) * eased);
+      displayedRef.current = next;
+      setDisplayed(next);
+      if (progress < 1) frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [target]);
+  return displayed;
+}
+
+function thoughtPreview(text: string): string {
+  const lines = text
+    .replace(/<!--.*?-->/gs, "")
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return (lines.at(-1) ?? "")
+    .replace(/^#{1,6}\s+/, "")
+    .replace(/^\*\*(.+)\*\*$/, "$1")
+    .replace(/^__(.+)__$/, "$1");
+}
+
+function thoughtDisplayText(chunk: ThoughtChunk): string {
+  if (chunk.provider !== "codex") return chunk.text;
+  return chunk.text.replace(/\*\*(.*?)\*\*/gs, "$1").replace(/__(.*?)__/gs, "$1");
+}
+
+const ThoughtBlock = memo(function ThoughtBlock({ chunk }: { chunk: ThoughtChunk }) {
+  const active = chunk.status === "thinking";
+  const [open, setOpen] = useState(chunk.provider === "claude");
+  const tokens = useAnimatedInteger(chunk.tokens);
+  const displayText = thoughtDisplayText(chunk);
+  const preview = thoughtPreview(displayText);
+  const canExpand = displayText.trim().length > 0;
+  const label = active ? "Thinking" : "Thought";
+  return (
+    <div
+      data-thinking-provider={chunk.provider}
+      data-thinking-status={chunk.status}
+      className="my-2 font-sans"
+    >
+      <button
+        type="button"
+        disabled={!canExpand}
+        aria-expanded={canExpand ? open : undefined}
+        onClick={() => canExpand && setOpen((value) => !value)}
+        className="group flex max-w-full items-center gap-2 rounded-md py-0.5 text-left text-[13px] disabled:cursor-default"
+      >
+        <span className="relative flex size-4 shrink-0 items-center justify-center">
+          {active && (
+            <span className="absolute inset-0 rounded-full bg-foreground/10 animate-ping motion-reduce:animate-none" />
+          )}
+          <Sparkles
+            className={cn(
+              "relative size-3.5 text-muted-foreground transition-colors",
+              active && "thinking-spark text-foreground/80",
+            )}
+          />
+        </span>
+        <span
+          className={cn("shrink-0 font-medium", active ? "text-shimmer" : "text-muted-foreground")}
+        >
+          {label}
+        </span>
+        {tokens !== undefined && (
+          <span className="shrink-0 tabular-nums text-muted-foreground/80">
+            · {tokens.toLocaleString()} tokens
+          </span>
+        )}
+        {preview && !open && (
+          <span className="min-w-0 truncate text-muted-foreground/80">· {preview}</span>
+        )}
+        {canExpand && (
+          <ChevronDown
+            className={cn(
+              "size-3.5 shrink-0 text-muted-foreground/60 transition-transform duration-200 group-hover:text-muted-foreground",
+              open && "rotate-180",
+            )}
+          />
+        )}
+      </button>
+      <div
+        className={cn(
+          "grid transition-[grid-template-rows] duration-200 ease-out",
+          open && canExpand ? "grid-rows-[1fr]" : "grid-rows-[0fr]",
+        )}
+      >
+        <div className="overflow-hidden">
+          <div className="ml-2 mt-1 border-l border-border/70 pl-4 text-sm text-muted-foreground">
+            <StreamingMarkdown content={displayText} streaming={active} />
+          </div>
+        </div>
+      </div>
     </div>
   );
 });
@@ -291,6 +414,7 @@ export const StreamView = memo(function StreamView({
           return <ToolCallBlock key={i} chunk={chunk} onRequestDetails={onRequestToolDetails} />;
         }
         if (chunk.kind === "api_retry") return <RetryBlock key={i} chunk={chunk} />;
+        if (chunk.kind === "thought") return <ThoughtBlock key={chunk.id} chunk={chunk} />;
         if (!showDebug) return null;
         if (chunk.kind === "thinking") return <ThinkingBlock key={i} text={chunk.text} />;
         return (

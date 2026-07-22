@@ -8,6 +8,8 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Added
 
+- Added chat thinking indicators. Codex shows thinking updates, while Claude
+  shows thinking token counts and summaries.
 - Chat messages can now carry file attachments. Use the paperclip on the
   bottom-left of the composer, or paste an image straight from the clipboard
   (Cmd+V), and it shows up as a preview before you send. Attachments are placed

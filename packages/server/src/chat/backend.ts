@@ -37,6 +37,23 @@ export type ChatEvent =
   | { type: "tool_call_start"; id: string; name: string }
   | { type: "tool_call_input"; id: string; input: unknown }
   | { type: "tool_call_result"; id: string; output: string; isError?: boolean }
+  | { type: "thinking_start"; id: string; provider: "claude" | "codex" }
+  | { type: "thinking_delta"; id: string; provider: "claude" | "codex"; text: string }
+  | {
+      type: "thinking_tokens";
+      id: string;
+      provider: "claude" | "codex";
+      tokens?: number;
+      tokensDelta?: number;
+    }
+  | {
+      type: "thinking_done";
+      id: string;
+      provider: "claude" | "codex";
+      text?: string;
+      tokens?: number;
+    }
+  // Legacy debug-only reasoning payload retained for old persisted turns.
   | { type: "thinking"; text: string }
   | {
       type: "usage";

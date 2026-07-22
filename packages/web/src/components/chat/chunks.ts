@@ -27,7 +27,8 @@ export interface UsageState {
 
 // One renderable piece of an assistant turn. Each variant has its own UI:
 // - text: streamed Markdown body
-// - thinking: extended-thinking block, italic body text in a subtle callout
+// - thought: provider reasoning progress and its final user-facing summary
+// - thinking: legacy extended-thinking debug payload
 // - tool: a single tool call (start + input + result merged by id), shown as
 //   a collapsible card with a one-line summary
 // - raw: any other provider event (unknown shapes) shown as a collapsible
@@ -130,7 +131,9 @@ export function replaceChunksFromSnapshot(
 export function revealableLength(chunks: readonly StreamChunk[]): number {
   let length = 0;
   for (const chunk of chunks) {
-    if (chunk.kind === "text" || chunk.kind === "thinking") length += chunk.text.length;
+    if (chunk.kind === "text" || chunk.kind === "thought" || chunk.kind === "thinking") {
+      length += chunk.text.length;
+    }
   }
   return length;
 }
@@ -152,7 +155,7 @@ export function revealChunks(chunks: readonly StreamChunk[], budget: number): St
   const revealed: StreamChunk[] = [];
   let remaining = Math.max(0, budget);
   for (const chunk of chunks) {
-    if (chunk.kind !== "text" && chunk.kind !== "thinking") {
+    if (chunk.kind !== "text" && chunk.kind !== "thought" && chunk.kind !== "thinking") {
       revealed.push(chunk);
       continue;
     }

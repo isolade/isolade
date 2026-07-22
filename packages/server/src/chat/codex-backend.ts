@@ -207,6 +207,7 @@ export class CodexBackend implements ChatBackend {
           reject(new Error(turn.error?.message ?? "turn failed"));
           return;
         }
+        for (const itemId of reasoning.keys()) finishReasoning(itemId);
         cleanup();
         resolve();
       });
@@ -229,18 +230,39 @@ export class CodexBackend implements ChatBackend {
       // events the UI already renders for Claude.
       const seenTools = new Set<string>();
       const finishedTools = new Set<string>();
-      // Reasoning items model the assistant's chain-of-thought. They arrive
-      // through the same item/* methods as tool calls, but they aren't tool
-      // calls, so they should render as a `thinking` block. The dump is the
-      // full item JSON so the user sees everything codex sent without our
-      // guessing about field names. Dedup by serialized content so a no-op
-      // update doesn't produce a duplicate block.
-      const lastReasoningJson = new Map<string, string>();
-      const handleReasoning = (item: CodexItem) => {
-        const text = JSON.stringify(item, null, 2);
-        if (lastReasoningJson.get(item.id) === text) return;
-        lastReasoningJson.set(item.id, text);
-        opts.onEvent?.({ type: "thinking", text });
+      // Codex's summaryTextDelta notifications are the public reasoning
+      // summary stream. For each item, concatenating deltas within each
+      // summaryIndex reconstructs the corresponding entry in the completed
+      // item's `summary` array. Keep those parts separate while streaming so
+      // we can preserve the section breaks and reconcile with the final item.
+      const reasoning = new Map<string, { parts: Map<number, string>; done: boolean }>();
+      const ensureReasoning = (itemId: string) => {
+        const existing = reasoning.get(itemId);
+        if (existing) return existing;
+        const state = { parts: new Map<number, string>(), done: false };
+        reasoning.set(itemId, state);
+        opts.onEvent?.({ type: "thinking_start", id: itemId, provider: "codex" });
+        return state;
+      };
+      const reasoningText = (state: { parts: Map<number, string> }) =>
+        [...state.parts.entries()]
+          .toSorted(([a], [b]) => a - b)
+          .map(([, text]) => text)
+          .filter((text) => text.length > 0)
+          .join("\n\n");
+      const finishReasoning = (itemId: string, item?: CodexItem) => {
+        const state = ensureReasoning(itemId);
+        if (state.done) return;
+        state.done = true;
+        const completedSummary = Array.isArray(item?.summary)
+          ? item.summary.filter((part): part is string => typeof part === "string").join("\n\n")
+          : undefined;
+        opts.onEvent?.({
+          type: "thinking_done",
+          id: itemId,
+          provider: "codex",
+          text: completedSummary || reasoningText(state),
+        });
       };
 
       // Liberal classifier: codex CLI versions have used "reasoning",
@@ -257,7 +279,7 @@ export class CodexBackend implements ChatBackend {
 
       const handleItemStart = (item: CodexItem) => {
         if (isReasoning(item)) {
-          handleReasoning(item);
+          ensureReasoning(item.id);
           return;
         }
         if (isMessage(item)) return;
@@ -276,7 +298,7 @@ export class CodexBackend implements ChatBackend {
       };
       const handleItemFinish = (item: CodexItem) => {
         if (isReasoning(item)) {
-          handleReasoning(item);
+          finishReasoning(item.id, item);
           return;
         }
         if (isMessage(item)) return;
@@ -304,9 +326,18 @@ export class CodexBackend implements ChatBackend {
         const item = extractCodexItem(params);
         if (!item) return;
         // Reasoning may stream text through item/updated even before a
-        // terminal status, so try to extract on every update.
+        // terminal status. Text itself arrives through summaryTextDelta.
         if (isReasoning(item)) {
-          handleReasoning(item);
+          if (
+            item.status === "completed" ||
+            item.status === "succeeded" ||
+            item.status === "failed" ||
+            item.status === "errored"
+          ) {
+            finishReasoning(item.id, item);
+          } else {
+            ensureReasoning(item.id);
+          }
           return;
         }
         // Tool calls: only flip to "result" on terminal status; otherwise
@@ -326,6 +357,31 @@ export class CodexBackend implements ChatBackend {
       const offItemDone = conn.on("item/completed", (params) => {
         const item = extractCodexItem(params);
         if (item) handleItemFinish(item);
+      });
+
+      const offReasoningDelta = conn.on("item/reasoning/summaryTextDelta", (params) => {
+        const p = params as {
+          itemId?: unknown;
+          delta?: unknown;
+          summaryIndex?: unknown;
+        } | null;
+        if (typeof p?.itemId !== "string" || typeof p.delta !== "string") return;
+        const summaryIndex = typeof p.summaryIndex === "number" ? p.summaryIndex : 0;
+        const state = ensureReasoning(p.itemId);
+        if (state.done) return;
+        const isNewPart = !state.parts.has(summaryIndex);
+        state.parts.set(summaryIndex, (state.parts.get(summaryIndex) ?? "") + p.delta);
+        opts.onEvent?.({
+          type: "thinking_delta",
+          id: p.itemId,
+          provider: "codex",
+          text: `${isNewPart && state.parts.size > 1 ? "\n\n" : ""}${p.delta}`,
+        });
+      });
+
+      const offReasoningPart = conn.on("item/reasoning/summaryPartAdded", (params) => {
+        const itemId = (params as { itemId?: unknown } | null)?.itemId;
+        if (typeof itemId === "string") ensureReasoning(itemId);
       });
 
       // Token usage. The v2 app-server emits `thread/tokenUsage/updated`
@@ -379,6 +435,8 @@ export class CodexBackend implements ChatBackend {
         "item/started",
         "item/updated",
         "item/completed",
+        "item/reasoning/summaryTextDelta",
+        "item/reasoning/summaryPartAdded",
         "thread/tokenUsage/updated",
         "thread/compacted",
       ]);
@@ -398,6 +456,8 @@ export class CodexBackend implements ChatBackend {
         offStarted();
         offUpdated();
         offItemDone();
+        offReasoningDelta();
+        offReasoningPart();
         offUsage();
         offCompacted();
         offAny();
