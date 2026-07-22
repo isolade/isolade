@@ -380,7 +380,33 @@ export class ClaudeBackend implements ChatBackend {
     // content_block_stop with a single typed event.
     const toolIndexToId = new Map<number, string>();
     const toolInputBuffers = new Map<string, string>();
-    const thinkingBuffers = new Map<number, string>();
+    const thinkingBuffers = new Map<number, { id: string; text: string }>();
+    let thinkingSequence = 0;
+    let activeThinkingId: string | null = null;
+    let activeThinkingTokens = 0;
+    const ensureThinking = () => {
+      if (activeThinkingId) return activeThinkingId;
+      activeThinkingId = `claude-thinking-${thinkingSequence++}`;
+      activeThinkingTokens = 0;
+      opts.onEvent?.({
+        type: "thinking_start",
+        id: activeThinkingId,
+        provider: "claude",
+      });
+      return activeThinkingId;
+    };
+    const finishThinking = (text?: string) => {
+      if (!activeThinkingId) return;
+      opts.onEvent?.({
+        type: "thinking_done",
+        id: activeThinkingId,
+        provider: "claude",
+        ...(text !== undefined ? { text } : {}),
+        ...(activeThinkingTokens > 0 ? { tokens: activeThinkingTokens } : {}),
+      });
+      activeThinkingId = null;
+      activeThinkingTokens = 0;
+    };
 
     // Per-turn usage assembly. Anthropic sends input/cache counts on
     // `message_start.message.usage` and incrementally updates output_tokens
@@ -524,6 +550,33 @@ export class ClaudeBackend implements ChatBackend {
         handled = true;
       }
 
+      // Newer Claude CLI builds report a running estimate while extended
+      // thinking is in progress. `estimated_tokens` is the total so far and
+      // `estimated_tokens_delta` is retained as a compatibility fallback.
+      // This is display telemetry only. Authoritative billing still comes
+      // from the result usage envelope below.
+      if (event.type === "system" && event.subtype === "thinking_tokens") {
+        const id = ensureThinking();
+        const total =
+          typeof event.estimated_tokens === "number" ? event.estimated_tokens : undefined;
+        const delta =
+          typeof event.estimated_tokens_delta === "number"
+            ? event.estimated_tokens_delta
+            : undefined;
+        activeThinkingTokens = Math.max(
+          0,
+          Math.round(total ?? activeThinkingTokens + (delta ?? 0)),
+        );
+        opts.onEvent?.({
+          type: "thinking_tokens",
+          id,
+          provider: "claude",
+          ...(total !== undefined ? { tokens: activeThinkingTokens } : {}),
+          ...(total === undefined && delta !== undefined ? { tokensDelta: delta } : {}),
+        });
+        handled = true;
+      }
+
       if (event.type === "stream_event") {
         const inner = event.event;
         if (
@@ -552,7 +605,7 @@ export class ClaudeBackend implements ChatBackend {
           inner?.content_block?.type === "thinking" &&
           typeof inner.index === "number"
         ) {
-          thinkingBuffers.set(inner.index, "");
+          thinkingBuffers.set(inner.index, { id: ensureThinking(), text: "" });
           handled = true;
         } else if (
           inner?.type === "content_block_delta" &&
@@ -573,7 +626,8 @@ export class ClaudeBackend implements ChatBackend {
           thinkingBuffers.has(inner.index)
         ) {
           const text = typeof inner.delta.thinking === "string" ? inner.delta.thinking : "";
-          thinkingBuffers.set(inner.index, (thinkingBuffers.get(inner.index) ?? "") + text);
+          const buffer = thinkingBuffers.get(inner.index)!;
+          thinkingBuffers.set(inner.index, { ...buffer, text: buffer.text + text });
           handled = true;
         } else if (
           inner?.type === "content_block_stop" &&
@@ -607,8 +661,11 @@ export class ClaudeBackend implements ChatBackend {
           typeof inner.index === "number" &&
           thinkingBuffers.has(inner.index)
         ) {
-          const text = thinkingBuffers.get(inner.index) ?? "";
-          if (text.length > 0) opts.onEvent?.({ type: "thinking", text });
+          const buffer = thinkingBuffers.get(inner.index)!;
+          // With `--thinking-display summarized`, thinking_delta is the
+          // provider-authored summary intended for display, not raw hidden
+          // chain-of-thought. Publish it once the block is complete.
+          finishThinking(buffer.text);
           thinkingBuffers.delete(inner.index);
           handled = true;
         } else if (
@@ -681,6 +738,7 @@ export class ClaudeBackend implements ChatBackend {
       }
 
       if (event.type === "result") {
+        finishThinking();
         if (event.result) {
           fullContent = event.result;
         }

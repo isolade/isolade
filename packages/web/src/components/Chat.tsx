@@ -1407,6 +1407,10 @@ function Chat({
         // byte identical chunks.
         if (
           ev.type === "delta" ||
+          ev.type === "thinking_start" ||
+          ev.type === "thinking_delta" ||
+          ev.type === "thinking_tokens" ||
+          ev.type === "thinking_done" ||
           ev.type === "thinking" ||
           ev.type === "tool_call_start" ||
           ev.type === "tool_call_input" ||
@@ -1420,7 +1424,12 @@ function Chat({
           }
           if ((ev.type === "thinking" || ev.type === "raw") && !showDebugRef.current) return;
           applyEvent(chunks, toolIndex, ev.type, ev.payload);
-          if (ev.type === "delta" || ev.type === "thinking") {
+          if (
+            ev.type === "delta" ||
+            ev.type === "thinking_delta" ||
+            ev.type === "thinking_done" ||
+            ev.type === "thinking"
+          ) {
             if (canAnimateLive()) pumpReveal();
             else settleRevealWithoutAnimation(canRenderLive());
           } else if (revealRafRef.current === null) {

@@ -13,7 +13,7 @@ async function openHarness(
   await page.waitForFunction(() => document.documentElement.dataset.harnessReady === "true");
 }
 
-function transcriptFixture(chatId: string, count = 60, wrapping = false) {
+function transcriptFixture(chatId: string, count = 60, wrapping = false, thoughts = false) {
   const messages = Array.from({ length: count }, (_, index) => {
     const role = index % 2 === 0 ? "user" : "assistant";
     return {
@@ -35,7 +35,22 @@ function transcriptFixture(chatId: string, count = 60, wrapping = false) {
       version: null,
     };
   });
-  return { messages, hasMore: false, chunksByMessage: {}, inFlight: null };
+  const chunksByMessage = thoughts
+    ? {
+        [`${chatId}-production-m1`]: [
+          {
+            kind: "thought",
+            id: "claude-thinking-0",
+            provider: "claude",
+            text: "I checked the request, the current state, and the relevant implementation details.",
+            tokens: 768,
+            status: "done",
+          },
+          { kind: "text", text: "The implementation is ready." },
+        ],
+      }
+    : {};
+  return { messages, hasMore: false, chunksByMessage, inFlight: null };
 }
 
 async function openProductionHarness(
@@ -46,6 +61,7 @@ async function openProductionHarness(
     instancePanes?: boolean;
     messages?: number;
     wrappingRows?: boolean;
+    thoughts?: boolean;
   } = {},
 ) {
   const transcriptRequests: string[] = [];
@@ -58,7 +74,12 @@ async function openProductionHarness(
     }
     transcriptRequests.push(chatId);
     await route.fulfill({
-      json: transcriptFixture(chatId, options.messages ?? 60, options.wrappingRows),
+      json: transcriptFixture(
+        chatId,
+        options.messages ?? 60,
+        options.wrappingRows,
+        options.thoughts,
+      ),
     });
   });
   const parameters = new URLSearchParams({ production: "1", chats: String(chatCount) });
@@ -88,6 +109,19 @@ async function rowTop(page: Page, messageId: string): Promise<number> {
 }
 
 test.describe("message renderer browser gate", () => {
+  test("renders the thinking indicator and completed Claude summary", async ({ page }) => {
+    await openProductionHarness(page, 1, { messages: 2, thoughts: true });
+
+    const thought = page.locator('[data-thinking-provider="claude"]');
+    await expect(thought).toBeVisible();
+    await expect(thought).toHaveAttribute("data-thinking-status", "done");
+    await expect(thought).toContainText("Thought");
+    await expect(thought).toContainText("768 tokens");
+    await expect(thought).toContainText(
+      "I checked the request, the current state, and the relevant implementation details.",
+    );
+  });
+
   test("retains an instance chat's DOM and reading position across sidebar switches", async ({
     page,
   }) => {

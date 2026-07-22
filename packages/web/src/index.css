@@ -299,6 +299,29 @@ svg.animate-spin {
   animation: shimmer-sweep 2.4s linear infinite;
 }
 
+@keyframes thinking-spark {
+  0%,
+  100% {
+    transform: scale(0.9) rotate(-8deg);
+    opacity: 0.72;
+  }
+  50% {
+    transform: scale(1.08) rotate(8deg);
+    opacity: 1;
+  }
+}
+
+.thinking-spark {
+  animation: thinking-spark 1.35s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thinking-spark,
+  .text-shimmer {
+    animation: none;
+  }
+}
+
 /* Simulated macOS window chrome for the browser. In the native Tauri build the
    OS draws the real window (rounded corners, shadow, traffic lights); opened in
    a plain browser the UI has none of that and bleeds edge-to-edge. When App

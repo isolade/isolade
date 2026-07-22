@@ -369,7 +369,7 @@ export const MessageRow = memo(function MessageRow({
                 streaming={streaming}
                 onRequestToolDetails={requestToolDetails}
               />
-              {streaming && (
+              {streaming && chunks.at(-1)?.kind === "text" && (
                 <span className="ml-0.5 inline-block h-4 w-1 animate-pulse bg-muted-foreground align-text-bottom" />
               )}
             </>

@@ -146,9 +146,15 @@ describe("ClaudeBackend stream-json parsing", () => {
     });
   });
 
-  it("emits a thinking event from a thinking block", async () => {
+  it("emits animated token totals and completes with the thinking summary", async () => {
     const { events } = await run([
       { type: "system", subtype: "init", session_id: "s" },
+      {
+        type: "system",
+        subtype: "thinking_tokens",
+        estimated_tokens: 768,
+        estimated_tokens_delta: 372,
+      },
       {
         type: "stream_event",
         event: {
@@ -168,7 +174,28 @@ describe("ClaudeBackend stream-json parsing", () => {
       { type: "stream_event", event: { type: "content_block_stop", index: 0 } },
       { type: "result", result: "" },
     ]);
-    expect(events).toContainEqual({ type: "thinking", text: "let me think" });
+    expect(events).toEqual(
+      expect.arrayContaining([
+        {
+          type: "thinking_start",
+          id: "claude-thinking-0",
+          provider: "claude",
+        },
+        {
+          type: "thinking_tokens",
+          id: "claude-thinking-0",
+          provider: "claude",
+          tokens: 768,
+        },
+        {
+          type: "thinking_done",
+          id: "claude-thinking-0",
+          provider: "claude",
+          text: "let me think",
+          tokens: 768,
+        },
+      ]),
+    );
   });
 
   it("emits usage with last + accumulated total", async () => {

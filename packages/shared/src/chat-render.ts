@@ -12,6 +12,16 @@ export const tokenUsageSchema = z.object({
 
 export const chatRenderChunkSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("text"), text: z.string() }),
+  z.object({
+    kind: z.literal("thought"),
+    id: z.string(),
+    provider: z.enum(["claude", "codex"]),
+    text: z.string(),
+    tokens: z.number().int().nonnegative().optional(),
+    status: z.enum(["thinking", "done"]),
+  }),
+  // Legacy debug-only reasoning payloads. New provider integrations use the
+  // structured `thought` chunk above, which is part of the normal transcript.
   z.object({ kind: z.literal("thinking"), text: z.string() }),
   z.object({
     kind: z.literal("tool"),
@@ -187,6 +197,107 @@ export function applyChatRenderEvent(
     case "thinking": {
       const p = payload as { text?: string } | null;
       chunks.push({ kind: "thinking", text: p?.text ?? "" });
+      return;
+    }
+    case "thinking_start": {
+      const p = payload as {
+        id?: string;
+        provider?: "claude" | "codex";
+      } | null;
+      if (!p?.id || !p.provider) return;
+      const existing = chunks.findIndex((chunk) => chunk.kind === "thought" && chunk.id === p.id);
+      if (existing < 0) {
+        chunks.push({
+          kind: "thought",
+          id: p.id,
+          provider: p.provider,
+          text: "",
+          status: "thinking",
+        });
+      }
+      return;
+    }
+    case "thinking_delta": {
+      const p = payload as {
+        id?: string;
+        provider?: "claude" | "codex";
+        text?: string;
+      } | null;
+      if (!p?.id || !p.provider) return;
+      const index = chunks.findIndex((chunk) => chunk.kind === "thought" && chunk.id === p.id);
+      const text = p.text ?? "";
+      if (index < 0) {
+        chunks.push({
+          kind: "thought",
+          id: p.id,
+          provider: p.provider,
+          text,
+          status: "thinking",
+        });
+        return;
+      }
+      const current = chunks[index];
+      if (current?.kind === "thought") {
+        chunks[index] = { ...current, text: current.text + text, status: "thinking" };
+      }
+      return;
+    }
+    case "thinking_tokens": {
+      const p = payload as {
+        id?: string;
+        provider?: "claude" | "codex";
+        tokens?: number;
+        tokensDelta?: number;
+      } | null;
+      if (!p?.id || !p.provider) return;
+      const index = chunks.findIndex((chunk) => chunk.kind === "thought" && chunk.id === p.id);
+      const current = index < 0 ? undefined : chunks[index];
+      const previousTokens = current?.kind === "thought" ? (current.tokens ?? 0) : 0;
+      const tokens = Math.max(
+        0,
+        Math.round(typeof p.tokens === "number" ? p.tokens : previousTokens + (p.tokensDelta ?? 0)),
+      );
+      if (current?.kind === "thought") {
+        chunks[index] = { ...current, tokens, status: "thinking" };
+      } else {
+        chunks.push({
+          kind: "thought",
+          id: p.id,
+          provider: p.provider,
+          text: "",
+          tokens,
+          status: "thinking",
+        });
+      }
+      return;
+    }
+    case "thinking_done": {
+      const p = payload as {
+        id?: string;
+        provider?: "claude" | "codex";
+        text?: string;
+        tokens?: number;
+      } | null;
+      if (!p?.id || !p.provider) return;
+      const index = chunks.findIndex((chunk) => chunk.kind === "thought" && chunk.id === p.id);
+      const current = index < 0 ? undefined : chunks[index];
+      if (current?.kind === "thought") {
+        chunks[index] = {
+          ...current,
+          ...(typeof p.text === "string" ? { text: p.text } : {}),
+          ...(typeof p.tokens === "number" ? { tokens: Math.max(0, Math.round(p.tokens)) } : {}),
+          status: "done",
+        };
+      } else {
+        chunks.push({
+          kind: "thought",
+          id: p.id,
+          provider: p.provider,
+          text: p.text ?? "",
+          ...(typeof p.tokens === "number" ? { tokens: Math.max(0, Math.round(p.tokens)) } : {}),
+          status: "done",
+        });
+      }
       return;
     }
     case "tool_call_start": {

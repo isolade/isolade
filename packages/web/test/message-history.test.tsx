@@ -85,6 +85,100 @@ describe("MessageHistory", () => {
     expect(waiting).toContain('data-message-id="live"');
   });
 
+  it("shows thinking progress and Claude's final summary without debug mode", () => {
+    const assistant = message("thought", "assistant");
+    const html = renderToStaticMarkup(
+      <MessageHistory
+        instanceId="instance-test"
+        pages={[
+          {
+            key: "thoughts",
+            messages: [assistant],
+            chunksByMessage: {
+              [assistant.id]: [
+                {
+                  kind: "thought",
+                  id: "claude-thinking-0",
+                  provider: "claude",
+                  text: "I checked the relevant state before answering.",
+                  tokens: 768,
+                  status: "done",
+                },
+              ],
+            },
+          },
+        ]}
+        sessionRows={[]}
+        live={null}
+        scrollElementRef={createRef<HTMLDivElement>()}
+        showDebug={false}
+        userFontFamily="sans-serif"
+        agentFontFamily="sans-serif"
+        editingId={null}
+        actionsDisabled={false}
+        visible
+        hasOlder={false}
+        onStartEdit={() => {}}
+        onCancelEdit={() => {}}
+        onSubmitEdit={() => {}}
+        onNavigateVersion={() => {}}
+        onRequestToolDetails={() => {}}
+        onLoadOlder={() => {}}
+        onLayoutChange={() => {}}
+      />,
+    );
+
+    expect(html).toContain('data-thinking-provider="claude"');
+    expect(html).toContain('data-thinking-status="done"');
+    expect(html).toContain("I checked the relevant state before answering.");
+  });
+
+  it("renders Codex summary emphasis as plain text", () => {
+    const assistant = message("codex-thought", "assistant");
+    const html = renderToStaticMarkup(
+      <MessageHistory
+        instanceId="instance-test"
+        pages={[
+          {
+            key: "codex-thoughts",
+            messages: [assistant],
+            chunksByMessage: {
+              [assistant.id]: [
+                {
+                  kind: "thought",
+                  id: "reasoning-1",
+                  provider: "codex",
+                  text: "**Clarifying data persistence limitations**",
+                  status: "done",
+                },
+              ],
+            },
+          },
+        ]}
+        sessionRows={[]}
+        live={null}
+        scrollElementRef={createRef<HTMLDivElement>()}
+        showDebug={false}
+        userFontFamily="sans-serif"
+        agentFontFamily="sans-serif"
+        editingId={null}
+        actionsDisabled={false}
+        visible
+        hasOlder={false}
+        onStartEdit={() => {}}
+        onCancelEdit={() => {}}
+        onSubmitEdit={() => {}}
+        onNavigateVersion={() => {}}
+        onRequestToolDetails={() => {}}
+        onLoadOlder={() => {}}
+        onLayoutChange={() => {}}
+      />,
+    );
+
+    expect(html).toContain("Clarifying data persistence limitations");
+    expect(html).not.toContain("<strong>Clarifying data persistence limitations</strong>");
+  });
+
   it("removes edit and version controls from the tab order while actions are busy", () => {
     const versioned = {
       ...message("versioned"),

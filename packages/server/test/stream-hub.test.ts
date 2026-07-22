@@ -136,6 +136,8 @@ describe("ChatStreamHub", () => {
       run: async (api) => {
         await hold;
         api.publish("thinking", { text: "secret" });
+        api.publish("thinking_start", { id: "visible", provider: "claude" });
+        api.publish("thinking_tokens", { id: "visible", provider: "claude", tokens: 768 });
         api.publish("raw", { source: "claude", payload: { value: "z".repeat(20_000) } });
         api.publish("tool_call_start", { id: "tool", name: "Bash" });
         api.publish("tool_call_input", {
@@ -154,16 +156,18 @@ describe("ChatStreamHub", () => {
       (signal): signal is Extract<StreamSignal, { kind: "event" }> => signal.kind === "event",
     );
     expect(events.map((signal) => signal.event.type)).toEqual([
+      "thinking_start",
+      "thinking_tokens",
       "tool_call_start",
       "tool_call_input",
       "tool_call_result",
     ]);
-    const input = events[1]!.event.payload as {
+    const input = events[3]!.event.payload as {
       input: unknown;
       summary?: string;
       detailsAvailable?: boolean;
     };
-    const result = events[2]!.event.payload as { output: string; detailsAvailable?: boolean };
+    const result = events[4]!.event.payload as { output: string; detailsAvailable?: boolean };
     expect(JSON.stringify(input.input).length).toBeLessThan(1_200);
     expect(input.summary).toStartWith("echo ");
     expect(input.summary!.length).toBeLessThan(600);

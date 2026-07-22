@@ -437,6 +437,10 @@ export class ChatManager {
     if (messageIds.length === 0) return [];
     const renderTypes = [
       "delta",
+      "thinking_start",
+      "thinking_delta",
+      "thinking_tokens",
+      "thinking_done",
       "tool_call_start",
       "tool_call_input",
       "tool_call_result",
@@ -482,6 +486,10 @@ export class ChatManager {
   getRenderableEventMessageIds(chatId: string, messageIds: string[], includeDebug: boolean) {
     if (messageIds.length === 0) return [];
     const structuralTypes = [
+      "thinking_start",
+      "thinking_delta",
+      "thinking_tokens",
+      "thinking_done",
       "tool_call_start",
       "tool_call_input",
       "tool_call_result",
@@ -779,6 +787,10 @@ export class ChatManager {
     if (!last) return null;
     const renderTypes = [
       "delta",
+      "thinking_start",
+      "thinking_delta",
+      "thinking_tokens",
+      "thinking_done",
       "tool_call_start",
       "tool_call_input",
       "tool_call_result",

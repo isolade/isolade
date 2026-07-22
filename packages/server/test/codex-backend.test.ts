@@ -324,12 +324,55 @@ describe("CodexBackend notification parsing", () => {
     expect(result?.isError).toBe(true);
   });
 
-  it("renders a reasoning item as a thinking event, not a tool call", async () => {
+  it("streams and reconciles a reasoning summary without treating it as a tool", async () => {
     const { events } = await run([
       ["item/started", { item: { id: "r1", type: "reasoning", status: "inProgress" } }],
+      [
+        "item/reasoning/summaryTextDelta",
+        { itemId: "r1", summaryIndex: 0, delta: "**Clarifying the request**" },
+      ],
+      ["item/reasoning/summaryPartAdded", { itemId: "r1", summaryIndex: 1 }],
+      [
+        "item/reasoning/summaryTextDelta",
+        { itemId: "r1", summaryIndex: 1, delta: "**Checking the implementation**" },
+      ],
+      [
+        "item/completed",
+        {
+          item: {
+            id: "r1",
+            type: "reasoning",
+            status: "completed",
+            summary: ["**Clarifying the request**", "**Checking the implementation**"],
+          },
+        },
+      ],
       ["turn/completed", { turn: { status: "completed" } }],
     ]);
-    expect(events.some((e) => e.type === "thinking")).toBe(true);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        { type: "thinking_start", id: "r1", provider: "codex" },
+        {
+          type: "thinking_delta",
+          id: "r1",
+          provider: "codex",
+          text: "**Clarifying the request**",
+        },
+        {
+          type: "thinking_delta",
+          id: "r1",
+          provider: "codex",
+          text: "\n\n**Checking the implementation**",
+        },
+        {
+          type: "thinking_done",
+          id: "r1",
+          provider: "codex",
+          text: "**Clarifying the request**\n\n**Checking the implementation**",
+        },
+      ]),
+    );
+    expect(events.filter((e) => e.type === "thinking_done")).toHaveLength(1);
     expect(events.some((e) => e.type === "tool_call_start")).toBe(false);
   });
 
