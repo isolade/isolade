@@ -64,8 +64,9 @@ export function codexPricingFor(modelId: string) {
 // (MORE_BY_DEFAULT_MODEL_IDS); keep the two in sync.
 export const ANTHROPIC_ALLOWLIST = [
   "claude-fable-5",
-  "claude-opus-4-8",
+  "claude-opus-5",
   "claude-sonnet-5",
+  "claude-opus-4-8",
   "claude-opus-4-7",
   "claude-opus-4-6",
   "claude-sonnet-4-6",
@@ -96,8 +97,8 @@ export const CHAT_MODELS = [
     },
   },
   {
-    id: "claude-opus-4-8",
-    name: "Opus 4.8",
+    id: "claude-opus-5",
+    name: "Opus 5",
     provider: "anthropic",
     contextWindow: 1_000_000,
     supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
@@ -121,6 +122,20 @@ export const CHAT_MODELS = [
       cachedInputPerMTok: 0.2,
       cacheWritePerMTok: 2.5,
       outputPerMTok: 10,
+    },
+  },
+  {
+    id: "claude-opus-4-8",
+    name: "Opus 4.8",
+    provider: "anthropic",
+    contextWindow: 1_000_000,
+    supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+    defaultEffort: "high",
+    pricing: {
+      inputPerMTok: 5,
+      cachedInputPerMTok: 0.5,
+      cacheWritePerMTok: 6.25,
+      outputPerMTok: 25,
     },
   },
   {
@@ -347,7 +362,7 @@ export function resolveRatePlan(tierOrPlan: string | null | undefined): RatePlan
 // fallback when this id has been hidden for the active profile (see
 // NewInstancePane).
 export const DEFAULT_CHAT_MODEL_ID = "gpt-5.6-sol";
-export const DEFAULT_ANTHROPIC_MODEL_ID = "claude-opus-4-8";
+export const DEFAULT_ANTHROPIC_MODEL_ID = "claude-opus-5";
 export const DEFAULT_OPENAI_MODEL_ID = "gpt-5.6-sol";
 
 // Catalog-default tier: non-frontier releases (older versions + smaller
@@ -356,8 +371,9 @@ export const DEFAULT_OPENAI_MODEL_ID = "gpt-5.6-sol";
 // model's tier (or hide it) via ModelOverrides, and a model whose tier the
 // user hasn't touched follows catalog changes here.
 const MORE_BY_DEFAULT_MODEL_IDS = new Set<string>([
-  // Keep the current-gen flagships (Fable 5, Opus 4.8, Sonnet 5) at the top
+  // Keep the current-gen flagships (Fable 5, Opus 5, Sonnet 5) at the top
   // level; older Opus/Sonnet releases and Haiku start under "More…".
+  "claude-opus-4-8",
   "claude-opus-4-7",
   "claude-opus-4-6",
   "claude-sonnet-4-6",

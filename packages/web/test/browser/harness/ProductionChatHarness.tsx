@@ -135,7 +135,7 @@ export function ProductionChatHarness() {
     return grouped;
   }, [chats]);
   const chatModels = useMemo(() => {
-    const ids = crossProviderPicker ? ["claude-opus-4-8", "gpt-5.6-sol"] : ["claude-sonnet-5"];
+    const ids = crossProviderPicker ? ["claude-opus-5", "gpt-5.6-sol"] : ["claude-sonnet-5"];
     return ids.flatMap((id) => {
       const model = findChatModel(id);
       return model ? [model] : [];

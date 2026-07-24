@@ -6,6 +6,11 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+### Added
+
+- Claude Opus 5 is now available in the model picker and is the default Claude
+  model for new chats.
+
 ## [0.3.0] - 2026-07-22
 
 ### Added

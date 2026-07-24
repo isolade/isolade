@@ -24,41 +24,41 @@ describe("static catalog", () => {
 
 describe("defaultModelTier", () => {
   it("puts frontier models at the top and legacy ones under More", () => {
-    expect(defaultModelTier("claude-opus-4-8")).toBe("default");
+    expect(defaultModelTier("claude-opus-5")).toBe("default");
     expect(defaultModelTier("gpt-5.6-sol")).toBe("default");
     expect(defaultModelTier("gpt-5.5")).toBe("more");
-    expect(defaultModelTier("claude-opus-4-6")).toBe("more");
+    expect(defaultModelTier("claude-opus-4-8")).toBe("more");
   });
 });
 
 describe("effectiveModelTier", () => {
   it("falls back to the catalog default when there's no override", () => {
-    expect(effectiveModelTier("claude-opus-4-8", {})).toBe("default");
+    expect(effectiveModelTier("claude-opus-5", {})).toBe("default");
     expect(effectiveModelTier("gpt-5.5", {})).toBe("more");
   });
 
   it("honors an override", () => {
     const overrides: ModelOverrides = {
-      "claude-opus-4-8": { tier: "hidden" },
+      "claude-opus-5": { tier: "hidden" },
       "gpt-5.5": { tier: "default" },
     };
-    expect(effectiveModelTier("claude-opus-4-8", overrides)).toBe("hidden");
+    expect(effectiveModelTier("claude-opus-5", overrides)).toBe("hidden");
     expect(effectiveModelTier("gpt-5.5", overrides)).toBe("default");
   });
 });
 
 describe("setModelTierOverride", () => {
   it("stores a delta that differs from the catalog default", () => {
-    const next = setModelTierOverride({}, "claude-opus-4-8", "hidden");
-    expect(next).toEqual({ "claude-opus-4-8": { tier: "hidden" } });
+    const next = setModelTierOverride({}, "claude-opus-5", "hidden");
+    expect(next).toEqual({ "claude-opus-5": { tier: "hidden" } });
   });
 
   it("drops the entry when reverting to the catalog default", () => {
-    const start: ModelOverrides = { "claude-opus-4-8": { tier: "hidden" } };
-    const next = setModelTierOverride(start, "claude-opus-4-8", "default");
+    const start: ModelOverrides = { "claude-opus-5": { tier: "hidden" } };
+    const next = setModelTierOverride(start, "claude-opus-5", "default");
     expect(next).toEqual({});
     // Pure: the input is untouched.
-    expect(start).toEqual({ "claude-opus-4-8": { tier: "hidden" } });
+    expect(start).toEqual({ "claude-opus-5": { tier: "hidden" } });
   });
 
   it("stores 'default' when a More-by-default model is pulled up", () => {
@@ -72,10 +72,10 @@ describe("setModelTierOverride", () => {
 describe("pruneModelOverrides", () => {
   it("drops ids no longer in the catalog", () => {
     const overrides: ModelOverrides = {
-      "claude-opus-4-8": { tier: "hidden" },
+      "claude-opus-5": { tier: "hidden" },
       "gone-9.9": { tier: "more" },
     };
-    expect(pruneModelOverrides(overrides)).toEqual({ "claude-opus-4-8": { tier: "hidden" } });
+    expect(pruneModelOverrides(overrides)).toEqual({ "claude-opus-5": { tier: "hidden" } });
   });
 });
 
