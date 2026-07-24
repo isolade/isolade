@@ -768,6 +768,13 @@ export default function PanelWorkspace({
 // (not in flow) so it paints above the empty slots but below the z-10 resize
 // handles, which stay grabbable.
 //
+// A body clips to its slot, because it paints above the whole tree and anything
+// escaping it would land on a neighbouring panel's content and tab strip. Note
+// that unclipping alone would not buy anything: an escaped popover still ends up
+// under the resize handles and under any body activated after it (siblings here
+// are all z-index auto, in append-only order). Content that has to leave its
+// panel needs a portal, which is what the tab-strip menus already do.
+//
 // Memoized for the same reason as the tree below: a drag updates state on the
 // workspace on every pointer move, and all of these props are stable through a
 // gesture, so bodies (a terminal, a file tree) don't re-render at pointer rate.
