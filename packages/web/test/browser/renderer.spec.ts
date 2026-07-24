@@ -410,7 +410,7 @@ test.describe("message renderer browser gate", () => {
         json: {
           id: "chat-a",
           instanceId: "instance-production-harness",
-          model: "claude-opus-4-8",
+          model: "claude-opus-5",
           provider: "anthropic",
           effort: "high",
           claudeSessionId: null,
@@ -436,12 +436,12 @@ test.describe("message renderer browser gate", () => {
     await openProductionHarness(page, 1, { messages: 0, crossProviderPicker: true });
 
     await page.locator('[data-demo="model-picker"]').click();
-    await expect(page.getByRole("radio", { name: "Opus 4.8" })).toBeVisible();
-    await page.getByRole("radio", { name: "Opus 4.8" }).click();
+    await expect(page.getByRole("radio", { name: "Opus 5" })).toBeVisible();
+    await page.getByRole("radio", { name: "Opus 5" }).click();
 
-    await expect.poll(() => createBody).toEqual({ model: "claude-opus-4-8" });
+    await expect.poll(() => createBody).toEqual({ model: "claude-opus-5" });
     expect(await page.evaluate(() => window.localStorage.getItem("isolade.lastModelId"))).toBe(
-      "claude-opus-4-8",
+      "claude-opus-5",
     );
   });
 

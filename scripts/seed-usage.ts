@@ -65,7 +65,7 @@ type Provider = "anthropic" | "openai";
 // token-weighting / subscription-share columns; a couple per provider so
 // per-model views have variety.
 const MODELS: Record<Provider, string[]> = {
-  anthropic: ["claude-sonnet-4-6", "claude-opus-4-8"],
+  anthropic: ["claude-sonnet-5", "claude-opus-5"],
   openai: ["gpt-5.4", "gpt-5.3-codex"],
 };
 
