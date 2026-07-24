@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execSync } from "child_process";
 import { eq } from "drizzle-orm";
@@ -393,12 +393,27 @@ describe("expose_sandbox seeding", () => {
       },
       async destroyVm() {},
       async stopVm() {},
+      async restartVm(vmId: string) {
+        return { vmId, ports: [] };
+      },
+      async ensureVm(vmId: string) {
+        return { vmId, ports: [] };
+      },
       async exec() {
         return { stdout: "", stderr: "", exitCode: 0 };
       },
       async writeFile() {},
       async execStream() {
         return { exitCode: 0 };
+      },
+      async execInteractive() {
+        return { exitCode: 0 };
+      },
+      async build() {
+        return "";
+      },
+      async getStats() {
+        return {};
       },
       async waitUntilReady() {
         return true;
@@ -516,6 +531,31 @@ dockerfile = "./Dockerfile"
     }
     expect(removedClients).toEqual([instance.id]);
     expect(existsSync(staging)).toBe(false);
+  });
+
+  it("re-stages a swept seed bundle on restart so the VM can boot again", async () => {
+    const instance = await server.instances.create({ profileId: "dev", title: "revive" });
+    const staging = seedStagingDir(instance.id);
+    expect(existsSync(join(staging, "manifest.json"))).toBe(true);
+
+    // Simulate the boot-time staging sweep / state cleanup that deletes the
+    // bundle while the instance row (and its persisted /run/isolade-seed mount)
+    // live on. Without self-heal, resume would fail with `mount <tag>: No such
+    // file or directory` on every restart.
+    rmSync(staging, { recursive: true, force: true });
+    expect(existsSync(staging)).toBe(false);
+    keepSets = [];
+
+    await server.instances.restart(instance.id);
+
+    // The bundle is back (the mount target exists again) and its images are
+    // re-protected against a GC between now and boot.
+    expect(existsSync(join(staging, "manifest.json"))).toBe(true);
+    expect(existsSync(join(staging, "profiles", "payload", "config.toml"))).toBe(true);
+    expect(keepSets).toEqual([{ clientId: instance.id, keep: ["img-payload"] }]);
+    expect(server.instances.get(instance.id)?.status).toBe("running");
+
+    await server.instances.remove(instance.id);
   });
 
   it("re-registers and stages the fresh ref when a seed profile is rebuilt mid-create", async () => {

@@ -1,5 +1,6 @@
 import { randomUUID } from "crypto";
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
+import { existsSync, mkdirSync } from "fs";
 import { AUTH_MOUNT, seedVmAuth } from "./auth-sync";
 import type { Layout, PortProbe } from "./contracts";
 import type { Db } from "./db";
@@ -23,7 +24,13 @@ import type { ProfileManager } from "./profiles";
 import { runRequestBroker } from "./request-broker";
 import { GUEST_SANDBOX_PORT, SandboxReverseForwarder } from "./sandbox-forward";
 import type { SecretsStore } from "./secrets-store";
-import { removeSeedStaging, SEED_MOUNT, type SeedProfileEntry, stageSeed } from "./seed";
+import {
+  removeSeedStaging,
+  SEED_MOUNT,
+  type SeedProfileEntry,
+  seedStagingDir,
+  stageSeed,
+} from "./seed";
 import { shellQuote } from "./shell";
 import { runSignerStream, SIGN_SOCK } from "./sign-broker";
 import { buildSignShimScript } from "./sign-shim";
@@ -470,6 +477,52 @@ export class InstanceManager {
     throw new Error("seed profiles kept changing during create (rebuilds in flight?); try again");
   }
 
+  // Regenerate the seed staging bundle before resuming an expose_sandbox VM, if
+  // it went missing since create. The bundle is staged once in create() and is
+  // meant to live as long as the instance, but a boot-time staging sweep, an
+  // orphan-client sweep, or a manual state cleanup can delete it — and nothing
+  // else recreates it. The persisted VM record still bind-mounts /run/isolade-seed
+  // from `seedStagingDir(id)`, so a missing dir makes the VM unbootable with a
+  // `mount <tag>: No such file or directory` -> BootStart failure on every
+  // restart/resume. Rebuilding it here (a no-op when it survived) makes resume
+  // self-healing instead of permanently bricking the instance.
+  private async ensureSeedStaging(instance: {
+    id: string;
+    exposeSandbox: boolean;
+    seedProfiles: string[] | null;
+  }): Promise<void> {
+    if (!instance.exposeSandbox || !instance.seedProfiles?.length) return;
+    if (existsSync(seedStagingDir(instance.id))) return; // survived; fast path
+
+    let entries: SeedProfileEntry[] = [];
+    try {
+      entries = this.resolveSeedEntries(instance.id, instance.seedProfiles);
+      stageSeed(instance.id, entries);
+    } catch (err) {
+      // Never let a re-stage failure brick resume: an empty bundle still
+      // satisfies the mount, and importSeedProfiles() no-ops on an absent
+      // manifest (a setup-done instance has already imported its seeds anyway).
+      console.warn(
+        `[instance-resume ${instance.id}] seed re-stage failed; creating empty bundle so the VM can still boot:`,
+        err,
+      );
+      try {
+        mkdirSync(seedStagingDir(instance.id), { recursive: true });
+      } catch {}
+      return;
+    }
+    // Bundle exists again; re-protect its images so a GC between now and boot
+    // can't collect them. Best-effort — the mount target already exists, so a
+    // failed keep-set must not block resume.
+    try {
+      await this.sandboxClient.registerKeepSet(instance.id, [
+        ...new Set(entries.map((e) => e.image)),
+      ]);
+    } catch (err) {
+      console.warn(`[instance-resume ${instance.id}] seed keep-set refresh failed:`, err);
+    }
+  }
+
   // Recency order, newest-active first: the order the sidebar renders in.
   // The tiebreakers make it a *total* order so it never flickers: updatedAt
   // has only second precision (stored via unixepoch()), so several instances
@@ -691,6 +744,9 @@ export class InstanceManager {
       .run();
 
     try {
+      // A fresh boot re-evaluates the persisted mounts, so a swept seed bundle
+      // must be back before we resume or the VM fails to boot (mount ENOENT).
+      await this.ensureSeedStaging(instance);
       await this.sandboxClient.restartVm(instance.vmId);
       // A fresh boot dropped the guest's relay/watcher/broker processes and the
       // host listeners. Re-establish every per-VM attachment. Params come from
@@ -824,6 +880,11 @@ export class InstanceManager {
   private async ensureAttached(id: string): Promise<void> {
     const instance = this.get(id);
     if (!instance) throw new Error(`instance ${id} not found`);
+    // If ensureVm resumes via a fresh boot (the sandbox-service also reloaded),
+    // it re-evaluates the persisted mounts, so a swept seed bundle must be back
+    // first. No-op when the dir survived or the sandbox-service still holds the
+    // VM (a server-only reload re-reads bindings without a boot).
+    await this.ensureSeedStaging(instance);
     await this.sandboxClient.ensureVm(instance.vmId);
     // Re-establish every per-VM attachment. If the VM was resumed via a fresh
     // boot, its guest relay/watcher/broker processes are gone and this rewrites
