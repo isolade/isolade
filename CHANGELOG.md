@@ -10,6 +10,8 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 - Claude Opus 5 is now available in the model picker and is the default Claude
   model for new chats.
+- Isolade now writes a log file to `~/.local/state/isolade/logs/isolade.log` to
+  help with troubleshooting. The last 10 launches are kept.
 
 ## [0.3.0] - 2026-07-22
 

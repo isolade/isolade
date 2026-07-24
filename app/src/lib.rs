@@ -299,14 +299,27 @@ fn state_dir() -> Option<std::path::PathBuf> {
     Some(base.join("isolade"))
 }
 
-// Open (and rotate) the per-session log file under stateDir/logs. The previous
-// session is kept as isolade.log.1. Returns None on any failure, so logging is
-// always best-effort and never blocks startup.
+// Open (and rotate) the per-session log file under stateDir/logs. The last
+// LOG_KEEP launches are retained as isolade.log (current) plus isolade.log.1
+// ..isolade.log.{LOG_KEEP-1}; rotation is per-launch only, with no mid-session
+// size cap. Returns None on any failure, so logging is always best-effort and
+// never blocks startup.
 fn open_session_logfile() -> Option<std::fs::File> {
+    // Total files retained, counting the live isolade.log.
+    const LOG_KEEP: usize = 10;
+
     let dir = state_dir()?.join("logs");
     std::fs::create_dir_all(&dir).ok()?;
     let current = dir.join("isolade.log");
-    // Keep exactly the previous session. A no-op the first time.
+    // Shift the archives up by one, dropping the oldest (the .{KEEP-1} rename
+    // overwrites it), then move the current file to .1. High-to-low order so a
+    // rename never clobbers a slot still to be moved. All no-ops the first time.
+    for i in (1..LOG_KEEP - 1).rev() {
+        let _ = std::fs::rename(
+            dir.join(format!("isolade.log.{i}")),
+            dir.join(format!("isolade.log.{}", i + 1)),
+        );
+    }
     let _ = std::fs::rename(&current, dir.join("isolade.log.1"));
     std::fs::OpenOptions::new()
         .create(true)
