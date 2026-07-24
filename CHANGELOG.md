@@ -13,6 +13,13 @@ _Changes landed on `main` that haven't shipped in a release yet._
 - Isolade now writes a log file to `~/.local/state/isolade/logs/isolade.log` to
   help with troubleshooting. The last 10 launches are kept.
 
+### Fixed
+
+- Rearranging workspace panels no longer resets their contents. Splitting,
+  moving, or reordering a panel used to reload it, losing a chat's draft and
+  scroll position, dropping a terminal session, and reloading a running browser
+  preview. Panels now keep their live state as the layout changes.
+
 ## [0.3.0] - 2026-07-22
 
 ### Added
