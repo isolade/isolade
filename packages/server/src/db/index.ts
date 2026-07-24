@@ -54,8 +54,13 @@ function defaultDbPath(): string {
  * Version 7 adds `instances.layout` (the JSON-encoded dockable panel layout for
  * an instance's workspace). Existing rows remain null so the client can build a
  * default layout from the instance's chats when it first opens the workspace.
+ *
+ * Version 8 adds durable queued user messages and provider delivery state.
+ *
+ * Version 9 records Claude transcript checkpoints for editable in-turn user
+ * messages.
  */
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 9;
 
 /**
  * The complete, current schema: one CREATE TABLE (plus indexes) per table in
@@ -202,8 +207,29 @@ function createSchema(sqlite: Database): void {
       parent_id TEXT,
       session_id TEXT,
       anchor_id TEXT,
+      delivery_status TEXT,
+      delivery_error TEXT,
       created_at INTEGER NOT NULL DEFAULT (unixepoch())
     )
+  `);
+  sqlite.run(`
+    CREATE TABLE IF NOT EXISTS queued_messages (
+      id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      content TEXT NOT NULL,
+      mode TEXT NOT NULL DEFAULT 'later',
+      status TEXT NOT NULL DEFAULT 'queued',
+      target_message_id TEXT,
+      edit_session_id TEXT,
+      edit_anchor_id TEXT,
+      error TEXT,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+    )
+  `);
+  sqlite.run(`
+    CREATE INDEX IF NOT EXISTS idx_queued_messages_chat
+    ON queued_messages (chat_id, status, created_at)
   `);
   // Append-only log of structured SSE events for each assistant turn. Lets the
   // UI reconstruct tool calls, thinking blocks, raw debug events, and per-turn
@@ -466,6 +492,45 @@ const migrations: Record<number, (sqlite: Database) => void> = {
       .query("SELECT name FROM pragma_table_info('instances') WHERE name = 'layout'")
       .get();
     if (!layoutColumn) sqlite.run(`ALTER TABLE instances ADD COLUMN layout TEXT`);
+  },
+  8: (sqlite) => {
+    const messageColumns = sqlite
+      .query("SELECT name FROM pragma_table_info('chat_messages')")
+      .all() as Array<{ name: string }>;
+    if (!messageColumns.some((column) => column.name === "delivery_status")) {
+      sqlite.run(`ALTER TABLE chat_messages ADD COLUMN delivery_status TEXT`);
+    }
+    if (!messageColumns.some((column) => column.name === "delivery_error")) {
+      sqlite.run(`ALTER TABLE chat_messages ADD COLUMN delivery_error TEXT`);
+    }
+    sqlite.run(`
+      CREATE TABLE IF NOT EXISTS queued_messages (
+        id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        mode TEXT NOT NULL DEFAULT 'later',
+        status TEXT NOT NULL DEFAULT 'queued',
+        target_message_id TEXT,
+        error TEXT,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+        updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+      )
+    `);
+    sqlite.run(`
+      CREATE INDEX IF NOT EXISTS idx_queued_messages_chat
+      ON queued_messages (chat_id, status, created_at)
+    `);
+  },
+  9: (sqlite) => {
+    const columns = sqlite
+      .query("SELECT name FROM pragma_table_info('queued_messages')")
+      .all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === "edit_session_id")) {
+      sqlite.run(`ALTER TABLE queued_messages ADD COLUMN edit_session_id TEXT`);
+    }
+    if (!columns.some((column) => column.name === "edit_anchor_id")) {
+      sqlite.run(`ALTER TABLE queued_messages ADD COLUMN edit_anchor_id TEXT`);
+    }
   },
 };
 

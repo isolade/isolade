@@ -175,7 +175,7 @@ function seedV3Db(path: string): { chatId: string; newestOrphanId: string } {
   return { chatId, newestOrphanId };
 }
 
-describe("db migrations 3-7 (message tree, attachments, rendering, and panel layout)", () => {
+describe("db migrations 3-9 (message tree, attachments, rendering, panel layout, and queue)", () => {
   it("backfills linear parent chains, the active leaf, and the parent index", () => {
     const path = join(tmpdir(), `isolade-mig3-${randomUUID()}.db`);
     try {
@@ -206,7 +206,17 @@ describe("db migrations 3-7 (message tree, attachments, rendering, and panel lay
       const raw = new Database(path);
       const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(7);
+      expect(version).toBe(9);
+      const messageColumns = raw
+        .query("SELECT name FROM pragma_table_info('chat_messages')")
+        .all() as Array<{ name: string }>;
+      expect(messageColumns.map((column) => column.name)).toContain("delivery_status");
+      expect(messageColumns.map((column) => column.name)).toContain("delivery_error");
+      expect(
+        raw
+          .query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'queued_messages'`)
+          .get(),
+      ).toEqual({ name: "queued_messages" });
       // Migration 4 installed the uploads table.
       const uploadsTable = raw
         .query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'uploads'`)
@@ -370,7 +380,7 @@ describe("db migration 7 (panel layout)", () => {
       const version = (
         new Database(path).query("PRAGMA user_version").get() as { user_version: number }
       ).user_version;
-      expect(version).toBe(7);
+      expect(version).toBe(9);
     } finally {
       rmSync(path, { force: true });
       rmSync(`${path}-wal`, { force: true });

@@ -199,6 +199,25 @@ export class UploadStore {
       .map(({ upload }) => toUpload(upload));
   }
 
+  releaseQueuedMessage(chatId: string, messageId: string): void {
+    this.db.transaction(() => {
+      this.db
+        .delete(schema.messageUploads)
+        .where(
+          and(
+            eq(schema.messageUploads.chatId, chatId),
+            eq(schema.messageUploads.messageId, messageId),
+          ),
+        )
+        .run();
+      this.db
+        .update(schema.uploads)
+        .set({ chatId: null, messageId: null })
+        .where(and(eq(schema.uploads.chatId, chatId), eq(schema.uploads.messageId, messageId)))
+        .run();
+    });
+  }
+
   removeForChat(chatId: string): void {
     this.db.delete(schema.messageUploads).where(eq(schema.messageUploads.chatId, chatId)).run();
     this.db.delete(schema.uploads).where(eq(schema.uploads.chatId, chatId)).run();

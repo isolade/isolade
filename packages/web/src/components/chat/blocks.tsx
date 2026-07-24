@@ -18,12 +18,15 @@ import {
   Wrench,
 } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
+import type { Upload } from "@/lib/contracts";
 import { summarizeChatToolInput } from "@/lib/contracts";
 import { cn } from "@/lib/utils";
 import StreamingMarkdown from "../StreamingMarkdown";
 import type { StreamChunk, ToolChunk } from "./chunks";
+import { UserMessage } from "./UserMessage";
 
 type ThoughtChunk = Extract<StreamChunk, { kind: "thought" }>;
+const NO_USER_MESSAGE_CAPABILITIES = {};
 
 // Visual presentation per tool: icon + present/past verb. Verb-based naming
 // reads more naturally than the raw tool name ("Reading file.ts" vs "Read:
@@ -381,6 +384,19 @@ const RetryBlock = memo(function RetryBlock({
   );
 });
 
+const InterruptionMarker = memo(function InterruptionMarker({ id }: { id: string }) {
+  return (
+    <div
+      data-agent-interrupted={id}
+      className="-mr-12 my-4 flex items-center gap-2 text-xs text-muted-foreground"
+    >
+      <span className="h-px flex-1 bg-border" />
+      <span>Agent interrupted</span>
+      <span className="h-px flex-1 bg-border" />
+    </div>
+  );
+});
+
 // Memoized so a re-render of Chat (e.g. a tab switch flipping `visible`, or a
 // streaming delta on a *different* message) doesn't reconcile every past
 // turn's tool/thinking/markdown blocks. History chunk arrays keep a stable
@@ -391,11 +407,25 @@ export const StreamView = memo(function StreamView({
   chunks,
   showDebug,
   streaming = false,
+  instanceId,
+  userFontFamily,
+  editingUserMessageId,
+  actionsDisabled,
+  onStartUserMessageEdit,
+  onCancelUserMessageEdit,
+  onSubmitUserMessageEdit,
   onRequestToolDetails,
 }: {
   chunks: StreamChunk[];
   showDebug: boolean;
   streaming?: boolean;
+  instanceId: string;
+  userFontFamily: string;
+  editingUserMessageId?: string | null;
+  actionsDisabled?: boolean;
+  onStartUserMessageEdit?: (id: string) => void;
+  onCancelUserMessageEdit?: () => void;
+  onSubmitUserMessageEdit?: (id: string, content: string, uploads: Upload[]) => void;
   onRequestToolDetails?: (toolId: string) => void;
 }) {
   return (
@@ -412,6 +442,26 @@ export const StreamView = memo(function StreamView({
         }
         if (chunk.kind === "tool") {
           return <ToolCallBlock key={i} chunk={chunk} onRequestDetails={onRequestToolDetails} />;
+        }
+        if (chunk.kind === "user_message") {
+          return (
+            <UserMessage
+              key={chunk.id}
+              message={chunk}
+              capabilities={chunk.capabilities ?? NO_USER_MESSAGE_CAPABILITIES}
+              instanceId={instanceId}
+              fontFamily={userFontFamily}
+              inline
+              editing={editingUserMessageId === chunk.id}
+              actionsDisabled={actionsDisabled}
+              onStartEdit={onStartUserMessageEdit}
+              onCancelEdit={onCancelUserMessageEdit}
+              onSubmitEdit={onSubmitUserMessageEdit}
+            />
+          );
+        }
+        if (chunk.kind === "interruption") {
+          return <InterruptionMarker key={chunk.id} id={chunk.id} />;
         }
         if (chunk.kind === "api_retry") return <RetryBlock key={i} chunk={chunk} />;
         if (chunk.kind === "thought") return <ThoughtBlock key={chunk.id} chunk={chunk} />;

@@ -93,6 +93,51 @@ function streamedResponse(
 }
 
 describe("runChatTurn", () => {
+  it("repeats a lost initial POST with the same stable user id", async () => {
+    let attempts = 0;
+    const bodies: unknown[] = [];
+    const mock = installMockFetch({
+      routes: [
+        {
+          method: "POST",
+          pathRegex: /\/messages$/,
+          respond: async (request) => {
+            bodies.push(await request.json());
+            attempts++;
+            if (attempts === 1) throw new TypeError("connection reset");
+            return new Response(
+              sseBody([
+                { event: "message_id", data: JSON.stringify("assistant-1") },
+                { event: "done", data: "" },
+              ]),
+              { headers: { "Content-Type": "text/event-stream" } },
+            );
+          },
+        },
+      ],
+    });
+    try {
+      await runChatTurn({
+        apiBase: "http://test",
+        instanceId: "i1",
+        chatId: "c1",
+        content: "hello",
+        userMessageId: "stable-user",
+        onEvent: () => {},
+        signal: new AbortController().signal,
+        backoffBaseMs: 1,
+        backoffCapMs: 1,
+      });
+      expect(attempts).toBe(2);
+      expect(bodies).toEqual([
+        { id: "stable-user", content: "hello" },
+        { id: "stable-user", content: "hello" },
+      ]);
+    } finally {
+      mock.restore();
+    }
+  });
+
   it("posts retained and added upload ids to the edit endpoint", async () => {
     let requestPath = "";
     let requestBody: unknown;

@@ -6,6 +6,13 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+### Added
+
+- Messages can now be queued while an agent is working. By default, they are
+  sent when the current turn ends. They can also be sent after the current tool
+  call or immediately.
+- User messages now warn when delivery could not be confirmed.
+
 ### Fixed
 
 - Codex chats now show reconnect progress while Codex retries an interrupted

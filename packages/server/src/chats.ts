@@ -19,7 +19,7 @@ import {
 } from "./contracts";
 import type { Db } from "./db";
 import { schema } from "./db";
-import type { ChatMessage, Chat as ChatRow } from "./db/schema";
+import type { ChatMessage, Chat as ChatRow, QueuedMessage } from "./db/schema";
 
 // Optional tree/session metadata for a message insert. `parentId` links the
 // message into the tree (null = chat root). `sessionId`/`anchorId` snapshot
@@ -29,6 +29,8 @@ export interface MessageMeta {
   parentId?: string | null;
   sessionId?: string | null;
   anchorId?: string | null;
+  deliveryStatus?: "sending" | "confirmed" | "unknown" | "rejected" | null;
+  deliveryError?: string | null;
 }
 
 // Row shape returned from manager methods. Effort is always non-null at this
@@ -72,6 +74,7 @@ export class ChatManager {
   }
 
   remove(id: string) {
+    this.db.delete(schema.queuedMessages).where(eq(schema.queuedMessages.chatId, id)).run();
     this.db.delete(schema.chatEvents).where(eq(schema.chatEvents.chatId, id)).run();
     this.db.delete(schema.chatMessageRenders).where(eq(schema.chatMessageRenders.chatId, id)).run();
     this.db.delete(schema.chatMessages).where(eq(schema.chatMessages.chatId, id)).run();
@@ -109,6 +112,8 @@ export class ChatManager {
         parentId: meta.parentId ?? null,
         sessionId: meta.sessionId ?? null,
         anchorId: meta.anchorId ?? null,
+        deliveryStatus: meta.deliveryStatus ?? null,
+        deliveryError: meta.deliveryError ?? null,
       })
       .run();
     return this.db.select().from(schema.chatMessages).where(eq(schema.chatMessages.id, id)).get()!;
@@ -116,6 +121,22 @@ export class ChatManager {
 
   getMessage(id: string): ChatMessage | undefined {
     return this.db.select().from(schema.chatMessages).where(eq(schema.chatMessages.id, id)).get();
+  }
+
+  getAssistantReply(chatId: string, userMessageId: string): ChatMessage | undefined {
+    return this.db
+      .select()
+      .from(schema.chatMessages)
+      .where(
+        and(
+          eq(schema.chatMessages.chatId, chatId),
+          eq(schema.chatMessages.role, "assistant"),
+          eq(schema.chatMessages.parentId, userMessageId),
+        ),
+      )
+      .orderBy(desc(sql`rowid`))
+      .limit(1)
+      .get();
   }
 
   // Insertion order (rowid), NOT created_at: the column has second precision,
@@ -260,6 +281,7 @@ export class ChatManager {
         ...page,
         chunksByMessage,
         inFlight,
+        queuedMessages: this.listQueuedMessages(chatId),
       };
     });
   }
@@ -444,6 +466,9 @@ export class ChatManager {
       "tool_call_start",
       "tool_call_input",
       "tool_call_result",
+      "steered_user_message",
+      "turn_interrupted",
+      "render_seed",
       "api_retry",
       ...(includeDebug ? ["thinking", "raw"] : []),
     ];
@@ -493,6 +518,9 @@ export class ChatManager {
       "tool_call_start",
       "tool_call_input",
       "tool_call_result",
+      "steered_user_message",
+      "turn_interrupted",
+      "render_seed",
       "api_retry",
       ...(includeDebug ? ["thinking", "raw"] : []),
     ];
@@ -535,9 +563,17 @@ export class ChatManager {
     assistantMessageId: string,
     content: string,
     parentId: string | null,
+    userMessageId: string = randomUUID(),
   ): ChatMessage {
     return this.db.transaction(() => {
-      const userMessage = this.addMessage(chatId, "user", content, { parentId });
+      const userMessage = this.addMessageWithId(chatId, userMessageId, "user", content, {
+        parentId,
+        deliveryStatus: "sending",
+      });
+      this.db
+        .delete(schema.queuedMessages)
+        .where(eq(schema.queuedMessages.id, userMessageId))
+        .run();
       this.db
         .update(schema.chats)
         .set({ activeLeafId: userMessage.id, inFlightMessageId: assistantMessageId })
@@ -556,6 +592,118 @@ export class ChatManager {
         .run();
       return userMessage;
     });
+  }
+
+  enqueueMessage(opts: { id: string; chatId: string; content: string }): QueuedMessage {
+    const existing = this.db
+      .select()
+      .from(schema.queuedMessages)
+      .where(eq(schema.queuedMessages.id, opts.id))
+      .get();
+    if (existing) {
+      if (existing.chatId !== opts.chatId || existing.content !== opts.content) {
+        throw new Error("queued message id was already used with different content");
+      }
+      return existing;
+    }
+    const existingMessage = this.getMessage(opts.id);
+    if (existingMessage) {
+      if (
+        existingMessage.chatId !== opts.chatId ||
+        existingMessage.role !== "user" ||
+        existingMessage.content !== opts.content
+      ) {
+        throw new Error("message id was already used with different content");
+      }
+      throw new Error("message was already sent");
+    }
+    this.db
+      .insert(schema.queuedMessages)
+      .values({ id: opts.id, chatId: opts.chatId, content: opts.content })
+      .run();
+    return this.getQueuedMessage(opts.id)!;
+  }
+
+  getQueuedMessage(id: string): QueuedMessage | undefined {
+    return this.db
+      .select()
+      .from(schema.queuedMessages)
+      .where(eq(schema.queuedMessages.id, id))
+      .get();
+  }
+
+  listQueuedMessages(chatId: string): QueuedMessage[] {
+    return this.db
+      .select()
+      .from(schema.queuedMessages)
+      .where(eq(schema.queuedMessages.chatId, chatId))
+      .orderBy(asc(schema.queuedMessages.createdAt), asc(sql`rowid`))
+      .all()
+      .filter((message) => message.status !== "delivered");
+  }
+
+  nextQueuedMessage(chatId: string): QueuedMessage | undefined {
+    const messages = this.listQueuedMessages(chatId);
+    return (
+      messages.find((message) => message.mode === "now" && message.status === "interrupting") ??
+      messages.find((message) => message.mode === "later" && message.status === "queued")
+    );
+  }
+
+  updateQueuedMessage(
+    id: string,
+    updates: Partial<
+      Pick<
+        QueuedMessage,
+        "mode" | "status" | "targetMessageId" | "editSessionId" | "editAnchorId" | "error"
+      >
+    >,
+  ): QueuedMessage | undefined {
+    this.db
+      .update(schema.queuedMessages)
+      .set({ ...updates, updatedAt: new Date() })
+      .where(eq(schema.queuedMessages.id, id))
+      .run();
+    return this.getQueuedMessage(id);
+  }
+
+  createDeliveredInTurnMessage(opts: {
+    id: string;
+    chatId: string;
+    content: string;
+    mode: "next" | "now";
+    targetMessageId: string;
+    editSessionId: string;
+    editAnchorId: string;
+  }): QueuedMessage {
+    this.db
+      .insert(schema.queuedMessages)
+      .values({ ...opts, status: "delivered" })
+      .run();
+    return this.getQueuedMessage(opts.id)!;
+  }
+
+  removeQueuedMessage(id: string, allowInProgress = false): QueuedMessage | undefined {
+    const row = this.getQueuedMessage(id);
+    if (!row) return undefined;
+    if (!allowInProgress && (row.status === "steering" || row.status === "interrupting")) {
+      throw new Error("message is already being delivered");
+    }
+    this.db.delete(schema.queuedMessages).where(eq(schema.queuedMessages.id, id)).run();
+    return row;
+  }
+
+  setUserMessageDelivery(
+    id: string,
+    status: "sending" | "confirmed" | "unknown" | "rejected",
+    error: string | null = null,
+  ): ChatMessage | undefined {
+    this.db
+      .update(schema.chatMessages)
+      .set({ deliveryStatus: status, deliveryError: error })
+      .where(and(eq(schema.chatMessages.id, id), eq(schema.chatMessages.role, "user")))
+      .run();
+    return this.getMessage(id);
   }
 
   finalizeTurn(
@@ -794,6 +942,9 @@ export class ChatManager {
       "tool_call_start",
       "tool_call_input",
       "tool_call_result",
+      "steered_user_message",
+      "turn_interrupted",
+      "render_seed",
       "api_retry",
       ...(includeDebug ? ["thinking", "raw"] : []),
     ];

@@ -48,6 +48,7 @@ describe("ClaudeBackend session lifecycle", () => {
     expect((await p1).content).toBe("one");
     expect(procs.length).toBe(1);
     expect(proc(procs, 0).command).toContain("--input-format stream-json");
+    expect(proc(procs, 0).command).toContain("--replay-user-messages");
     expect(proc(procs, 0).command).not.toContain("--resume");
 
     // Turn 2: same model → SAME process (no new execStream).

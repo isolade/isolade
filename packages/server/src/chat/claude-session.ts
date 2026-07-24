@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import { PushQueue } from "@isolade/shared";
 import type { SandboxApi } from "../sandbox-client";
@@ -41,8 +42,15 @@ interface PendingControl {
   timer: ReturnType<typeof setTimeout>;
 }
 
+interface PendingUserAcknowledgement {
+  steering: boolean;
+  resolve: (receipt: { sessionId?: string; priorAnchorId?: string }) => void;
+  reject: (err: Error) => void;
+}
+
 type ControlRequest =
   | { subtype: "interrupt" }
+  | { subtype: "cancel_async_message"; message_uuid: string }
   | { subtype: "set_model"; model?: string }
   | {
       subtype: "apply_flag_settings";
@@ -96,6 +104,11 @@ export class ClaudeSession {
   private started = false;
   private dead = false;
   private sessionId: string | undefined;
+  // Last resumable transcript entry emitted by the CLI. A queued-command
+  // replay carries the stable client UUID rather than the attachment row's
+  // transcript UUID, so its acknowledgement captures this value before the
+  // replay instead of treating the replay UUID as a future anchor.
+  private lastTranscriptUuid: string | undefined;
   private stderr = "";
   private readonly stdoutDecoder = new StringDecoder("utf8");
   private readonly stderrDecoder = new StringDecoder("utf8");
@@ -105,6 +118,13 @@ export class ClaudeSession {
   private shutdownTimer: ReturnType<typeof setTimeout> | null = null;
   private controlSeq = 0;
   private readonly pendingControls = new Map<string, PendingControl>();
+  private readonly pendingUserAcknowledgements = new Map<string, PendingUserAcknowledgement>();
+  // A native `now` prompt aborts Claude's current ask(), which emits one
+  // terminal result, then Claude dequeues the prompt and starts another ask()
+  // on the same process. Both belong to one Isolade-visible turn. Skip exactly
+  // one result boundary per immediate steer and settle on the replacement
+  // query's result.
+  private immediateResultBoundaries = 0;
 
   constructor(opts: ClaudeSessionOpts) {
     this.opts = opts;
@@ -136,6 +156,8 @@ export class ClaudeSession {
   // process alive and reusable for the next turn.
   async runTurn(opts: {
     userText: string;
+    userMessageId?: string;
+    onUserMessageAcknowledged?: (receipt: { sessionId?: string; priorAnchorId?: string }) => void;
     signal?: AbortSignal;
     hooks: TurnHooks;
   }): Promise<{ content: string; sessionId?: string }> {
@@ -166,7 +188,10 @@ export class ClaudeSession {
     // very fast first chunk) always have a turn to land on.
     if (!this.started) this.start();
 
-    this.writeUserMessage(opts.userText);
+    void this.writeUserMessage(opts.userText, opts.userMessageId ?? randomUUID()).then(
+      (receipt) => opts.onUserMessageAcknowledged?.(receipt),
+      () => {},
+    );
 
     try {
       const content = await turnPromise;
@@ -191,6 +216,36 @@ export class ClaudeSession {
       }
       this.active = null;
     }
+  }
+
+  async steer(opts: {
+    userText: string;
+    userMessageId: string;
+    priority: "next" | "now";
+  }): Promise<{ sessionId?: string; priorAnchorId?: string }> {
+    if (this.dead) throw new Error("claude session is no longer alive");
+    if (!this.active) throw new Error("there is no active claude turn to steer");
+    if (opts.priority === "now") this.immediateResultBoundaries += 1;
+    return this.writeUserMessage(opts.userText, opts.userMessageId, opts.priority);
+  }
+
+  async cancelSteer(userMessageId: string): Promise<boolean> {
+    if (this.dead) throw new Error("claude session is no longer alive");
+    const result = await this.sendControl({
+      subtype: "cancel_async_message",
+      message_uuid: userMessageId,
+    });
+    if (result.cancelled !== true) return false;
+
+    // A cancelled async message is intentionally never replay-acknowledged by
+    // Claude. Reject its waiter so the outstanding steer request settles and
+    // cannot leak until the process exits.
+    const acknowledgement = this.pendingUserAcknowledgements.get(userMessageId);
+    if (acknowledgement) {
+      this.pendingUserAcknowledgements.delete(userMessageId);
+      acknowledgement.reject(new Error("claude queued message was cancelled"));
+    }
+    return true;
   }
 
   // Update launch-time choices without replacing the process. The CLI applies
@@ -258,16 +313,32 @@ export class ClaudeSession {
       .catch((err) => this.onProcessEnd(undefined, err));
   }
 
-  private writeUserMessage(text: string): void {
-    if (this.dead) return;
+  private writeUserMessage(
+    text: string,
+    id: string,
+    priority?: "next" | "now",
+  ): Promise<{ sessionId?: string; priorAnchorId?: string }> {
+    if (this.dead) return Promise.reject(new Error("claude session is no longer alive"));
+    const acknowledgement = new Promise<{ sessionId?: string; priorAnchorId?: string }>(
+      (resolve, reject) => {
+        this.pendingUserAcknowledgements.set(id, {
+          steering: priority !== undefined,
+          resolve,
+          reject,
+        });
+      },
+    );
     this.stdin.push(
       Buffer.from(
         JSON.stringify({
           type: "user",
+          uuid: id,
+          ...(priority ? { priority } : {}),
           message: { role: "user", content: [{ type: "text", text }] },
         }) + "\n",
       ),
     );
+    return acknowledgement;
   }
 
   // Ask the CLI to abandon the in-flight turn. It acks with a
@@ -314,6 +385,28 @@ export class ClaudeSession {
       return;
     }
 
+    if (event.type === "user" && event.isReplay === true && typeof event.uuid === "string") {
+      const pending = this.pendingUserAcknowledgements.get(event.uuid);
+      if (pending) {
+        this.pendingUserAcknowledgements.delete(event.uuid);
+        pending.resolve({
+          ...(this.sessionId ? { sessionId: this.sessionId } : {}),
+          ...(this.lastTranscriptUuid ? { priorAnchorId: this.lastTranscriptUuid } : {}),
+        });
+        // Ordinary input UUIDs are real transcript rows. Steering input is
+        // persisted as a queued_command attachment with a different UUID.
+        if (!pending.steering) this.lastTranscriptUuid = event.uuid;
+      }
+    }
+
+    if (
+      event.isReplay !== true &&
+      (event.type === "assistant" || event.type === "user") &&
+      typeof event.uuid === "string"
+    ) {
+      this.lastTranscriptUuid = event.uuid;
+    }
+
     // Track the CLI's session id for the turn's return value (the backend
     // separately persists it from the same event).
     if (
@@ -337,6 +430,10 @@ export class ClaudeSession {
     // roundtrips). The backend's onEvent has already run its result accounting
     // above, so getContent() now reflects the final assistant text.
     if (event.type === "result") {
+      if (this.immediateResultBoundaries > 0) {
+        this.immediateResultBoundaries -= 1;
+        return;
+      }
       const hooks = active.hooks;
       this.settleTurn(active, () => active.resolve(hooks.getContent()));
     }
@@ -440,6 +537,11 @@ export class ClaudeSession {
         : String(err)
       : `claude exited with code ${exitCode}${this.stderr ? `: ${this.stderr.trim()}` : ""}`;
     this.rejectPendingControls(new Error(message));
+    this.immediateResultBoundaries = 0;
+    for (const pending of this.pendingUserAcknowledgements.values()) {
+      pending.reject(new Error(message));
+    }
+    this.pendingUserAcknowledgements.clear();
 
     const active = this.active;
     if (active && !active.settled) {

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { ChatManager } from "../chats";
 import {
   type ChatEffort,
@@ -32,6 +33,14 @@ export class CodexBackend implements ChatBackend {
   // resets to "nothing loaded" and forces a resume. WeakMap so a dropped
   // connection's entry is collected with it.
   private threadLiveness = new WeakMap<CodexConnection, Map<string, Promise<void>>>();
+  private activeTurns = new Map<
+    string,
+    {
+      conn: CodexConnection;
+      threadId: string;
+      turnId: Promise<string>;
+    }
+  >();
 
   constructor(
     sandboxClient: SandboxApi,
@@ -146,11 +155,13 @@ export class CodexBackend implements ChatBackend {
     model: string;
     effort: ChatEffort;
     sessionId?: string; // codexThreadId
+    userMessageId?: string;
     fork?: { anchorId: string }; // anchorId = the turn id to fork through
     signal?: AbortSignal;
     onDelta: (text: string) => void;
     onEvent?: (event: ChatEvent) => void;
     onMeta?: (meta: TurnMeta) => void;
+    onUserMessageAcknowledged?: () => void;
   }): Promise<{ content: string; sessionId?: string }> {
     const conn = await this.manager.getOrCreate(opts.vmId);
 
@@ -180,9 +191,41 @@ export class CodexBackend implements ChatBackend {
 
     // Register notification handlers before sending the turn so we don't miss early events
     let fullContent = "";
+    const userMessageId = opts.userMessageId ?? randomUUID();
     await new Promise<void>((resolve, reject) => {
       let turnStartPromise: Promise<{ turn: { id: string } }> | null = null;
+      let activeTurnId: string | null = null;
+      let acknowledged = false;
+      const belongsToTurn = (params: unknown): boolean => {
+        const envelope = params as {
+          threadId?: unknown;
+          turnId?: unknown;
+          turn?: { id?: unknown };
+          item?: { type?: unknown; clientId?: unknown };
+        } | null;
+        if (typeof envelope?.threadId === "string" && envelope.threadId !== threadId) return false;
+        const eventTurnId =
+          typeof envelope?.turnId === "string"
+            ? envelope.turnId
+            : typeof envelope?.turn?.id === "string"
+              ? envelope.turn.id
+              : null;
+        if (!eventTurnId) return true;
+        if (activeTurnId) return eventTurnId === activeTurnId;
+        // Notifications can beat the turn/start response. The replacement
+        // turn's user item carries our stable client id, so it can establish
+        // the turn identity early. Reject every other turn-scoped event until
+        // then. This is critical after interruption, when the old turn's
+        // delayed completion can otherwise settle the replacement turn and
+        // detach its handlers before its answer arrives.
+        if (envelope?.item?.type === "userMessage" && envelope.item.clientId === userMessageId) {
+          activeTurnId = eventTurnId;
+          return true;
+        }
+        return false;
+      };
       const offDelta = conn.on("item/agentMessage/delta", (params) => {
+        if (!belongsToTurn(params)) return;
         const delta = (params as { delta?: string } | null)?.delta ?? "";
         if (delta) {
           fullContent += delta;
@@ -197,6 +240,7 @@ export class CodexBackend implements ChatBackend {
       // upstream API errors all surface to the user as an empty assistant
       // message with no error event on the SSE stream.
       const offCompleted = conn.on("turn/completed", (params) => {
+        if (!belongsToTurn(params)) return;
         const turn = (
           params as {
             turn?: { status?: string; error?: { message?: string } };
@@ -213,6 +257,7 @@ export class CodexBackend implements ChatBackend {
       });
 
       const offFailed = conn.on("turn/failed", (params) => {
+        if (!belongsToTurn(params)) return;
         cleanup();
         const errMsg =
           (params as { error?: { message?: string } } | null)?.error?.message ?? "turn failed";
@@ -365,10 +410,25 @@ export class CodexBackend implements ChatBackend {
       };
 
       const offStarted = conn.on("item/started", (params) => {
+        if (!belongsToTurn(params)) return;
+        const itemEnvelope = params as {
+          threadId?: unknown;
+          item?: { type?: unknown; clientId?: unknown };
+        } | null;
+        if (
+          !acknowledged &&
+          itemEnvelope?.threadId === threadId &&
+          itemEnvelope.item?.type === "userMessage" &&
+          itemEnvelope.item.clientId === userMessageId
+        ) {
+          acknowledged = true;
+          opts.onUserMessageAcknowledged?.();
+        }
         const item = extractCodexItem(params);
         if (item) handleItemStart(item);
       });
       const offUpdated = conn.on("item/updated", (params) => {
+        if (!belongsToTurn(params)) return;
         const item = extractCodexItem(params);
         if (!item) return;
         // Reasoning may stream text through item/updated even before a
@@ -401,11 +461,13 @@ export class CodexBackend implements ChatBackend {
         }
       });
       const offItemDone = conn.on("item/completed", (params) => {
+        if (!belongsToTurn(params)) return;
         const item = extractCodexItem(params);
         if (item) handleItemFinish(item);
       });
 
       const offReasoningDelta = conn.on("item/reasoning/summaryTextDelta", (params) => {
+        if (!belongsToTurn(params)) return;
         const p = params as {
           itemId?: unknown;
           delta?: unknown;
@@ -426,6 +488,7 @@ export class CodexBackend implements ChatBackend {
       });
 
       const offReasoningPart = conn.on("item/reasoning/summaryPartAdded", (params) => {
+        if (!belongsToTurn(params)) return;
         const itemId = (params as { itemId?: unknown } | null)?.itemId;
         if (typeof itemId === "string") ensureReasoning(itemId);
       });
@@ -438,6 +501,7 @@ export class CodexBackend implements ChatBackend {
       // model's catalog pricing (when known).
       const pricing = codexPricingFor(opts.model);
       const offUsage = conn.on("thread/tokenUsage/updated", (params) => {
+        if (!belongsToTurn(params)) return;
         const ev = params as {
           tokenUsage?: {
             last?: Record<string, unknown>;
@@ -465,7 +529,8 @@ export class CodexBackend implements ChatBackend {
       // Codex fires this when it auto-compacts the thread because the
       // context window is full. The UI flags the next gauge update as a
       // post-compaction snapshot rather than showing a confusing drop.
-      const offCompacted = conn.on("thread/compacted", () => {
+      const offCompacted = conn.on("thread/compacted", (params) => {
+        if (!belongsToTurn(params)) return;
         opts.onEvent?.({ type: "context_compacted" });
       });
 
@@ -489,6 +554,7 @@ export class CodexBackend implements ChatBackend {
       ]);
       const offAny = conn.onAny((method, params) => {
         if (HANDLED_METHODS.has(method)) return;
+        if (!belongsToTurn(params)) return;
         opts.onEvent?.({
           type: "raw",
           source: "codex",
@@ -496,7 +562,7 @@ export class CodexBackend implements ChatBackend {
         });
       });
 
-      function cleanup() {
+      const cleanup = () => {
         offDelta();
         offCompleted();
         offFailed();
@@ -509,11 +575,15 @@ export class CodexBackend implements ChatBackend {
         offUsage();
         offCompacted();
         offAny();
+        const active = this.activeTurns.get(opts.chatId);
+        if (active?.conn === conn && active.threadId === threadId) {
+          this.activeTurns.delete(opts.chatId);
+        }
         // Detach the abort listener on every exit path (not just when it
         // fires) so a completed turn doesn't leave a dangling listener on the
         // shared per-turn signal.
         opts.signal?.removeEventListener("abort", onAbort);
-      }
+      };
 
       // User-initiated cancel: interrupt the actual Codex turn before
       // unblocking the chat. `turn/interrupt` needs the turn id returned by
@@ -563,6 +633,7 @@ export class CodexBackend implements ChatBackend {
       // doesn't support, so pass the chat's effort straight through.
       turnStartPromise = conn.send("turn/start", {
         threadId,
+        clientUserMessageId: userMessageId,
         model: opts.model,
         // The text carries the user's message plus an attachments preamble
         // that cites every file's path. The agent opens images with view_image
@@ -581,6 +652,11 @@ export class CodexBackend implements ChatBackend {
         serviceTier: "default",
         effort: opts.effort,
       }) as Promise<{ turn: { id: string } }>;
+      this.activeTurns.set(opts.chatId, {
+        conn,
+        threadId,
+        turnId: turnStartPromise.then((result) => result.turn.id),
+      });
       turnStartPromise.catch((err: Error) => {
         cleanup();
         reject(err);
@@ -591,7 +667,10 @@ export class CodexBackend implements ChatBackend {
       void turnStartPromise.then(
         (res) => {
           const turnId = res?.turn?.id;
-          if (turnId) opts.onMeta?.({ anchorId: turnId });
+          if (turnId) {
+            activeTurnId = turnId;
+            opts.onMeta?.({ anchorId: turnId });
+          }
         },
         () => {},
       );
@@ -601,6 +680,71 @@ export class CodexBackend implements ChatBackend {
     });
 
     return { content: fullContent, sessionId: threadId };
+  }
+
+  async steer(opts: {
+    vmId: string;
+    chatId: string;
+    message: string;
+    userMessageId: string;
+    priority: "next" | "now";
+    onUserMessageAcknowledged?: () => void;
+  }): Promise<void> {
+    if (opts.priority === "now") {
+      throw new Error("codex does not support in-turn now steering");
+    }
+    const active = this.activeTurns.get(opts.chatId);
+    if (!active) throw new Error("there is no active codex turn to steer");
+    const expectedTurnId = await active.turnId;
+    let acknowledged = false;
+    const acknowledgement = new Promise<void>((resolve, reject) => {
+      const offStarted = active.conn.on("item/started", (params) => {
+        const envelope = params as {
+          threadId?: unknown;
+          turnId?: unknown;
+          item?: { type?: unknown; clientId?: unknown };
+        } | null;
+        if (
+          envelope?.threadId !== active.threadId ||
+          envelope.turnId !== expectedTurnId ||
+          envelope.item?.type !== "userMessage" ||
+          envelope.item.clientId !== opts.userMessageId
+        ) {
+          return;
+        }
+        acknowledged = true;
+        offStarted();
+        resolve();
+      });
+      void active.conn
+        .send("turn/steer", {
+          threadId: active.threadId,
+          expectedTurnId,
+          clientUserMessageId: opts.userMessageId,
+          input: [{ type: "text", text: opts.message }],
+        })
+        .catch((error: unknown) => {
+          offStarted();
+          reject(error);
+        });
+    });
+    await acknowledgement;
+    if (acknowledged) opts.onUserMessageAcknowledged?.();
+  }
+
+  async hasUserMessage(opts: {
+    vmId: string;
+    chatId: string;
+    sessionId?: string;
+    userMessageId: string;
+  }): Promise<boolean> {
+    const active = this.activeTurns.get(opts.chatId);
+    const conn = active?.conn ?? (await this.manager.getOrCreate(opts.vmId));
+    const threadId = active?.threadId ?? opts.sessionId;
+    if (!threadId) return false;
+    if (!active) await this.ensureThreadLive(conn, threadId);
+    const result = await conn.send("thread/read", { threadId, includeTurns: true });
+    return containsClientUserMessageId(result, opts.userMessageId);
   }
 
   // Codex exposes per-turn token totals through `thread/tokenUsage/updated`
@@ -763,6 +907,21 @@ function codexToolName(itemType: string): string {
     default:
       return itemType.replace(/^[a-z]/, (c) => c.toUpperCase());
   }
+}
+
+function containsClientUserMessageId(value: unknown, target: string): boolean {
+  if (!value || typeof value !== "object") return false;
+  if (
+    (value as { type?: unknown }).type === "userMessage" &&
+    (value as { clientId?: unknown }).clientId === target
+  ) {
+    return true;
+  }
+  return Array.isArray(value)
+    ? value.some((item) => containsClientUserMessageId(item, target))
+    : Object.values(value as Record<string, unknown>).some((item) =>
+        containsClientUserMessageId(item, target),
+      );
 }
 
 // Codex reports a resume against a thread whose rollout file is gone as

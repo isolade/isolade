@@ -16,10 +16,12 @@
  *     events in the same order.
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import type { CreateAppOptions } from "../src/app";
 import type { ChatEvent as BackendChatEvent } from "../src/chat/backend";
 import {
   type ChatResumeSnapshot,
   DEFAULT_ANTHROPIC_MODEL_ID,
+  DEFAULT_OPENAI_MODEL_ID,
   TOOL_INPUT_PREVIEW_CHARS,
   TOOL_OUTPUT_PREVIEW_CHARS,
 } from "../src/contracts";
@@ -33,6 +35,7 @@ type Action =
   | { kind: "delta"; text: string }
   | { kind: "event"; event: BackendChatEvent }
   | { kind: "meta"; meta: { sessionId?: string; anchorId?: string } }
+  | { kind: "ack" }
   | { kind: "wait"; promise: Promise<void> }
   // Simulates a provider that ignores cancellation while one callback is
   // already in progress, then invokes it after the owning chat was deleted.
@@ -52,6 +55,7 @@ interface FakeSendOpts {
   onDelta: (text: string) => void;
   onEvent?: (event: BackendChatEvent) => void;
   onMeta?: (meta: { sessionId?: string; anchorId?: string }) => void;
+  onUserMessageAcknowledged?: (receipt?: { sessionId?: string; priorAnchorId?: string }) => void;
 }
 
 class FakeBackend {
@@ -61,6 +65,17 @@ class FakeBackend {
   public lastOpts: FakeSendOpts | null = null;
   public lastCompletion: Promise<void> = Promise.resolve();
   public callCount = 0;
+  public lastSteer: {
+    message: string;
+    userMessageId: string;
+    priority: "next" | "now";
+  } | null = null;
+  public lastCancelSteer: {
+    vmId: string;
+    chatId: string;
+    userMessageId: string;
+  } | null = null;
+  public cancelSteerResult = true;
 
   setScript(actions: Action[]) {
     this.script = actions;
@@ -89,6 +104,8 @@ class FakeBackend {
         opts.onEvent?.(action.event);
       } else if (action.kind === "meta") {
         opts.onMeta?.(action.meta);
+      } else if (action.kind === "ack") {
+        opts.onUserMessageAcknowledged?.();
       } else if (action.kind === "wait") {
         await action.promise;
       } else if (action.kind === "late_delta") {
@@ -110,6 +127,28 @@ class FakeBackend {
 
   probeContext = async (): Promise<{ available: false; reason: string }> => {
     return { available: false, reason: "fake" };
+  };
+
+  steer = async (opts: {
+    message: string;
+    userMessageId: string;
+    priority: "next" | "now";
+    onUserMessageAcknowledged?: (receipt?: { sessionId?: string; priorAnchorId?: string }) => void;
+  }): Promise<void> => {
+    this.lastSteer = opts;
+    opts.onUserMessageAcknowledged?.({
+      sessionId: "steering-session",
+      priorAnchorId: "before-steering",
+    });
+  };
+
+  cancelSteer = async (opts: {
+    vmId: string;
+    chatId: string;
+    userMessageId: string;
+  }): Promise<boolean> => {
+    this.lastCancelSteer = opts;
+    return this.cancelSteerResult;
   };
 
   // Titles are best-effort, and returning null exercises the truncation fallback,
@@ -216,12 +255,14 @@ describe("chat streaming resilience", () => {
     await cleanup();
   });
 
-  async function makeChat(): Promise<{ instanceId: string; chatId: string }> {
+  async function makeChat(
+    model = DEFAULT_ANTHROPIC_MODEL_ID,
+  ): Promise<{ instanceId: string; chatId: string }> {
     const instanceId = seedInstance();
     const res = await fetch(`${baseUrl}/api/instances/${instanceId}/chats`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: DEFAULT_ANTHROPIC_MODEL_ID }),
+      body: JSON.stringify({ model }),
     });
     const { id } = (await res.json()) as { id: string };
     return { instanceId, chatId: id };
@@ -286,9 +327,74 @@ describe("chat streaming resilience", () => {
     // Persisted assistant message.
     const msgs = chatManager.getMessages(chatId);
     expect(msgs.length).toBe(2);
+    expect(msgs[0]).toMatchObject({
+      role: "user",
+      deliveryStatus: "confirmed",
+    });
+    expect(events.some((event) => event.event === "user_message_confirmed")).toBe(true);
     expect(msgs[1]!.role).toBe("assistant");
     expect(msgs[1]!.content).toBe("hello world");
     expect(msgs[1]!.id).toBe(messageId);
+  });
+
+  it("warns after an acknowledgement timeout and clears on a late acknowledgement", async () => {
+    const delayedBackend = new FakeBackend();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    delayedBackend.setScript([
+      { kind: "wait", promise: blocked },
+      { kind: "ack" },
+      { kind: "delta", text: "received" },
+    ]);
+    const timeoutServer = createTestServer({
+      backendForTest: delayedBackend as unknown as NonNullable<CreateAppOptions["backendForTest"]>,
+      deliveryConfirmationTimeoutMs: 10,
+      hubOptions: { idleCancelMs: 30_000, evictionMs: 30_000 },
+    });
+
+    try {
+      const instanceId = timeoutServer.seedInstance();
+      const chatResponse = await fetch(
+        `${timeoutServer.baseUrl}/api/instances/${instanceId}/chats`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: DEFAULT_ANTHROPIC_MODEL_ID }),
+        },
+      );
+      const { id: chatId } = (await chatResponse.json()) as { id: string };
+      const response = await fetch(
+        `${timeoutServer.baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: "did this arrive?" }),
+        },
+      );
+
+      let deliveryStatus: string | null | undefined;
+      for (let i = 0; i < 50; i++) {
+        deliveryStatus = timeoutServer.chatManager.getMessages(chatId)[0]?.deliveryStatus;
+        if (deliveryStatus === "unknown") break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(deliveryStatus).toBe("unknown");
+
+      release();
+      const { events } = await readAllSse(response);
+      expect(
+        events.some(
+          (event) =>
+            event.event === "user_message_delivery" && event.data.includes('"status":"unknown"'),
+        ),
+      ).toBe(true);
+      expect(events.some((event) => event.event === "user_message_confirmed")).toBe(true);
+      expect(timeoutServer.chatManager.getMessages(chatId)[0]?.deliveryStatus).toBe("confirmed");
+    } finally {
+      await timeoutServer.cleanup();
+    }
   });
 
   it("finalizes only the durable prefix when an event-log write fails", async () => {
@@ -699,6 +805,7 @@ describe("chat streaming resilience", () => {
       messageId = chatStreamHub.inFlightFor(chatId);
     }
     expect(messageId).not.toBeNull();
+    if (!messageId) throw new Error("turn did not become active");
 
     const delRes = await fetch(
       `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages/${messageId}`,
@@ -712,6 +819,9 @@ describe("chat streaming resilience", () => {
       chunks: Array<{ kind: string; text?: string }>;
     };
     expect(snapshot.chunks).toEqual([{ kind: "text", text: "before-cancel" }]);
+    expect(events.find((event) => event.event === "turn_interrupted")?.data).toBe(
+      JSON.stringify({ id: messageId }),
+    );
     expect(events[events.length - 1]!.event).toBe("error");
     expect(events[events.length - 1]!.data).toMatch(/aborted/i);
 
@@ -719,6 +829,12 @@ describe("chat streaming resilience", () => {
     const msgs = chatManager.getMessages(chatId);
     const assistant = msgs.find((m) => m.role === "assistant");
     expect(assistant?.content).toBe("before-cancel");
+    expect(
+      chatManager.getMessageRenderChunks(chatId, [assistant!.id], false, false)[assistant!.id],
+    ).toContainEqual({
+      kind: "interruption",
+      id: messageId,
+    });
   });
 
   it("deleting an in-flight chat discards callbacks that arrive after deletion", async () => {
@@ -860,6 +976,469 @@ describe("chat streaming resilience", () => {
     expect(post2Res.status).toBe(409);
     resolveBackend();
     await readAllSse(await post1);
+  });
+
+  it("reuses the provider turn when a stable user id is posted again", async () => {
+    const { instanceId, chatId } = await makeChat();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const before = backend.callCount;
+    backend.setScript([
+      { kind: "wait", promise: blocked },
+      { kind: "delta", text: "once" },
+    ]);
+    const url = `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`;
+    const body = JSON.stringify({ id: "stable-user", content: "only once" });
+    const first = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+    await waitForInFlight(chatId);
+    const duplicate = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+    expect(duplicate.status).toBe(200);
+    release();
+    const [firstStream, duplicateStream] = await Promise.all([
+      readAllSse(first),
+      readAllSse(duplicate),
+    ]);
+    expect(firstStream.events.some((event) => event.event === "done")).toBe(true);
+    expect(duplicateStream.events.some((event) => event.event === "done")).toBe(true);
+    expect(backend.callCount).toBe(before + 1);
+
+    const afterCompletion = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+    expect(afterCompletion.status).toBe(200);
+    expect((await readAllSse(afterCompletion)).events.some((event) => event.event === "done")).toBe(
+      true,
+    );
+    expect(backend.callCount).toBe(before + 1);
+  });
+
+  it("durably queues a normal send and starts it after the active turn settles", async () => {
+    const { instanceId, chatId } = await makeChat();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const before = backend.callCount;
+    backend.setScript([
+      { kind: "wait", promise: blocked },
+      { kind: "delta", text: "first" },
+    ]);
+    const activeResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: "user-first", content: "first prompt" }),
+      },
+    );
+    await waitForInFlight(chatId);
+
+    const queuedResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/queue`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: "user-queued", content: "queued prompt" }),
+      },
+    );
+    expect(queuedResponse.status).toBe(201);
+    expect((await queuedResponse.json()).status).toBe("queued");
+
+    backend.setScript([{ kind: "ack" }, { kind: "delta", text: "second" }]);
+    release();
+    await readAllSse(activeResponse);
+    for (let i = 0; i < 50 && backend.callCount < before + 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await chatStreamHub.drain();
+
+    const transcript = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/transcript`,
+    ).then((response) => response.json());
+    expect(transcript.queuedMessages).toEqual([]);
+    expect(
+      transcript.messages.map((message: { role: string; content: string }) => [
+        message.role,
+        message.content,
+      ]),
+    ).toEqual([
+      ["user", "first prompt"],
+      ["assistant", "first"],
+      ["user", "queued prompt"],
+      ["assistant", "second"],
+    ]);
+    expect(
+      transcript.messages.find((message: { id: string }) => message.id === "user-queued")
+        ?.deliveryStatus,
+    ).toBe("confirmed");
+  });
+
+  it("shows a Codex steering message at its position in the active turn", async () => {
+    const { instanceId, chatId } = await makeChat(DEFAULT_OPENAI_MODEL_ID);
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    backend.setScript([
+      { kind: "event", event: { type: "tool_call_start", id: "tool-1", name: "Read" } },
+      {
+        kind: "event",
+        event: { type: "tool_call_result", id: "tool-1", output: "done" },
+      },
+      { kind: "wait", promise: blocked },
+      { kind: "delta", text: "continued" },
+    ]);
+    const activeResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "first prompt" }),
+      },
+    );
+    await waitForInFlight(chatId);
+    await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chatId}/queue`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: "steer-me", content: "change direction" }),
+    });
+
+    const steerResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/queue/steer-me/dispatch`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "next" }),
+      },
+    );
+    expect(steerResponse.status).toBe(200);
+    expect((await steerResponse.json()).status).toBe("delivered");
+    expect(backend.lastSteer).toMatchObject({
+      message: "change direction",
+      userMessageId: "steer-me",
+      priority: "next",
+    });
+
+    release();
+    const { events } = await readAllSse(activeResponse);
+    const steeredEvent = events.findIndex((event) => event.event === "steered_user_message");
+    const continuedDelta = events.findIndex(
+      (event) => event.event === "delta" && event.data.includes("continued"),
+    );
+    expect(steeredEvent).toBeGreaterThan(-1);
+    expect(continuedDelta).toBeGreaterThan(steeredEvent);
+
+    const transcript = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/transcript`,
+    ).then((response) => response.json());
+    expect(transcript.queuedMessages).toEqual([]);
+    const assistant = transcript.messages.find(
+      (message: { role: string }) => message.role === "assistant",
+    );
+    expect(
+      transcript.chunksByMessage[assistant.id].map((chunk: { kind: string }) => chunk.kind),
+    ).toEqual(["tool", "user_message", "text"]);
+    expect(transcript.chunksByMessage[assistant.id][1]).toMatchObject({
+      id: "steer-me",
+      content: "change direction",
+    });
+    expect(transcript.chunksByMessage[assistant.id][1].capabilities).toBeUndefined();
+  });
+
+  it("marks and displays a Claude immediate interruption inside the active turn", async () => {
+    const { instanceId, chatId } = await makeChat();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    backend.setScript([
+      { kind: "delta", text: "before" },
+      { kind: "wait", promise: blocked },
+      { kind: "delta", text: "after" },
+    ]);
+    const activeResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "first prompt" }),
+      },
+    );
+    await waitForInFlight(chatId);
+    await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chatId}/queue`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: "claude-now", content: "change now" }),
+    });
+
+    const immediateResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/queue/claude-now/dispatch`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "now" }),
+      },
+    );
+    expect(immediateResponse.status).toBe(200);
+    expect((await immediateResponse.json()).status).toBe("delivered");
+
+    release();
+    const { events } = await readAllSse(activeResponse);
+    const interrupted = events.findIndex((event) => event.event === "turn_interrupted");
+    const steered = events.findIndex((event) => event.event === "steered_user_message");
+    const continued = events.findIndex(
+      (event) => event.event === "delta" && event.data.includes("after"),
+    );
+    expect(interrupted).toBeGreaterThan(-1);
+    expect(steered).toBeGreaterThan(interrupted);
+    expect(continued).toBeGreaterThan(steered);
+    expect(JSON.parse(events[steered]!.data).capabilities).toEqual({ edit: true });
+    expect(chatManager.getQueuedMessage("claude-now")).toMatchObject({
+      editSessionId: "steering-session",
+      editAnchorId: "before-steering",
+    });
+  });
+
+  it("edits a Claude in-turn message by forking at its acknowledgement checkpoint", async () => {
+    const { instanceId, chatId } = await makeChat();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    backend.setScript([
+      { kind: "delta", text: "before " },
+      { kind: "wait", promise: blocked },
+      { kind: "delta", text: "original suffix" },
+    ]);
+    const activeResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "initial prompt" }),
+      },
+    );
+    await waitForInFlight(chatId);
+    await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chatId}/queue`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: "claude-inline", content: "original steering" }),
+    });
+    const dispatch = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/queue/claude-inline/dispatch`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "next" }),
+      },
+    );
+    expect(dispatch.status).toBe(200);
+    release();
+    await readAllSse(activeResponse);
+    await chatStreamHub.drain();
+
+    backend.setScript([
+      { kind: "meta", meta: { sessionId: "edited-session", anchorId: "edited-end" } },
+      { kind: "ack" },
+      { kind: "delta", text: "edited suffix" },
+    ]);
+    const editResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages/claude-inline/edit`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: "claude-inline-edited",
+          content: "edited steering",
+        }),
+      },
+    );
+    expect(editResponse.status).toBe(200);
+    await readAllSse(editResponse);
+    await chatStreamHub.drain();
+
+    expect(backend.lastOpts?.sessionId).toBe("steering-session");
+    expect(backend.lastOpts?.fork).toEqual({ anchorId: "before-steering" });
+    const transcript = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/transcript`,
+    ).then((response) => response.json());
+    expect(transcript.messages.map((message: { role: string }) => message.role)).toEqual([
+      "user",
+      "assistant",
+    ]);
+    const assistant = transcript.messages[1];
+    expect(assistant.content).toBe("before edited suffix");
+    expect(transcript.chunksByMessage[assistant.id]).toEqual([
+      { kind: "text", text: "before " },
+      {
+        kind: "user_message",
+        id: "claude-inline-edited",
+        content: "edited steering",
+        deliveryStatus: "confirmed",
+        capabilities: { edit: true },
+      },
+      { kind: "text", text: "edited suffix" },
+    ]);
+
+    const calls = backend.callCount;
+    const retry = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages/claude-inline/edit`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: "claude-inline-edited",
+          content: "edited steering",
+        }),
+      },
+    );
+    expect(retry.status).toBe(200);
+    await readAllSse(retry);
+    expect(backend.callCount).toBe(calls);
+  });
+
+  it("retracts a Claude next message while it is still pending", async () => {
+    const { instanceId, chatId } = await makeChat();
+    chatManager.enqueueMessage({
+      id: "retract-me",
+      chatId,
+      content: "change direction",
+    });
+    chatManager.updateQueuedMessage("retract-me", {
+      mode: "next",
+      status: "steering",
+    });
+
+    const response = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/queue/retract-me`,
+      { method: "DELETE" },
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ removed: true });
+    expect(backend.lastCancelSteer).toMatchObject({ userMessageId: "retract-me" });
+    expect(chatManager.getQueuedMessage("retract-me")).toBeUndefined();
+  });
+
+  it("keeps a Claude next message when it was already dequeued", async () => {
+    const { instanceId, chatId } = await makeChat();
+    backend.cancelSteerResult = false;
+    chatManager.enqueueMessage({
+      id: "already-dequeued",
+      chatId,
+      content: "change direction",
+    });
+    chatManager.updateQueuedMessage("already-dequeued", {
+      mode: "next",
+      status: "steering",
+    });
+
+    const response = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/queue/already-dequeued`,
+      { method: "DELETE" },
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      removed: false,
+      reason: "already_delivered",
+    });
+    expect(chatManager.getQueuedMessage("already-dequeued")?.status).toBe("delivered");
+  });
+
+  it("keeps a steering message when its provider cannot retract it", async () => {
+    const { instanceId, chatId } = await makeChat(DEFAULT_OPENAI_MODEL_ID);
+    chatManager.enqueueMessage({
+      id: "committed",
+      chatId,
+      content: "change direction",
+    });
+    chatManager.updateQueuedMessage("committed", {
+      mode: "next",
+      status: "steering",
+    });
+
+    const response = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/queue/committed`,
+      { method: "DELETE" },
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      removed: false,
+      reason: "not_retractable",
+    });
+    expect(chatManager.getQueuedMessage("committed")?.status).toBe("steering");
+  });
+
+  it("implements Codex send-now by interrupting and promoting the queued message", async () => {
+    const { instanceId, chatId } = await makeChat(DEFAULT_OPENAI_MODEL_ID);
+    const before = backend.callCount;
+    backend.setScript([{ kind: "abortable" }]);
+    const activeResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "old direction" }),
+      },
+    );
+    await waitForInFlight(chatId);
+    await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chatId}/queue`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: "send-now", content: "new direction" }),
+    });
+    backend.setScript([{ kind: "ack" }, { kind: "delta", text: "new answer" }]);
+
+    const nowResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/queue/send-now/dispatch`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "now" }),
+      },
+    );
+    expect(nowResponse.status).toBe(200);
+    expect((await nowResponse.json()).status).toBe("interrupting");
+    await readAllSse(activeResponse);
+    for (let i = 0; i < 50 && backend.callCount < before + 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await chatStreamHub.drain();
+
+    const transcript = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/transcript`,
+    ).then((response) => response.json());
+    expect(transcript.queuedMessages).toEqual([]);
+    expect(transcript.messages.at(-2)).toMatchObject({
+      id: "send-now",
+      role: "user",
+      content: "new direction",
+      deliveryStatus: "confirmed",
+    });
+    expect(transcript.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: "new answer",
+    });
+    const interruptedAssistant = transcript.messages.at(-3);
+    expect(interruptedAssistant.role).toBe("assistant");
+    expect(transcript.chunksByMessage[interruptedAssistant.id]).toContainEqual({
+      kind: "interruption",
+      id: "send-now",
+    });
   });
 
   it("context probe is gated while a turn is in flight", async () => {

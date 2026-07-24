@@ -39,6 +39,171 @@ function sessionFor(proc: FakeProc, onExit: () => void = () => {}) {
 }
 
 describe("ClaudeSession", () => {
+  it("correlates replay acknowledgements and sends steering priority", async () => {
+    const proc = new FakeProc();
+    const session = sessionFor(proc);
+    let acknowledged = 0;
+    const turn = session.runTurn({
+      userText: "hi",
+      userMessageId: "user-1",
+      onUserMessageAcknowledged: () => acknowledged++,
+      hooks: makeHooks().hooks,
+    });
+    await tick();
+    expect(proc.userMessages()[0]).toMatchObject({ uuid: "user-1" });
+    proc.emit({ type: "system", subtype: "init", session_id: "session-1" });
+    proc.emit({ type: "user", uuid: "user-1", isReplay: true });
+    await tick();
+    expect(acknowledged).toBe(1);
+
+    const steered = session.steer({
+      userText: "do this next",
+      userMessageId: "user-2",
+      priority: "next",
+    });
+    await tick();
+    expect(proc.userMessages()[1]).toMatchObject({
+      uuid: "user-2",
+      priority: "next",
+    });
+    proc.emit({ type: "assistant", uuid: "assistant-before-steer" });
+    proc.emit({ type: "user", uuid: "user-2", isReplay: true });
+    expect(await steered).toEqual({
+      sessionId: "session-1",
+      priorAnchorId: "assistant-before-steer",
+    });
+    proc.emit({ type: "result", result: "done" });
+    await turn;
+    const shutdown = session.shutdown();
+    proc.exit(0);
+    await shutdown;
+  });
+
+  it("atomically cancels a pending steering message by UUID", async () => {
+    const proc = new FakeProc();
+    const session = sessionFor(proc);
+    const turn = session.runTurn({
+      userText: "hi",
+      userMessageId: "user-1",
+      hooks: makeHooks().hooks,
+    });
+    await tick();
+    proc.emit({ type: "user", uuid: "user-1", isReplay: true });
+
+    const steered = session.steer({
+      userText: "do this next",
+      userMessageId: "user-2",
+      priority: "next",
+    });
+    const steeringResult = steered.then(
+      () => undefined,
+      (error) => error,
+    );
+    await tick();
+
+    const cancelled = session.cancelSteer("user-2");
+    await tick();
+    const control = proc.controls("cancel_async_message")[0];
+    expect(control.request).toEqual({
+      subtype: "cancel_async_message",
+      message_uuid: "user-2",
+    });
+    proc.succeedControl(control, { cancelled: true });
+
+    expect(await cancelled).toBe(true);
+    expect(await steeringResult).toEqual(
+      expect.objectContaining({ message: expect.stringMatching(/cancelled/) }),
+    );
+    proc.emit({ type: "result", result: "done" });
+    await turn;
+    const shutdown = session.shutdown();
+    proc.exit(0);
+    await shutdown;
+  });
+
+  it("reports when Claude already dequeued a steering message", async () => {
+    const proc = new FakeProc();
+    const session = sessionFor(proc);
+    const turn = session.runTurn({
+      userText: "hi",
+      userMessageId: "user-1",
+      hooks: makeHooks().hooks,
+    });
+    await tick();
+    proc.emit({ type: "user", uuid: "user-1", isReplay: true });
+
+    const steered = session.steer({
+      userText: "do this next",
+      userMessageId: "user-2",
+      priority: "next",
+    });
+    await tick();
+    const cancelled = session.cancelSteer("user-2");
+    await tick();
+    proc.succeedControl(proc.controls("cancel_async_message")[0], { cancelled: false });
+    expect(await cancelled).toBe(false);
+
+    proc.emit({ type: "user", uuid: "user-2", isReplay: true });
+    await steered;
+    proc.emit({ type: "result", result: "done" });
+    await turn;
+    const shutdown = session.shutdown();
+    proc.exit(0);
+    await shutdown;
+  });
+
+  it("keeps a turn open across Claude's native now interrupt boundary", async () => {
+    const proc = new FakeProc();
+    const session = sessionFor(proc);
+    const { hooks, events } = makeHooks();
+    let turnSettled = false;
+    const turn = session
+      .runTurn({
+        userText: "start",
+        userMessageId: "user-1",
+        hooks,
+      })
+      .finally(() => {
+        turnSettled = true;
+      });
+    await tick();
+    proc.emit({ type: "user", uuid: "user-1", isReplay: true });
+
+    const steered = session.steer({
+      userText: "change now",
+      userMessageId: "user-now",
+      priority: "now",
+    });
+    await tick();
+    expect(proc.userMessages()[1]).toMatchObject({
+      uuid: "user-now",
+      priority: "now",
+    });
+
+    // Claude terminates the interrupted ask before it dequeues the immediate
+    // prompt. This is an internal boundary, not the end of Isolade's turn.
+    proc.emit({ type: "result", result: "partial before interruption" });
+    await tick();
+    expect(turnSettled).toBe(false);
+
+    proc.emit({ type: "user", uuid: "user-now", isReplay: true });
+    await steered;
+    proc.emit({
+      type: "stream_event",
+      event: {
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "replacement" },
+      },
+    });
+    proc.emit({ type: "result", result: "replacement" });
+
+    expect(await turn).toEqual({ content: "replacement", sessionId: undefined });
+    expect(events.filter((event) => event.type === "result")).toHaveLength(2);
+    const shutdown = session.shutdown();
+    proc.exit(0);
+    await shutdown;
+  });
+
   it("runs multiple turns on one persistent process", async () => {
     const proc = new FakeProc();
     let exits = 0;

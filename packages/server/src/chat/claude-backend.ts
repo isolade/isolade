@@ -8,6 +8,7 @@ import {
   emptyUsage,
   type TokenUsage,
   type TurnMeta,
+  type UserMessageReceipt,
 } from "./backend";
 import { ClaudeSession, type TurnHooks } from "./claude-session";
 import {
@@ -143,11 +144,13 @@ export class ClaudeBackend implements ChatBackend {
     model: string;
     effort: ChatEffort;
     sessionId?: string;
+    userMessageId?: string;
     fork?: { anchorId: string }; // anchorId = transcript uuid to resume at
     signal?: AbortSignal;
     onDelta: (text: string) => void;
     onEvent?: (event: ChatEvent) => void;
     onMeta?: (meta: TurnMeta) => void;
+    onUserMessageAcknowledged?: (receipt?: UserMessageReceipt) => void;
   }): Promise<{ content: string; sessionId?: string }> {
     // Claude CLI accepts: low | medium | high | xhigh | max. Other values
     // from the union (none/minimal, which are codex-only) are dropped. The model
@@ -215,6 +218,8 @@ export class ClaudeBackend implements ChatBackend {
     try {
       const result = await session.runTurn({
         userText: opts.message,
+        userMessageId: opts.userMessageId,
+        onUserMessageAcknowledged: opts.onUserMessageAcknowledged,
         signal: opts.signal,
         hooks,
       });
@@ -229,6 +234,38 @@ export class ClaudeBackend implements ChatBackend {
         this.armIdle(opts.chatId, session);
       }
     }
+  }
+
+  async steer(opts: {
+    vmId: string;
+    chatId: string;
+    message: string;
+    userMessageId: string;
+    priority: "next" | "now";
+    onUserMessageAcknowledged?: (receipt?: UserMessageReceipt) => void;
+  }): Promise<void> {
+    const session = this.sessions.get(opts.chatId);
+    if (!session || session.isDead() || session.vmId !== opts.vmId) {
+      throw new Error("there is no active claude turn to steer");
+    }
+    const receipt = await session.steer({
+      userText: opts.message,
+      userMessageId: opts.userMessageId,
+      priority: opts.priority,
+    });
+    opts.onUserMessageAcknowledged?.(receipt);
+  }
+
+  async cancelSteer(opts: {
+    vmId: string;
+    chatId: string;
+    userMessageId: string;
+  }): Promise<boolean> {
+    const session = this.sessions.get(opts.chatId);
+    if (!session || session.isDead() || session.vmId !== opts.vmId) {
+      throw new Error("there is no active claude turn to retract from");
+    }
+    return session.cancelSteer(opts.userMessageId);
   }
 
   private buildCommand(
@@ -249,6 +286,7 @@ export class ClaudeBackend implements ChatBackend {
       "stream-json",
       "--verbose",
       "--include-partial-messages",
+      "--replay-user-messages",
       // Headless `-p` defaults to NOT requesting thinking summaries: since
       // ~v2.1.8 the CLI only flips the display to "summarized" in interactive
       // mode, so stream-json emits thinking blocks with a signature but no

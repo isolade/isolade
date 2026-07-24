@@ -1,6 +1,7 @@
 import type { Context } from "hono";
 import type { AuthLoginManager } from "../auth-login";
 import type { ChatBackend } from "../chat/backend";
+import type { ChatQueueService } from "../chat/chat-queue-service";
 import type { ChatTurnService } from "../chat/chat-turn-service";
 import type { ClaudeBackend } from "../chat/claude-backend";
 import type { CodexManager } from "../chat/codex-manager";
@@ -46,6 +47,7 @@ export interface RouteContext {
   prAttachments: PrAttachmentManager;
   sandboxClient: SandboxApi;
   chatTurnService: ChatTurnService;
+  chatQueueService: ChatQueueService;
   // The real Claude backend, used for VM/chat-scoped teardown even when a fake
   // backend is swapped in for tests (dispose targets the real process handles).
   realClaudeBackend: ClaudeBackend;
