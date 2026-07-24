@@ -132,8 +132,10 @@ interface WorkspaceCtx {
   onAdd: (panelId: string, kind: TabKind) => void;
   onResizeSplit: (splitId: string, sizes: [number, number]) => void;
   onFocusPanel: (panelId: string) => void;
+  // Reposition the keep-alive body layers onto their panels' slots right now
+  // (called synchronously during a divider drag so bodies track the resize).
+  onResizeSync: () => void;
   beginDrag: (tab: PanelTab, e: React.PointerEvent, onActivate?: () => void) => void;
-  renderBody: (tab: PanelTab, active: boolean) => ReactNode;
   tabLabel: (tab: PanelTab) => string;
 }
 const Ctx = createContext<WorkspaceCtx | null>(null);
@@ -229,6 +231,15 @@ export default function PanelWorkspace({
   const [focusedPanelId, setFocusedPanelId] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const dragCleanupRef = useRef<(() => void) | null>(null);
+  // Keep-alive body layer bookkeeping: the DOM wrapper per tab body, and the
+  // set of tabs that have ever been active (so bodies mount lazily but stay).
+  const bodyElsRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  const activatedRef = useRef<Set<string>>(new Set());
+  // Stable, append-only render order for the body layers (see the sort below).
+  // Rendering in a fixed order means React never reorders their DOM nodes; a
+  // reorder would move a node in the tree, which reloads any <iframe> inside it.
+  const bodyOrderRef = useRef<Map<string, number>>(new Map());
+  const bodyOrderSeqRef = useRef(0);
 
   useEffect(() => () => dragCleanupRef.current?.(), []);
 
@@ -586,6 +597,80 @@ export default function PanelWorkspace({
       ? focusedPanelId
       : topLeftPanelId;
 
+  // ── Keep-alive body layer ──────────────────────────────────────────────
+  // Bodies are NOT rendered inside the recursive panel tree: a split or move
+  // reparents a panel, and React remounts a reparented subtree, which would drop
+  // chat drafts, terminal sockets, scroll, file-tree state, and reload the
+  // browser iframe. Instead every tab's body is rendered once, out of the tree,
+  // and absolutely positioned over its panel's slot rect — its position in the
+  // React tree never changes, so it survives any docking operation. `placement`
+  // maps each tab to the panel it lives in and whether it's that panel's active
+  // tab; `bodyTabs` is the (lazily grown) set of bodies to keep mounted.
+  const { bodyTabs, placement } = useMemo(() => {
+    const placementMap = new Map<string, { panelId: string; active: boolean }>();
+    const all: PanelTab[] = [];
+    const walk = (node: LayoutNode) => {
+      if (node.type === "panel") {
+        for (const tab of node.tabs) {
+          placementMap.set(tab.id, { panelId: node.id, active: node.activeTabId === tab.id });
+          all.push(tab);
+        }
+      } else {
+        walk(node.children[0]);
+        walk(node.children[1]);
+      }
+    };
+    if (layout) walk(layout);
+    // Lazy-mount-then-keep-alive: a body is created the first time its tab is
+    // the active one in its panel, and kept mounted for good after that.
+    for (const [id, place] of placementMap) if (place.active) activatedRef.current.add(id);
+    const mounted = all.filter((tab) => activatedRef.current.has(tab.id));
+    // Assign each newly seen body a stable slot and render in that order, so a
+    // new tab appends at the end and existing bodies are never reordered (hence
+    // never moved in the DOM, so a browser-preview iframe survives any docking).
+    for (const tab of mounted) {
+      if (!bodyOrderRef.current.has(tab.id)) {
+        bodyOrderRef.current.set(tab.id, bodyOrderSeqRef.current++);
+      }
+    }
+    mounted.sort(
+      (a, b) => (bodyOrderRef.current.get(a.id) ?? 0) - (bodyOrderRef.current.get(b.id) ?? 0),
+    );
+    return { bodyTabs: mounted, placement: placementMap };
+  }, [layout]);
+  const placementRef = useRef(placement);
+  placementRef.current = placement;
+
+  const registerBody = useCallback((tabId: string, el: HTMLDivElement | null) => {
+    if (el) bodyElsRef.current.set(tabId, el);
+    else bodyElsRef.current.delete(tabId);
+  }, []);
+
+  // Glue each mounted body to its panel's slot rect (imperative, so it stays in
+  // lockstep with a flex resize without waiting on a React render). The active
+  // tab in each panel is shown; the rest stay mounted but display:none.
+  const syncBodies = useCallback(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    const rootRect = root.getBoundingClientRect();
+    for (const [tabId, el] of bodyElsRef.current) {
+      const place = placementRef.current.get(tabId);
+      const slot = place
+        ? root.querySelector<HTMLElement>(`[data-body-id="${CSS.escape(place.panelId)}"]`)
+        : null;
+      if (!place || !place.active || !slot) {
+        el.style.display = "none";
+        continue;
+      }
+      const r = slot.getBoundingClientRect();
+      el.style.display = "block";
+      el.style.left = `${r.left - rootRect.left}px`;
+      el.style.top = `${r.top - rootRect.top}px`;
+      el.style.width = `${r.width}px`;
+      el.style.height = `${r.height}px`;
+    }
+  }, []);
+
   const ctx = useMemo<WorkspaceCtx>(
     () => ({
       leftEdge,
@@ -600,8 +685,8 @@ export default function PanelWorkspace({
       onAdd,
       onResizeSplit,
       onFocusPanel: setFocusedPanelId,
+      onResizeSync: syncBodies,
       beginDrag,
-      renderBody,
       tabLabel,
     }),
     [
@@ -617,18 +702,45 @@ export default function PanelWorkspace({
       onAdd,
       onResizeSplit,
       beginDrag,
-      renderBody,
+      syncBodies,
       tabLabel,
     ],
   );
 
+  // Reposition before paint on any layout change, and keep bodies glued to
+  // their slots as the container or the panels resize (splits, window resize).
+  useLayoutEffect(() => {
+    syncBodies();
+    const root = rootRef.current;
+    if (!root) return;
+    const ro = new ResizeObserver(() => syncBodies());
+    ro.observe(root);
+    for (const slot of root.querySelectorAll<HTMLElement>("[data-body-id]")) ro.observe(slot);
+    return () => ro.disconnect();
+  }, [layout, syncBodies]);
+
   return (
-    <div ref={rootRef} className="flex-1 min-w-0 min-h-0 flex bg-background">
+    <div ref={rootRef} className="relative flex-1 min-w-0 min-h-0 flex bg-background">
       {layout && (
         <Ctx.Provider value={ctx}>
-          <LayoutNodeView key={layout.id} node={layout} />
+          <LayoutNodeView node={layout} />
         </Ctx.Provider>
       )}
+      {/* Keep-alive body layer: each tab's body is rendered once here, out of
+          the panel tree, and positioned over its panel's slot by syncBodies.
+          Positioned (not in flow) so it paints above the empty slots but below
+          the z-10 resize handles, which stay grabbable. */}
+      {bodyTabs.map((tab) => (
+        <div
+          key={tab.id}
+          ref={(el) => registerBody(tab.id, el)}
+          data-body-layer={tab.id}
+          className="absolute overflow-hidden"
+          style={{ display: "none" }}
+        >
+          {renderBody(tab, placement.get(tab.id)?.active ?? false)}
+        </div>
+      ))}
       <DragLayer drag={drag} />
     </div>
   );
@@ -743,7 +855,7 @@ function ScrollableTabList({
 }
 
 function SplitView({ node }: { node: SplitNode }) {
-  const { onResizeSplit } = useWorkspace();
+  const { onResizeSplit, onResizeSync } = useWorkspace();
   const row = node.direction === "row";
   const containerRef = useRef<HTMLDivElement>(null);
   const aRef = useRef<HTMLDivElement>(null);
@@ -782,6 +894,8 @@ function SplitView({ node }: { node: SplitNode }) {
       // subtree doesn't re-render on every mousemove; commit once on release.
       if (aRef.current) aRef.current.style.flexGrow = `${f}`;
       if (bRef.current) bRef.current.style.flexGrow = `${1 - f}`;
+      // Keep the keep-alive body layers glued to the resizing slots, same frame.
+      onResizeSync();
     };
     const removeListeners = () => {
       window.removeEventListener("pointermove", onMove);
@@ -884,12 +998,6 @@ function PanelView({ panel }: { panel: PanelNode }) {
   const isTopLeft = panel.id === ctx.topLeftPanelId;
   const isFocused = panel.id === ctx.focusedPanelId;
   const windowDrag = useWindowDrag(ctx.isTauri);
-  // Lazy-mount-then-keep-alive: a body is created the first time its tab is
-  // active, and kept mounted thereafter so its state (chat scroll, terminal
-  // socket, file-tree expansion) survives switching away. Tracked in a ref so
-  // reading it during render doesn't need a state round-trip.
-  const mountedRef = useRef<Set<string>>(new Set());
-  if (panel.activeTabId) mountedRef.current.add(panel.activeTabId);
 
   // Only the tab strips of top-edge panels double as the window title bar, so
   // only their empty regions drag the window.
@@ -933,25 +1041,14 @@ function PanelView({ panel }: { panel: PanelNode }) {
         </ScrollableTabList>
       </div>
 
+      {/* Empty slot: the panel's active body is rendered in the keep-alive
+          layer at the workspace root and positioned over this rect. */}
       <div data-body-id={panel.id} className="flex-1 min-h-0 relative">
         {panel.tabs.length === 0 && (
           <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
             No tabs. Use + to add one
           </div>
         )}
-        {panel.tabs.map((tab) => {
-          const active = panel.activeTabId === tab.id;
-          if (!active && !mountedRef.current.has(tab.id)) return null;
-          return (
-            <div
-              key={tab.id}
-              className="absolute inset-0"
-              style={{ display: active ? "block" : "none" }}
-            >
-              {ctx.renderBody(tab, active)}
-            </div>
-          );
-        })}
       </div>
     </div>
   );
