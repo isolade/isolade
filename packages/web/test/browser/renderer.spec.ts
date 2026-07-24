@@ -352,6 +352,63 @@ test.describe("message renderer browser gate", () => {
       .toBe("1");
   });
 
+  test("follows focus into the browser preview iframe", async ({ page }) => {
+    const previewPort = 4321;
+    await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
+      await route.fulfill({
+        json: {
+          layout: {
+            type: "split",
+            id: "gesture-split",
+            direction: "row",
+            sizes: [0.5, 0.5],
+            children: [
+              {
+                type: "panel",
+                id: "left-panel",
+                tabs: [{ id: "left-tab", kind: "ports" }],
+                activeTabId: "left-tab",
+              },
+              {
+                type: "panel",
+                id: "right-panel",
+                tabs: [{ id: "right-tab", kind: "browser" }],
+                activeTabId: "right-tab",
+              },
+            ],
+          },
+        },
+      });
+    });
+    await page.route("**/api/instances/panel-gesture-instance/port-status", async (route) => {
+      await route.fulfill({
+        json: { forwarded: [{ remotePort: 3000, status: "listening" }], detected: [] },
+      });
+    });
+    // The previewed app. Served on a different origin than the harness, exactly
+    // like a real forward, so the frame is genuinely cross-origin and its events
+    // stay inside it.
+    await page.route(`http://localhost:${previewPort}/`, async (route) => {
+      await route.fulfill({
+        contentType: "text/html",
+        body: '<!doctype html><body style="margin:0"><input id="field" style="width:100%;height:100px"></body>',
+      });
+    });
+    await page.goto(`/test/browser/harness/index.html?panelGesture=1&previewPort=${previewPort}`);
+
+    const leftPanel = page.locator('[data-panel-id="left-panel"]');
+    const rightPanel = page.locator('[data-panel-id="right-panel"]');
+    const field = page.frameLocator('iframe[title="Browser preview"]').locator("#field");
+    await expect(field).toBeVisible();
+    await expect(leftPanel).toHaveAttribute("data-panel-focused", "true");
+
+    // A click inside the frame raises no pointer or focus event in this
+    // document, so the highlight has to follow the window blur instead.
+    await field.click();
+    await expect(rightPanel).toHaveAttribute("data-panel-focused", "true");
+    await expect(leftPanel).toHaveAttribute("data-panel-focused", "false");
+  });
+
   test("resizes panels and ends resizing when the window loses focus", async ({ page }) => {
     await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
       if (route.request().method() === "PATCH") {

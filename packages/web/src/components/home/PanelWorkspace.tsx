@@ -665,6 +665,26 @@ export default function PanelWorkspace({
     else bodyElsRef.current.delete(tabId);
   }, []);
 
+  // Clicking inside the browser preview's <iframe> moves the real focus into it,
+  // but the pointer and focus events belong to the frame's own document and
+  // never surface here, so the body layer's capture handlers can't see it and
+  // the focused-panel highlight would stay on whichever panel was focused
+  // before. The one signal an embedder does get is a window blur, and by then
+  // document.activeElement is already the <iframe>, so map that back to the
+  // panel holding it. A window blur with anything else focused is the app losing
+  // the OS focus, which must not move the highlight.
+  useEffect(() => {
+    const onBlur = () => {
+      const active = document.activeElement;
+      if (!(active instanceof HTMLIFrameElement)) return;
+      const tabId = active.closest<HTMLElement>("[data-body-layer]")?.dataset.bodyLayer;
+      const panelId = tabId ? placementRef.current.get(tabId)?.panelId : undefined;
+      if (panelId) setFocusedPanelId(panelId);
+    };
+    window.addEventListener("blur", onBlur);
+    return () => window.removeEventListener("blur", onBlur);
+  }, []);
+
   // Glue each mounted body to its panel's slot rect (imperative, so it stays in
   // lockstep with a flex resize without waiting on a React render). The active
   // tab in each panel is shown; the rest stay mounted but display:none.
