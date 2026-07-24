@@ -1,8 +1,9 @@
+use std::io::Write as _;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
 use std::sync::Mutex;
-use tauri::path::BaseDirectory;
 use tauri::Manager;
+use tauri::path::BaseDirectory;
 
 // The single isolade sidecar (API server + in-process sandbox runtime). It is
 // spawned in its own process group so teardown can signal the whole tree —
@@ -242,20 +243,165 @@ fn make_parent_watch_pipe() -> Option<(libc::c_int, libc::c_int)> {
     Some((read_fd, write_fd))
 }
 
+// Minimal `log` facade logger: writes each record to stderr as
+// `HH:MM:SS [LEVEL target] message`. stderr is tee'd to both the terminal and
+// the session log file (see setup_logging), so Tauri/wry's own `log::`
+// diagnostics land in both. Deliberately not tauri-plugin-log — that captures
+// only the Rust facade, never the sidecar's stdout, which is the output we
+// actually care about (the sidecar is captured at the fd level instead).
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        // UTC HH:MM:SS without pulling in a date crate — enough to locate a line
+        // among the server logs it interleaves with.
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(
+            std::io::stderr(),
+            "{:02}:{:02}:{:02} [{} {}] {}",
+            (secs / 3600) % 24,
+            (secs / 60) % 60,
+            secs % 60,
+            record.level(),
+            record.target(),
+            record.args(),
+        );
+    }
+
+    fn flush(&self) {
+        let _ = std::io::stderr().flush();
+    }
+}
+
+static STDERR_LOGGER: StderrLogger = StderrLogger;
+
+// Machine-local state root, mirroring the server's XDG resolution
+// (packages/shared/node/xdg.ts): $XDG_STATE_HOME if set, else ~/.local/state,
+// then "isolade". Kept in sync by hand — the launcher can't import the TS layer.
+fn state_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let base = match std::env::var_os("XDG_STATE_HOME") {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => PathBuf::from(std::env::var_os("HOME")?)
+            .join(".local")
+            .join("state"),
+    };
+    Some(base.join("isolade"))
+}
+
+// Open (and rotate) the per-session log file under stateDir/logs. The last
+// LOG_KEEP launches are retained as isolade.log (current) plus isolade.log.1
+// ..isolade.log.{LOG_KEEP-1}; rotation is per-launch only, with no mid-session
+// size cap. Returns None on any failure, so logging is always best-effort and
+// never blocks startup.
+fn open_session_logfile() -> Option<std::fs::File> {
+    // Total files retained, counting the live isolade.log.
+    const LOG_KEEP: usize = 10;
+
+    let dir = state_dir()?.join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let current = dir.join("isolade.log");
+    // Shift the archives up by one, dropping the oldest (the .{KEEP-1} rename
+    // overwrites it), then move the current file to .1. High-to-low order so a
+    // rename never clobbers a slot still to be moved. All no-ops the first time.
+    for i in (1..LOG_KEEP - 1).rev() {
+        let _ = std::fs::rename(
+            dir.join(format!("isolade.log.{i}")),
+            dir.join(format!("isolade.log.{}", i + 1)),
+        );
+    }
+    let _ = std::fs::rename(&current, dir.join("isolade.log.1"));
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&current)
+        .ok()
+}
+
+// Tee this process's stdout+stderr to both the terminal (where one exists) and
+// the session log file. Both streams share one pipe so the file preserves exact
+// write order; the write end replaces fd 1 and 2, so the sidecar spawned later
+// inherits it and its output — plus the launcher's own and the microsandbox
+// native runtime's stderr — flows through the same tee. A reader thread copies
+// each chunk to the saved original stdout (a harmless sink when launched from
+// Finder with no terminal) and to the file, for the process lifetime.
+fn tee_stdio(file: std::fs::File) {
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::io::FromRawFd;
+
+    // Save the real stdout BEFORE redirecting, so the tee can still echo to it.
+    let orig_fd = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    if orig_fd < 0 {
+        return;
+    }
+    let mut fds = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        unsafe { libc::close(orig_fd) };
+        return;
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    unsafe {
+        // Don't leak the read end into the sidecar; it only needs the write end
+        // (via the inherited fd 1/2 below).
+        libc::fcntl(read_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::dup2(write_fd, libc::STDOUT_FILENO);
+        libc::dup2(write_fd, libc::STDERR_FILENO);
+        libc::close(write_fd);
+    }
+    std::thread::spawn(move || {
+        // SAFETY: each fd is owned here and used by no one else; the File
+        // wrappers close them on thread exit (at EOF, once every write end has
+        // closed — i.e. this process and the sidecar have exited).
+        let mut reader = unsafe { std::fs::File::from_raw_fd(read_fd) };
+        let mut terminal = unsafe { std::fs::File::from_raw_fd(orig_fd) };
+        let mut file = file;
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let chunk = &buf[..n];
+            let _ = terminal.write_all(chunk);
+            let _ = file.write_all(chunk);
+        }
+    });
+}
+
+// Route all output into a single per-session log file while keeping it on the
+// terminal too, then install the minimal `log` logger. Called once at startup,
+// before Tauri initializes, so even early framework output is captured. Same
+// behavior in dev and release — in release there's simply no terminal on the
+// echo end.
+fn setup_logging() {
+    if let Some(file) = open_session_logfile() {
+        tee_stdio(file);
+    }
+    // set_logger fails only if one is already installed, which we never do.
+    let _ = log::set_logger(&STDERR_LOGGER);
+    log::set_max_level(log::LevelFilter::Info);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before Tauri starts: tee stdout/stderr to the session log file and install
+    // the logger, so nothing (framework startup included) is missed.
+    setup_logging();
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![list_system_fonts, open_url])
         .setup(|app| {
-            if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        .build(),
-                )?;
-            }
-
             let port = pick_free_port();
             // Per-launch bearer token gating the API. Passed to the sidecar via
             // env (below) and injected into the webview (initialization_script)
