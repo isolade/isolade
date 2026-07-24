@@ -427,6 +427,55 @@ test.describe("message renderer browser gate", () => {
     await expect(page.locator("[data-panel-resize-overlay]")).toHaveCount(0);
   });
 
+  test("presents each panel's out-of-tree body inside that panel", async ({ page }) => {
+    await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
+      if (route.request().method() === "PATCH") {
+        await route.fulfill({ json: {} });
+        return;
+      }
+      await route.fulfill({
+        json: {
+          layout: {
+            type: "split",
+            id: "aria-split",
+            direction: "row",
+            sizes: [0.5, 0.5],
+            children: [
+              {
+                type: "panel",
+                id: "aria-left-panel",
+                tabs: [{ id: "aria-left-tab", kind: "ports" }],
+                activeTabId: "aria-left-tab",
+              },
+              {
+                type: "panel",
+                id: "aria-right-panel",
+                tabs: [{ id: "aria-right-tab", kind: "browser" }],
+                activeTabId: "aria-right-tab",
+              },
+            ],
+          },
+        },
+      });
+    });
+    await page.goto("/test/browser/harness/index.html?panelGesture=1");
+    await expect(page.locator('[data-body-layer="aria-left-tab"]')).toBeVisible();
+
+    // A body is a DOM sibling of every panel, so only `aria-owns` puts it back
+    // under the panel it fills. Without it a screen reader reads both tab strips
+    // and then both bodies, in the order the bodies happened to be activated.
+    await expect(page.locator('[data-panel-id="aria-left-panel"]')).toMatchAriaSnapshot(`
+      - tablist "Panel tabs":
+        - tab "Ports Close tab" [selected]
+      - tabpanel "Ports"
+    `);
+    await expect(page.locator('[data-panel-id="aria-right-panel"]')).toMatchAriaSnapshot(`
+      - tablist "Panel tabs":
+        - tab "Browser Close tab" [selected]
+      - tabpanel "Browser"
+    `);
+  });
+
   test("keeps a panel body mounted and glued to its slot across a split and a move", async ({
     page,
   }) => {

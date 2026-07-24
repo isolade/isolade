@@ -171,6 +171,12 @@ function previewForZone(zone: DropZone, r: Rect): Rect {
   }
 }
 
+// Bodies live outside their panel in the DOM, so the tab/panel relationship has
+// to be spelled out with ARIA instead of being implied by nesting.
+const bodyDomId = (tabId: string) => `panel-body-${tabId}`;
+// The tab's label text alone, so a panel isn't named "Ports Close tab".
+const tabLabelDomId = (tabId: string) => `panel-tab-label-${tabId}`;
+
 function containsPanel(node: LayoutNode, panelId: string): boolean {
   if (node.type === "panel") return node.id === panelId;
   return containsPanel(node.children[0], panelId) || containsPanel(node.children[1], panelId);
@@ -788,7 +794,10 @@ const BodyLayer = memo(function BodyLayer({
       <div
         key={tab.id}
         ref={(el) => registerBody(tab.id, el)}
+        id={bodyDomId(tab.id)}
         data-body-layer={tab.id}
+        role="tabpanel"
+        aria-labelledby={tabLabelDomId(tab.id)}
         className="absolute overflow-hidden"
         style={{ display: "none" }}
         onPointerDownCapture={focusPanel}
@@ -1095,7 +1104,11 @@ function PanelView({ panel }: { panel: PanelNode }) {
 
       {/* Empty slot: the panel's active body is rendered in the keep-alive
           layer at the workspace root and positioned over this rect. */}
-      <div data-body-id={panel.id} className="flex-1 min-h-0 relative">
+      <div
+        data-body-id={panel.id}
+        aria-owns={panel.activeTabId ? bodyDomId(panel.activeTabId) : undefined}
+        className="flex-1 min-h-0 relative"
+      >
         {panel.tabs.length === 0 && (
           <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
             No tabs. Use + to add one
@@ -1127,6 +1140,7 @@ function TabButton({
       data-demo={`panel-tab-${tab.kind}`}
       role="tab"
       aria-selected={active}
+      aria-controls={active ? bodyDomId(tab.id) : undefined}
       tabIndex={active ? 0 : -1}
       className={cn(
         // Flat tab: no per-tab box, just a foreground underline under the active
@@ -1158,7 +1172,9 @@ function TabButton({
       }}
     >
       <Icon className="size-3.5 flex-shrink-0" />
-      <span className="truncate max-w-[160px]">{ctx.tabLabel(tab)}</span>
+      <span id={tabLabelDomId(tab.id)} className="truncate max-w-[160px]">
+        {ctx.tabLabel(tab)}
+      </span>
       <Button
         variant="ghost"
         size="icon"
