@@ -671,10 +671,18 @@ export default function PanelWorkspace({
   // the focused-panel highlight would stay on whichever panel was focused
   // before. The one signal an embedder does get is a window blur, and by then
   // document.activeElement is already the <iframe>, so map that back to the
-  // panel holding it. A window blur with anything else focused is the app losing
-  // the OS focus, which must not move the highlight.
+  // panel holding it.
+  //
+  // Switching to another app blurs the window too, and that must not move the
+  // highlight. `document.hasFocus()` is what tells the two apart: it stays true
+  // when focus merely descends into a nested browsing context, and goes false
+  // once the whole window loses the system focus. Sniffing activeElement alone
+  // would not do, because a tab click preventDefaults its pointerdown (to stop
+  // native drags) and so leaves the <iframe> as activeElement even after the
+  // highlight has legitimately moved to another panel's tab.
   useEffect(() => {
     const onBlur = () => {
+      if (!document.hasFocus()) return;
       const active = document.activeElement;
       if (!(active instanceof HTMLIFrameElement)) return;
       const tabId = active.closest<HTMLElement>("[data-body-layer]")?.dataset.bodyLayer;
