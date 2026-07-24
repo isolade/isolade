@@ -103,6 +103,9 @@ const UTILITY_KINDS: { kind: Exclude<TabKind, "chat">; label: string }[] = [
 ];
 
 type Rect = { left: number; top: number; width: number; height: number };
+// Where a tab's keep-alive body belongs: the panel whose slot it covers, and
+// whether it is that panel's active tab (only the active one is shown).
+type Placement = { panelId: string; active: boolean };
 type DropTarget =
   | { panelId: string; kind: "body"; zone: DropZone }
   | { panelId: string; kind: "strip"; index: number };
@@ -132,9 +135,6 @@ interface WorkspaceCtx {
   onAdd: (panelId: string, kind: TabKind) => void;
   onResizeSplit: (splitId: string, sizes: [number, number]) => void;
   onFocusPanel: (panelId: string) => void;
-  // Reposition the keep-alive body layers onto their panels' slots right now
-  // (called synchronously during a divider drag so bodies track the resize).
-  onResizeSync: () => void;
   beginDrag: (tab: PanelTab, e: React.PointerEvent, onActivate?: () => void) => void;
   tabLabel: (tab: PanelTab) => string;
 }
@@ -607,7 +607,7 @@ export default function PanelWorkspace({
   // maps each tab to the panel it lives in and whether it's that panel's active
   // tab; `bodyTabs` is the (lazily grown) set of bodies to keep mounted.
   const { bodyTabs, placement } = useMemo(() => {
-    const placementMap = new Map<string, { panelId: string; active: boolean }>();
+    const placementMap = new Map<string, Placement>();
     const all: PanelTab[] = [];
     const walk = (node: LayoutNode) => {
       if (node.type === "panel") {
@@ -641,6 +641,19 @@ export default function PanelWorkspace({
   const placementRef = useRef(placement);
   placementRef.current = placement;
 
+  // Retire the bookkeeping of tabs that left the layout, so it doesn't grow for
+  // the lifetime of the workspace. Done after commit rather than during render:
+  // a discarded render must not be able to retire a live body's order slot,
+  // which would re-append it and move its DOM node.
+  useEffect(() => {
+    for (const id of activatedRef.current) {
+      if (!placement.has(id)) activatedRef.current.delete(id);
+    }
+    for (const id of bodyOrderRef.current.keys()) {
+      if (!placement.has(id)) bodyOrderRef.current.delete(id);
+    }
+  }, [placement]);
+
   const registerBody = useCallback((tabId: string, el: HTMLDivElement | null) => {
     if (el) bodyElsRef.current.set(tabId, el);
     else bodyElsRef.current.delete(tabId);
@@ -652,17 +665,22 @@ export default function PanelWorkspace({
   const syncBodies = useCallback(() => {
     const root = rootRef.current;
     if (!root) return;
+    // Measure every slot before touching any body's style: interleaving the
+    // reads and writes forces a fresh layout per body, on every frame of a
+    // divider drag.
     const rootRect = root.getBoundingClientRect();
+    const slots = new Map<string, DOMRect>();
+    for (const slot of root.querySelectorAll<HTMLElement>("[data-body-id]")) {
+      const panelId = slot.dataset.bodyId;
+      if (panelId) slots.set(panelId, slot.getBoundingClientRect());
+    }
     for (const [tabId, el] of bodyElsRef.current) {
       const place = placementRef.current.get(tabId);
-      const slot = place
-        ? root.querySelector<HTMLElement>(`[data-body-id="${CSS.escape(place.panelId)}"]`)
-        : null;
-      if (!place || !place.active || !slot) {
+      const r = place?.active ? slots.get(place.panelId) : undefined;
+      if (!r) {
         el.style.display = "none";
         continue;
       }
-      const r = slot.getBoundingClientRect();
       el.style.display = "block";
       el.style.left = `${r.left - rootRect.left}px`;
       el.style.top = `${r.top - rootRect.top}px`;
@@ -685,7 +703,6 @@ export default function PanelWorkspace({
       onAdd,
       onResizeSplit,
       onFocusPanel: setFocusedPanelId,
-      onResizeSync: syncBodies,
       beginDrag,
       tabLabel,
     }),
@@ -702,13 +719,15 @@ export default function PanelWorkspace({
       onAdd,
       onResizeSplit,
       beginDrag,
-      syncBodies,
       tabLabel,
     ],
   );
 
-  // Reposition before paint on any layout change, and keep bodies glued to
-  // their slots as the container or the panels resize (splits, window resize).
+  // Reposition before paint on any layout change, and observe the slots for
+  // everything that moves one without a re-render: a window resize, a sidebar
+  // collapse, and a divider drag (which writes flex-grow straight to the DOM).
+  // Observer callbacks run after layout and before paint, so a body reaches its
+  // slot's new rect in the same frame the slot moved, with no lag to chase.
   useLayoutEffect(() => {
     syncBodies();
     const root = rootRef.current;
@@ -726,25 +745,60 @@ export default function PanelWorkspace({
           <LayoutNodeView node={layout} />
         </Ctx.Provider>
       )}
-      {/* Keep-alive body layer: each tab's body is rendered once here, out of
-          the panel tree, and positioned over its panel's slot by syncBodies.
-          Positioned (not in flow) so it paints above the empty slots but below
-          the z-10 resize handles, which stay grabbable. */}
-      {bodyTabs.map((tab) => (
-        <div
-          key={tab.id}
-          ref={(el) => registerBody(tab.id, el)}
-          data-body-layer={tab.id}
-          className="absolute overflow-hidden"
-          style={{ display: "none" }}
-        >
-          {renderBody(tab, placement.get(tab.id)?.active ?? false)}
-        </div>
-      ))}
+      <BodyLayer
+        tabs={bodyTabs}
+        placement={placement}
+        renderBody={renderBody}
+        registerBody={registerBody}
+        onFocusPanel={setFocusedPanelId}
+      />
       <DragLayer drag={drag} />
     </div>
   );
 }
+
+// The keep-alive body layer: each tab's body is rendered once here, out of the
+// panel tree, and positioned over its panel's slot by syncBodies. Positioned
+// (not in flow) so it paints above the empty slots but below the z-10 resize
+// handles, which stay grabbable.
+//
+// Memoized for the same reason as the tree below: a drag updates state on the
+// workspace on every pointer move, and all of these props are stable through a
+// gesture, so bodies (a terminal, a file tree) don't re-render at pointer rate.
+const BodyLayer = memo(function BodyLayer({
+  tabs,
+  placement,
+  renderBody,
+  registerBody,
+  onFocusPanel,
+}: {
+  tabs: PanelTab[];
+  placement: Map<string, Placement>;
+  renderBody: (tab: PanelTab, active: boolean) => ReactNode;
+  registerBody: (tabId: string, el: HTMLDivElement | null) => void;
+  onFocusPanel: (panelId: string) => void;
+}) {
+  return tabs.map((tab) => {
+    const place = placement.get(tab.id);
+    // A body sits outside its panel in the DOM, so a click or focus inside it
+    // can't reach the panel's own capture handlers. Forward it explicitly, or
+    // the focused-panel highlight would only follow tab-strip clicks.
+    const focusPanel = place ? () => onFocusPanel(place.panelId) : undefined;
+    return (
+      <div
+        key={tab.id}
+        ref={(el) => registerBody(tab.id, el)}
+        data-body-layer={tab.id}
+        className="absolute overflow-hidden"
+        style={{ display: "none" }}
+        onPointerDownCapture={focusPanel}
+        onFocusCapture={focusPanel}
+      >
+        {renderBody(tab, place?.active ?? false)}
+      </div>
+    );
+  });
+});
 
 // The recursive tree renderer. Memoized so a drag (which updates state on the
 // parent but leaves `node` and the context value untouched) doesn't re-render
@@ -855,7 +909,7 @@ function ScrollableTabList({
 }
 
 function SplitView({ node }: { node: SplitNode }) {
-  const { onResizeSplit, onResizeSync } = useWorkspace();
+  const { onResizeSplit } = useWorkspace();
   const row = node.direction === "row";
   const containerRef = useRef<HTMLDivElement>(null);
   const aRef = useRef<HTMLDivElement>(null);
@@ -894,8 +948,6 @@ function SplitView({ node }: { node: SplitNode }) {
       // subtree doesn't re-render on every mousemove; commit once on release.
       if (aRef.current) aRef.current.style.flexGrow = `${f}`;
       if (bRef.current) bRef.current.style.flexGrow = `${1 - f}`;
-      // Keep the keep-alive body layers glued to the resizing slots, same frame.
-      onResizeSync();
     };
     const removeListeners = () => {
       window.removeEventListener("pointermove", onMove);

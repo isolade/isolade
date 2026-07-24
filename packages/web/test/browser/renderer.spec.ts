@@ -110,6 +110,24 @@ async function rowTop(page: Page, messageId: string): Promise<number> {
     .evaluate((row) => row.getBoundingClientRect().top);
 }
 
+// How far a tab's keep-alive body sits from the slot of the panel that owns it,
+// as [left, top, width, height]. The owning panel is resolved through the tab
+// strip holding that tab, independently of the body layer's own bookkeeping.
+async function gluedDelta(page: Page, tabId: string): Promise<number[] | null> {
+  return await page.evaluate((id) => {
+    const layer = document.querySelector(`[data-body-layer="${id}"]`);
+    const strip = document.querySelector(`[data-tab-id="${id}"]`)?.closest("[data-strip-id]");
+    const panelId = strip?.getAttribute("data-strip-id");
+    const slot = panelId ? document.querySelector(`[data-body-id="${panelId}"]`) : null;
+    if (!layer || !slot) return null;
+    const a = layer.getBoundingClientRect();
+    const b = slot.getBoundingClientRect();
+    return [a.left - b.left, a.top - b.top, a.width - b.width, a.height - b.height].map((delta) =>
+      Math.round(delta),
+    );
+  }, tabId);
+}
+
 test.describe("message renderer browser gate", () => {
   test("renders the thinking indicator and completed Claude summary", async ({ page }) => {
     await openProductionHarness(page, 1, { messages: 2, thoughts: true });
@@ -320,7 +338,10 @@ test.describe("message renderer browser gate", () => {
     expect(await leftTab.evaluate((tab) => getComputedStyle(tab, "::after").opacity)).toBe("1");
     expect(await rightTab.evaluate((tab) => getComputedStyle(tab, "::after").opacity)).toBe("0.35");
 
-    await page.locator('[data-body-id="right-panel"]').click({ position: { x: 100, y: 100 } });
+    // Bodies are rendered in the keep-alive layer at the workspace root, not
+    // inside their panel, so this click has to travel out of the panel subtree
+    // to move the focused panel.
+    await page.locator('[data-body-layer="right-tab"]').click({ position: { x: 100, y: 100 } });
     await expect(leftPanel).toHaveAttribute("data-panel-focused", "false");
     await expect(rightPanel).toHaveAttribute("data-panel-focused", "true");
     await expect
@@ -378,6 +399,10 @@ test.describe("message renderer browser gate", () => {
     await expect
       .poll(() => leftPanel.evaluate((element) => element.getBoundingClientRect().width))
       .toBeGreaterThan(initialWidth + 25);
+    // A drag writes flex-grow straight to the DOM without a re-render, so the
+    // keep-alive bodies have to follow their slots mid-gesture, not on release.
+    await expect.poll(() => gluedDelta(page, "resize-left-tab")).toEqual([0, 0, 0, 0]);
+    await expect.poll(() => gluedDelta(page, "resize-right-tab")).toEqual([0, 0, 0, 0]);
 
     await page.evaluate(() => window.dispatchEvent(new Event("blur")));
     await expect(page.locator("[data-panel-resize-overlay]")).toHaveCount(0);
@@ -400,6 +425,79 @@ test.describe("message renderer browser gate", () => {
       .toBeLessThan(resumedWidth - 15);
     await page.mouse.up();
     await expect(page.locator("[data-panel-resize-overlay]")).toHaveCount(0);
+  });
+
+  test("keeps a panel body mounted and glued to its slot across a split and a move", async ({
+    page,
+  }) => {
+    await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
+      if (route.request().method() === "PATCH") {
+        await route.fulfill({ json: {} });
+        return;
+      }
+      await route.fulfill({
+        json: {
+          layout: {
+            type: "panel",
+            id: "keepalive-panel",
+            tabs: [
+              { id: "keepalive-tab", kind: "ports" },
+              { id: "split-off-tab", kind: "browser" },
+            ],
+            activeTabId: "keepalive-tab",
+          },
+        },
+      });
+    });
+    await page.goto("/test/browser/harness/index.html?panelGesture=1");
+
+    const body = page.locator('[data-body-layer="keepalive-tab"]');
+    await expect(body).toBeVisible();
+    await expect(page.locator("[data-panel-id]")).toHaveCount(1);
+    // Tag the live DOM node. A remount would replace it with a fresh element
+    // that React never gave this attribute, taking the panel's state with it.
+    await body
+      .locator("> *")
+      .first()
+      .evaluate((element) => element.setAttribute("data-keepalive-probe", "1"));
+
+    // Drag the other tab onto the body's right edge: the panel splits, which
+    // used to swap the tree root and remount every body under it.
+    const tab = await page.locator('[data-tab-id="split-off-tab"]').boundingBox();
+    const slot = await page.locator('[data-body-id="keepalive-panel"]').boundingBox();
+    if (!tab || !slot) throw new Error("Missing panel tab or body bounds");
+    await page.mouse.move(tab.x + tab.width / 2, tab.y + tab.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(tab.x + tab.width / 2, tab.y + tab.height / 2 + 8);
+    await page.mouse.move(slot.x + slot.width * 0.92, slot.y + slot.height / 2, { steps: 5 });
+    await page.mouse.up();
+
+    const otherBody = page.locator('[data-body-layer="split-off-tab"]');
+    await expect(page.locator("[data-panel-id]")).toHaveCount(2);
+    await expect(body.locator('[data-keepalive-probe="1"]')).toHaveCount(1);
+    await expect(otherBody).toBeVisible();
+    // The surviving body has to end up over its (now narrower) panel's slot.
+    await expect.poll(() => gluedDelta(page, "keepalive-tab")).toEqual([0, 0, 0, 0]);
+
+    // Now move the tagged tab itself into the other panel, which reparents its
+    // panel and prunes the one it came from.
+    const taggedTab = await page.locator('[data-tab-id="keepalive-tab"]').boundingBox();
+    const target = await otherBody.boundingBox();
+    if (!taggedTab || !target) throw new Error("Missing tagged tab or target body bounds");
+    await page.mouse.move(taggedTab.x + taggedTab.width / 2, taggedTab.y + taggedTab.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(
+      taggedTab.x + taggedTab.width / 2,
+      taggedTab.y + taggedTab.height / 2 + 8,
+    );
+    await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2, { steps: 5 });
+    await page.mouse.up();
+
+    await expect(page.locator("[data-panel-id]")).toHaveCount(1);
+    await expect(page.getByRole("tab")).toHaveCount(2);
+    await expect(body.locator('[data-keepalive-probe="1"]')).toHaveCount(1);
+    await expect(otherBody).toBeHidden();
+    await expect.poll(() => gluedDelta(page, "keepalive-tab")).toEqual([0, 0, 0, 0]);
   });
 
   test("offers Opus in a fresh Codex chat's composer", async ({ page }) => {
