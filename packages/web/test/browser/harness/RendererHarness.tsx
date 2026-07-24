@@ -11,7 +11,7 @@ import {
 import type { SessionMessageRow } from "@/components/chat/MessageHistory";
 import PanelWorkspace, { DragLayer } from "@/components/home/PanelWorkspace";
 import WindowChrome from "@/components/home/WindowChrome";
-import type { Instance } from "@/lib/contracts";
+import type { Instance, PortForward } from "@/lib/contracts";
 import { type HarnessPage, makeOlderPage, makePages } from "./fixtures";
 import { getRenderMetrics, type MetricSnapshot } from "./metrics";
 import {
@@ -194,6 +194,14 @@ function PanelGestureHarness() {
   const parameters = new URLSearchParams(window.location.search);
   const withChromeInset = parameters.get("chromeInset") === "1";
   const sidebarExpanded = parameters.get("sidebarExpanded") === "1";
+  // A forwarded port makes the browser tab render its preview <iframe> against
+  // the given host port, which the test serves itself.
+  const previewPort = Number(parameters.get("previewPort") ?? 0);
+  const ports = useMemo<PortForward[]>(
+    () =>
+      previewPort > 0 ? [{ address: "127.0.0.1", localPort: previewPort, remotePort: 3000 }] : [],
+    [previewPort],
+  );
   const [chromeWidth, setChromeWidth] = useState(0);
   return (
     <main className="relative h-screen bg-background text-foreground">
@@ -214,7 +222,7 @@ function PanelGestureHarness() {
           instance={PANEL_GESTURE_INSTANCE}
           chats={[]}
           terminals={[]}
-          ports={[]}
+          ports={ports}
           prs={[]}
           onDetachPr={() => {}}
           chatModels={[]}
