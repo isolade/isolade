@@ -8,6 +8,10 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Added
 
+- A chat can now switch between Claude and Codex without losing its
+  conversation. Pick a model from the other provider in the composer and your
+  next message carries the conversation over. Very long conversations are
+  summarized so the switch still fits the new model.
 - Messages can now be queued while an agent is working. By default, they are
   sent when the current turn ends. They can also be sent after the current tool
   call or immediately.

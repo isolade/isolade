@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Chat, ChatManager } from "../chats";
-import type { ChatRenderChunk, Upload, UsageStats } from "../contracts";
+import type { ChatEffort, ChatProvider, ChatRenderChunk, Upload, UsageStats } from "../contracts";
+import { findChatModel } from "../contracts";
 import type { ChatMessage } from "../db/schema";
 import type { DiffStatsPoller } from "../diff-stats";
 import type { InstanceManager } from "../instances";
@@ -8,6 +9,18 @@ import type { ProfileManager } from "../profiles";
 import type { TitleVmManager } from "../title-vm-manager";
 import { toUpload, type UploadStore, uploadGuestPath } from "../uploads";
 import type { ChatBackend, UploadAttachment } from "./backend";
+import {
+  capSummaryText,
+  estimateFirstTargetRequest,
+  type HandoffAttachment,
+  handoffSummaryInstruction,
+  type IsoladeBranchMessage,
+  isoladeBranchToHandoff,
+  makeHandoff,
+  reduceHandoffItems,
+  renderHandoffEnvelope,
+} from "./handoff";
+import type { ProviderSwitchStore } from "./provider-switch-store";
 import type { ChatStreamHub } from "./stream-hub";
 import { computeSubscriptionShare } from "./subscription-share";
 
@@ -34,6 +47,7 @@ type InstanceRecord = NonNullable<ReturnType<InstanceManager["get"]>>;
 
 export interface ChatTurnDeps {
   chatManager: ChatManager;
+  providerSwitchStore: ProviderSwitchStore;
   uploadStore: UploadStore;
   instances: InstanceManager;
   profiles: ProfileManager;
@@ -43,6 +57,12 @@ export interface ChatTurnDeps {
   // Provider backends for this turn. In tests both point at the same fake.
   claudeBackend: ChatBackend;
   codexBackend: ChatBackend;
+  // Retire the chat's live Claude process before a cross-provider switch
+  // activates, so a Claude target starts a fresh session instead of reusing a
+  // process positioned at an old Claude tip (see DESIGN.md live-process
+  // ownership). No-op when there is no live process. Optional so tests that
+  // don't exercise switching can omit it.
+  disposeChatProcess?: (chatId: string) => void;
   // The profile-scoped, 20s-cached upstream usage snapshot. Injected (rather
   // than fetched here) so the per-turn `usage` enrichment reuses the same
   // cached numbers /api/usage and the chat list see.
@@ -96,6 +116,7 @@ export class ChatTurnService {
   } {
     const {
       chatManager,
+      providerSwitchStore,
       uploadStore,
       instances,
       profiles,
@@ -104,6 +125,7 @@ export class ChatTurnService {
       chatStreamHub,
       claudeBackend,
       codexBackend,
+      disposeChatProcess,
       profileUsageStats,
     } = this.deps;
     const {
@@ -149,7 +171,10 @@ export class ChatTurnService {
       }
 
       parentId = edit.parentId;
-      const forkPoint = chatManager.resolveForkPoint(parentId);
+      // Fork the current provider's session only. If the edited prefix crosses
+      // providers, this returns null and the turn starts a fresh session
+      // instead of handing one provider's session id to the other's fork.
+      const forkPoint = chatManager.resolveForkPoint(parentId, chat.provider);
       if (forkPoint) {
         sessionId = forkPoint.sessionId;
         fork = { anchorId: forkPoint.anchorId };
@@ -167,6 +192,46 @@ export class ChatTurnService {
         chat.provider === "anthropic"
           ? (chat.claudeSessionId ?? undefined)
           : (chat.codexThreadId ?? undefined);
+    }
+
+    // A pending cross-provider switch activates on this send when it is a normal
+    // send (not an edit or an in-turn edit, both of which pin their own provider
+    // session) and its recorded source leaf is still on the active branch's
+    // lineage. Using lineage (rather than an exact tip match) keeps the switch
+    // valid across a failed prior activation that left an orphan user message on
+    // the same branch, while a real branch change (the source leaf no longer an
+    // ancestor of the tip) still invalidates it.
+    const onActiveLineage = (leafId: string | null): boolean => {
+      if (leafId == null) return parentId == null;
+      if (parentId == null) return false;
+      for (const msg of chatManager.pathToRoot(parentId)) {
+        if (msg.id === leafId) return true;
+      }
+      return false;
+    };
+    let activatingSwitch = !edit && !inTurnEdit ? providerSwitchStore.get(chatId) : undefined;
+    if (activatingSwitch && !onActiveLineage(activatingSwitch.sourceLeafId)) {
+      providerSwitchStore.clear(chatId);
+      activatingSwitch = undefined;
+    }
+    // The turn's effective provider/model/effort: the target when activating a
+    // switch, the chat's own otherwise. All backend selection, pricing, usage
+    // enrichment, and persistence below use these, never the stale chat row.
+    const turnProvider: ChatProvider = activatingSwitch
+      ? activatingSwitch.targetProvider
+      : chat.provider;
+    const turnModel = activatingSwitch ? activatingSwitch.targetModel : chat.model;
+    const turnEffort: ChatEffort = activatingSwitch
+      ? ((activatingSwitch.targetEffort as ChatEffort | null) ??
+        findChatModel(turnModel)?.defaultEffort ??
+        "high")
+      : chat.effort;
+    if (activatingSwitch) {
+      // A cross-provider switch always starts a fresh target native session
+      // (no resume, no fork): the target has never seen this conversation, so
+      // the handoff carries the context instead.
+      sessionId = undefined;
+      fork = undefined;
     }
 
     // Reserve the assistant message id up front so every chat_events
@@ -187,6 +252,8 @@ export class ChatTurnService {
           anchorId: null,
           deliveryStatus: "sending",
           deliveryError: null,
+          provider: null,
+          model: null,
           createdAt: new Date(),
         } satisfies ChatMessage)
       : chatManager.beginTurn(chatId, assistantMessageId, content, parentId, userMessageId);
@@ -225,11 +292,39 @@ export class ChatTurnService {
       messageId: assistantMessageId,
       initialChunks: inTurnEdit?.initialChunks,
       run: async (api) => {
-        // One backend for this turn, picked by the chat's own provider, used
-        // for both the title and the actual response. Titling through the
-        // chat's provider (not always Claude) means a Codex-only profile still
-        // gets a real title instead of always truncating.
-        const backend = chat.provider === "anthropic" ? claudeBackend : codexBackend;
+        // One backend for this turn, picked by the turn's effective provider
+        // (the switch target when activating, else the chat's own). Titling
+        // through it means a Codex-only profile still gets a real title instead
+        // of always truncating.
+        const backend = turnProvider === "anthropic" ? claudeBackend : codexBackend;
+
+        // Commit a pending cross-provider switch exactly once, on the first sign
+        // the target provider accepted the request (a session id, first delta,
+        // or any event). Sets provider/model/effort and resets active usage in
+        // one transaction, then clears the pending switch, so the first target
+        // usage event diffs against a fresh total instead of the source's larger
+        // one. Runs before any usage handling below.
+        let switchCommitted = !activatingSwitch;
+        const commitSwitchIfAccepted = () => {
+          if (switchCommitted) return;
+          switchCommitted = true;
+          chatManager.commitProviderSwitch(chatId, {
+            provider: turnProvider,
+            model: turnModel,
+            effort: turnEffort,
+          });
+          providerSwitchStore.clear(chatId);
+          // Persist a visible divider at the switch point. Emitted as the target
+          // turn's first render event (commit runs before the first delta), so
+          // it folds into this assistant message's render chunks and survives a
+          // reload. `chat` still holds the source provider/model here.
+          api.publish("provider_switch", {
+            fromProvider: chat.provider,
+            fromModel: chat.model,
+            toProvider: turnProvider,
+            toModel: turnModel,
+          });
+        };
 
         let titlePromise: Promise<void> | null = null;
         if (needsTitle) {
@@ -341,12 +436,141 @@ export class ChatTurnService {
           const prelude =
             sessionId || !instance.profileId ? null : profiles.getPrelude(instance.profileId);
           // Compose the message actually sent to the model: optional prelude,
-          // optional attachments block (cites each file's absolute VM path),
-          // then the user's own text. The DB row keeps only `content`, so
-          // neither the prelude nor the attachments block shows in the UI.
+          // optional cross-provider handoff envelope, optional attachments block
+          // (cites each file's absolute VM path), then the user's own text. The
+          // DB row keeps only `content`, so none of the injected framing shows
+          // in the UI.
           const parts: string[] = [];
           if (prelude) parts.push(`<prelude>\n${prelude}\n</prelude>`);
-          if (uploads.length > 0) parts.push(buildAttachmentsPreamble(uploads));
+          const attachmentsPreamble = uploads.length > 0 ? buildAttachmentsPreamble(uploads) : null;
+          if (activatingSwitch) {
+            // Build the provider-neutral handoff from the source branch (every
+            // message before this turn) and estimate the complete first target
+            // request.
+            let handoff = this.buildBranchHandoff(chatId, parentId, chat.provider);
+            const targetModelDef = findChatModel(turnModel);
+            const capacity = {
+              contextWindow: targetModelDef?.contextWindow ?? chat.modelContextWindow ?? 200_000,
+            };
+            const estimate = estimateFirstTargetRequest(
+              { prelude, handoff, attachmentsPreamble, userMessage: content },
+              capacity,
+            );
+            // A current user message that alone exceeds the target's hard limit
+            // can't be fixed by reducing history, so refuse rather than silently
+            // summarizing a new instruction.
+            if (estimate.userMessageExceedsHardLimit) {
+              throw new Error(
+                "This message is too large for the selected model even with no prior context. " +
+                  "Shorten it or split it into smaller messages.",
+              );
+            }
+            console.info(
+              `[chat] activating provider switch ${chat.provider}→${turnProvider} (chat=${chatId}) ` +
+                `handoff bucket=${estimate.bucket} est_input=${estimate.estimatedInputTokens}`,
+            );
+            // Too big to hand over verbatim: reduce the conversation to a
+            // compact summary. Summarization always runs on the SOURCE model in
+            // a throwaway scratch session, so it never touches the chat's own
+            // session and any scratch Claude process is retired after.
+            if (estimate.bucket === "oversized") {
+              const sourceBackend = chat.provider === "anthropic" ? claudeBackend : codexBackend;
+              // Run one summarization turn on the source backend in a throwaway
+              // scratch session. When `fork` is given, the scratch turn forks the
+              // source's live session (which already holds the whole conversation
+              // prompt-cached) so the summary is one cache-advantaged pass; when
+              // it is not, the prompt itself carries the conversation.
+              const scratchSummarize = async (
+                prompt: string,
+                sourceFork?: { sessionId: string; anchorId: string },
+                signal?: AbortSignal,
+              ): Promise<string> => {
+                const scratchChatId = `handoff-reduce-${chatId}-${randomUUID()}`;
+                try {
+                  const summary = await sourceBackend.sendMessage({
+                    vmId: instance.vmId,
+                    chatId: scratchChatId,
+                    message: prompt,
+                    model: chat.model,
+                    effort: chat.effort,
+                    sessionId: sourceFork?.sessionId,
+                    fork: sourceFork ? { anchorId: sourceFork.anchorId } : undefined,
+                    signal,
+                    onDelta: () => {},
+                  });
+                  return summary.content;
+                } finally {
+                  // No-op for a Codex scratch id (no per-chat process); retires
+                  // the throwaway Claude process otherwise.
+                  disposeChatProcess?.(scratchChatId);
+                }
+              };
+
+              let reduced: typeof handoff.items | null = null;
+              // Preferred, cheap path: fork the source session and summarize the
+              // conversation the model already holds, in a single turn.
+              const src = activatingSwitch;
+              if (src.sourceSessionId && src.sourceAnchorId) {
+                try {
+                  const summary = (
+                    await scratchSummarize(
+                      handoffSummaryInstruction(),
+                      { sessionId: src.sourceSessionId, anchorId: src.sourceAnchorId },
+                      api.signal,
+                    )
+                  ).trim();
+                  if (summary) reduced = [{ kind: "summary", text: capSummaryText(summary) }];
+                } catch (err) {
+                  console.warn(
+                    `[chat] fork summarize failed (chat=${chatId}); falling back to chunked reduce:`,
+                    err,
+                  );
+                }
+              }
+              // Fallback: no forkable source session (or the fork failed), so
+              // re-feed the branch in bounded chunks and roll a running summary.
+              if (!reduced) {
+                const sourceWindow =
+                  findChatModel(chat.model)?.contextWindow ?? chat.modelContextWindow ?? 200_000;
+                reduced = await reduceHandoffItems(handoff.items, {
+                  summarize: (prompt, signal) => scratchSummarize(prompt, undefined, signal),
+                  // Leave headroom for the running summary, instructions, and the
+                  // response within the summarizer's window.
+                  chunkBudgetTokens: Math.floor(sourceWindow * 0.5),
+                  signal: api.signal,
+                  onProgress: (step, total) =>
+                    console.info(
+                      `[chat] summarizing handoff (chat=${chatId}) chunk ${step}/${total}`,
+                    ),
+                });
+              }
+              handoff = makeHandoff(handoff.source, reduced);
+              // Belt and suspenders: confirm the reduced handoff plus the
+              // current message now fits. It only wouldn't if the current
+              // message is itself nearly the whole window, which no amount of
+              // history reduction can fix, so refuse rather than send a request
+              // the target will reject.
+              const after = estimateFirstTargetRequest(
+                { prelude, handoff, attachmentsPreamble, userMessage: content },
+                capacity,
+              );
+              if (after.bucket === "oversized") {
+                throw new Error(
+                  "This message is too large for the selected model. " +
+                    "Shorten it or split it into smaller messages.",
+                );
+              }
+            }
+            // Retire the chat's live Claude process ONLY when the target is
+            // Claude, so a Claude target starts a fresh session rather than
+            // resuming an old Claude tip. For a Codex target the Claude process
+            // is never reused (different backend), so leave it for the idle
+            // reaper: disposing it here needlessly churns the VM's exec-streams
+            // right as the Codex app-server is starting.
+            if (turnProvider === "anthropic") disposeChatProcess?.(chatId);
+            parts.push(renderHandoffEnvelope(handoff));
+          }
+          if (attachmentsPreamble) parts.push(attachmentsPreamble);
           // Content can be empty when the message is attachments-only.
           if (content.length > 0) parts.push(content);
           const outgoingMessage = parts.join("\n\n");
@@ -354,22 +578,29 @@ export class ChatTurnService {
             vmId: instance.vmId,
             chatId,
             message: outgoingMessage,
-            model: chat.model,
-            effort: chat.effort,
+            model: turnModel,
+            effort: turnEffort,
             sessionId,
             userMessageId: userMessage.id,
             fork,
             signal: api.signal,
             onDelta: (text) => {
+              commitSwitchIfAccepted();
               api.publish("delta", text);
               assistantContent += text;
             },
             onMeta: (meta) => {
+              commitSwitchIfAccepted();
               if (meta.sessionId !== undefined) turnMeta.sessionId = meta.sessionId;
               if (meta.anchorId !== undefined) turnMeta.anchorId = meta.anchorId;
             },
             onUserMessageAcknowledged: confirmUserMessage,
             onEvent: (event) => {
+              // Any event proves the target accepted the request, so commit a
+              // pending switch before touching usage: updateUsage below reads
+              // the (now target) provider/model for pricing and diffs against
+              // the reset totals.
+              commitSwitchIfAccepted();
               // Persist the full usage snapshot onto the chat row so
               // the next mount of the chat UI can rehydrate UsageState
               // without waiting for a new turn.
@@ -393,8 +624,8 @@ export class ChatTurnService {
                   const work = (async () => {
                     try {
                       const subscriptionShare = await computeSubscriptionShare({
-                        provider: chat.provider,
-                        modelId: chat.model,
+                        provider: turnProvider,
+                        modelId: turnModel,
                         total: baseEvent.total,
                         stats: await profileUsageStats(instance.profileId!),
                         authStore: profiles.auth(instance.profileId!),
@@ -426,6 +657,9 @@ export class ChatTurnService {
           // provider accepted the user input, even if an older provider
           // version omitted or raced the explicit acknowledgement event.
           confirmUserMessage();
+          // A successful result (even an empty one) also proves the target
+          // accepted the request, so commit any pending switch before finalizing.
+          commitSwitchIfAccepted();
           assistantContent = result.content || assistantContent;
           await waitForPendingEvents();
           const renderChunks = api.renderChunks();
@@ -445,6 +679,11 @@ export class ChatTurnService {
               parentId: inTurnEdit ? inTurnEdit.sourceAssistant.parentId : userMessage.id,
               sessionId: turnMeta.sessionId ?? result.sessionId ?? null,
               anchorId: turnMeta.anchorId ?? null,
+              // Record which provider/model produced this turn, so a chat that
+              // later switches providers can tell each turn's native session
+              // apart (a native fork is only valid with the same provider).
+              provider: turnProvider,
+              model: turnModel,
             },
             renderChunks,
           );
@@ -473,6 +712,10 @@ export class ChatTurnService {
                   parentId: inTurnEdit ? inTurnEdit.sourceAssistant.parentId : userMessage.id,
                   sessionId: turnMeta.sessionId ?? null,
                   anchorId: turnMeta.anchorId ?? null,
+                  // Partial content means the target accepted and streamed, so
+                  // the switch already committed: record the target here too.
+                  provider: turnProvider,
+                  model: turnModel,
                 },
                 renderChunks,
               );
@@ -498,5 +741,47 @@ export class ChatTurnService {
       assistantMessageId,
       ...(inTurnEdit ? {} : { userMessage: userMessageWithUploads }),
     };
+  }
+
+  // Build the provider-neutral handoff for a cross-provider switch from the
+  // Isolade message and event stores: every message on the active branch up to
+  // and including `throughMessageId` (the source branch tip, i.e. the parent of
+  // the turn being sent). This host-side path needs no guest access and no
+  // source model request, so it powers direct transfer. Assistant turns use
+  // their persisted render chunks (full, non-debug) so tool calls and results
+  // carry over; user messages carry their attachments by guest path.
+  private buildBranchHandoff(
+    chatId: string,
+    throughMessageId: string | null,
+    source: ChatProvider,
+  ) {
+    const { chatManager, uploadStore } = this.deps;
+    const rootToTip: IsoladeBranchMessage[] = [];
+    for (const msg of chatManager.pathToRoot(throughMessageId)) {
+      rootToTip.push({ id: msg.id, role: msg.role, content: msg.content });
+    }
+    rootToTip.reverse();
+    const assistantIds = rootToTip.filter((m) => m.role === "assistant").map((m) => m.id);
+    const renderChunksByMessageId = chatManager.getMessageRenderChunks(
+      chatId,
+      assistantIds,
+      false,
+      false,
+    );
+    const userIds = rootToTip.filter((m) => m.role === "user").map((m) => m.id);
+    const attachmentsByMessageId: Record<string, HandoffAttachment[]> = {};
+    for (const [messageId, ups] of uploadStore.byMessageForChat(chatId, userIds)) {
+      attachmentsByMessageId[messageId] = ups.map((u) => ({
+        filename: u.filename,
+        mediaType: u.mediaType,
+        guestPath: uploadGuestPath(u.id, u.filename),
+      }));
+    }
+    return isoladeBranchToHandoff({
+      source,
+      messages: rootToTip,
+      renderChunksByMessageId,
+      attachmentsByMessageId,
+    });
   }
 }

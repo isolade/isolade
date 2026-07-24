@@ -14,7 +14,12 @@ import type { TranscriptMessage, Upload } from "@/lib/contracts";
 import { RENDER_METRICS_ENABLED, recordRenderMetric } from "@/lib/render-metrics";
 import { cn } from "@/lib/utils";
 import StreamingMarkdown from "../StreamingMarkdown";
-import { StreamView } from "./blocks";
+import {
+  type ProviderSwitchChunk,
+  ProviderSwitchDivider,
+  providerSwitchOf,
+  StreamView,
+} from "./blocks";
 import type { StreamChunk } from "./chunks";
 import { UserMessage } from "./UserMessage";
 
@@ -113,9 +118,9 @@ function VersionPager({
   );
 }
 
-function WaitingDots() {
-  return (
-    <span className="flex gap-1 py-2" aria-label="Waiting for response">
+function WaitingDots({ label }: { label?: string }) {
+  const dots = (
+    <span className="flex gap-1" aria-label={label ?? "Waiting for response"}>
       {[0, 150, 300].map((delay) => (
         <span
           key={delay}
@@ -125,12 +130,21 @@ function WaitingDots() {
       ))}
     </span>
   );
+  if (!label) return <span className="flex py-2">{dots}</span>;
+  return (
+    <span className="flex items-center gap-2 py-2 text-sm text-muted-foreground">
+      {dots}
+      <span>{label}</span>
+    </span>
+  );
 }
 
 export const MessageRow = memo(function MessageRow({
   message,
   instanceId,
   chunks,
+  switchAbove,
+  waitingLabel,
   showDebug,
   userFontFamily,
   agentFontFamily,
@@ -148,6 +162,12 @@ export const MessageRow = memo(function MessageRow({
   message: TranscriptMessage;
   instanceId: string;
   chunks: StreamChunk[] | undefined;
+  // When this row is the user message that triggered a provider switch, the
+  // divider to render above it (that message ran on the new model).
+  switchAbove?: ProviderSwitchChunk;
+  // Label shown next to the waiting dots while an assistant row is streaming
+  // with no output yet (e.g. "Transferring context…" during a switch).
+  waitingLabel?: string;
   showDebug: boolean;
   userFontFamily: string;
   agentFontFamily: string;
@@ -169,75 +189,78 @@ export const MessageRow = memo(function MessageRow({
   );
   const version = message.version;
   return (
-    <div
-      data-message-id={message.id}
-      data-message-row
-      role="listitem"
-      className={cn("flex", message.role === "user" ? "justify-end" : "justify-start")}
-      style={{ contentVisibility: "auto", containIntrinsicSize: "auto 96px" }}
-    >
-      {message.role === "user" ? (
-        <UserMessage
-          message={message}
-          capabilities={EDITABLE_USER_MESSAGE}
-          instanceId={instanceId}
-          fontFamily={userFontFamily}
-          editing={isEditing}
-          actionsDisabled={actionsDisabled}
-          onStartEdit={onStartEdit}
-          onCancelEdit={onCancelEdit}
-          onSubmitEdit={onSubmitEdit}
-          footer={
-            version ? (
+    <>
+      {switchAbove && <ProviderSwitchDivider chunk={switchAbove} />}
+      <div
+        data-message-id={message.id}
+        data-message-row
+        role="listitem"
+        className={cn("flex", message.role === "user" ? "justify-end" : "justify-start")}
+        style={{ contentVisibility: "auto", containIntrinsicSize: "auto 96px" }}
+      >
+        {message.role === "user" ? (
+          <UserMessage
+            message={message}
+            capabilities={EDITABLE_USER_MESSAGE}
+            instanceId={instanceId}
+            fontFamily={userFontFamily}
+            editing={isEditing}
+            actionsDisabled={actionsDisabled}
+            onStartEdit={onStartEdit}
+            onCancelEdit={onCancelEdit}
+            onSubmitEdit={onSubmitEdit}
+            footer={
+              version ? (
+                <VersionPager
+                  index={version.index}
+                  count={version.count}
+                  actionsDisabled={actionsDisabled}
+                  onNavigate={(direction) => onNavigateVersion(message.id, direction)}
+                />
+              ) : undefined
+            }
+          />
+        ) : (
+          <div
+            className="w-full break-words pr-12 text-[15px] leading-relaxed text-foreground"
+            style={{ fontFamily: agentFontFamily }}
+          >
+            {streaming && (!chunks || chunks.length === 0) ? (
+              <WaitingDots label={waitingLabel} />
+            ) : chunks && chunks.length > 0 ? (
+              <>
+                <StreamView
+                  chunks={chunks}
+                  showDebug={showDebug}
+                  streaming={streaming}
+                  instanceId={instanceId}
+                  userFontFamily={userFontFamily}
+                  editingUserMessageId={editingUserMessageId}
+                  actionsDisabled={actionsDisabled}
+                  onStartUserMessageEdit={onStartEdit}
+                  onCancelUserMessageEdit={onCancelEdit}
+                  onSubmitUserMessageEdit={onSubmitEdit}
+                  onRequestToolDetails={requestToolDetails}
+                />
+                {streaming && chunks.at(-1)?.kind === "text" && (
+                  <span className="ml-0.5 inline-block h-4 w-1 animate-pulse bg-muted-foreground align-text-bottom" />
+                )}
+              </>
+            ) : (
+              <StreamingMarkdown content={message.content} />
+            )}
+            {version && (
               <VersionPager
                 index={version.index}
                 count={version.count}
                 actionsDisabled={actionsDisabled}
                 onNavigate={(direction) => onNavigateVersion(message.id, direction)}
               />
-            ) : undefined
-          }
-        />
-      ) : (
-        <div
-          className="w-full break-words pr-12 text-[15px] leading-relaxed text-foreground"
-          style={{ fontFamily: agentFontFamily }}
-        >
-          {streaming && (!chunks || chunks.length === 0) ? (
-            <WaitingDots />
-          ) : chunks && chunks.length > 0 ? (
-            <>
-              <StreamView
-                chunks={chunks}
-                showDebug={showDebug}
-                streaming={streaming}
-                instanceId={instanceId}
-                userFontFamily={userFontFamily}
-                editingUserMessageId={editingUserMessageId}
-                actionsDisabled={actionsDisabled}
-                onStartUserMessageEdit={onStartEdit}
-                onCancelUserMessageEdit={onCancelEdit}
-                onSubmitUserMessageEdit={onSubmitEdit}
-                onRequestToolDetails={requestToolDetails}
-              />
-              {streaming && chunks.at(-1)?.kind === "text" && (
-                <span className="ml-0.5 inline-block h-4 w-1 animate-pulse bg-muted-foreground align-text-bottom" />
-              )}
-            </>
-          ) : (
-            <StreamingMarkdown content={message.content} />
-          )}
-          {version && (
-            <VersionPager
-              index={version.index}
-              count={version.count}
-              actionsDisabled={actionsDisabled}
-              onNavigate={(direction) => onNavigateVersion(message.id, direction)}
-            />
-          )}
-        </div>
-      )}
-    </div>
+            )}
+          </div>
+        )}
+      </div>
+    </>
   );
 });
 
@@ -260,6 +283,14 @@ const HistoryPage = memo(function HistoryPage({
   ...shared
 }: { page: MessageHistoryPage } & SharedRowProps) {
   if (RENDER_METRICS_ENABLED) recordRenderMetric("historyMappings");
+  // A provider-switch marker leads its (target) assistant turn; surface it as a
+  // divider above that turn's user message, keyed by the assistant's parentId.
+  const switchByUserId = new Map<string, ProviderSwitchChunk>();
+  for (const message of page.messages) {
+    if (message.role !== "assistant" || !message.parentId) continue;
+    const marker = providerSwitchOf(page.chunksByMessage[message.id]);
+    if (marker) switchByUserId.set(message.parentId, marker);
+  }
   return (
     <div
       data-history-page={page.key}
@@ -277,6 +308,7 @@ const HistoryPage = memo(function HistoryPage({
           historical
           actionsDisabled={shared.actionsDisabled}
           chunks={page.chunksByMessage[message.id]}
+          switchAbove={switchByUserId.get(message.id)}
           showDebug={shared.showDebug}
           userFontFamily={shared.userFontFamily}
           agentFontFamily={shared.agentFontFamily}
@@ -297,6 +329,10 @@ interface MessageHistoryProps extends SharedRowProps {
   pages: MessageHistoryPage[];
   sessionRows: SessionMessageRow[];
   live: LiveAssistantRow | null;
+  // An optimistic provider-switch divider to show above a session user message
+  // (keyed by its id) the instant a switch-triggering message is submitted,
+  // before the target turn commits its persisted marker.
+  activeSwitch?: { userId: string; chunk: ProviderSwitchChunk } | null;
   scrollElementRef: RefObject<HTMLDivElement | null>;
   visible: boolean;
   hasOlder: boolean;
@@ -311,6 +347,7 @@ export const MessageHistory = memo(
       pages,
       sessionRows,
       live,
+      activeSwitch,
       instanceId,
       scrollElementRef,
       showDebug,
@@ -382,42 +419,52 @@ export const MessageHistory = memo(
       () => pages.map((page) => <HistoryPage key={page.key} page={page} {...shared} />),
       [pages, shared],
     );
-    const sessionElements = useMemo(
-      () =>
-        sessionRows.map((row) => (
-          <MessageRow
-            key={row.renderKey}
-            message={row.message}
-            instanceId={instanceId}
-            chunks={row.chunks}
-            showDebug={showDebug}
-            userFontFamily={userFontFamily}
-            agentFontFamily={agentFontFamily}
-            isEditing={editingId === row.message.id}
-            editingUserMessageId={editingId}
-            actionsDisabled={actionsDisabled}
-            onStartEdit={onStartEdit}
-            onCancelEdit={onCancelEdit}
-            onSubmitEdit={onSubmitEdit}
-            onNavigateVersion={onNavigateVersion}
-            onRequestToolDetails={onRequestToolDetails}
-          />
-        )),
-      [
-        actionsDisabled,
-        agentFontFamily,
-        editingId,
-        instanceId,
-        onCancelEdit,
-        onNavigateVersion,
-        onRequestToolDetails,
-        onStartEdit,
-        onSubmitEdit,
-        sessionRows,
-        showDebug,
-        userFontFamily,
-      ],
-    );
+    const sessionElements = useMemo(() => {
+      const switchByUserId = new Map<string, ProviderSwitchChunk>();
+      for (const row of sessionRows) {
+        if (row.message.role !== "assistant" || !row.message.parentId) continue;
+        const marker = providerSwitchOf(row.chunks);
+        if (marker) switchByUserId.set(row.message.parentId, marker);
+      }
+      // The optimistic divider (shown before the turn commits its persisted
+      // marker) wins for its user message so it appears the instant the message
+      // is submitted.
+      if (activeSwitch) switchByUserId.set(activeSwitch.userId, activeSwitch.chunk);
+      return sessionRows.map((row) => (
+        <MessageRow
+          key={row.renderKey}
+          message={row.message}
+          instanceId={instanceId}
+          chunks={row.chunks}
+          switchAbove={switchByUserId.get(row.message.id)}
+          showDebug={showDebug}
+          userFontFamily={userFontFamily}
+          agentFontFamily={agentFontFamily}
+          isEditing={editingId === row.message.id}
+          editingUserMessageId={editingId}
+          actionsDisabled={actionsDisabled}
+          onStartEdit={onStartEdit}
+          onCancelEdit={onCancelEdit}
+          onSubmitEdit={onSubmitEdit}
+          onNavigateVersion={onNavigateVersion}
+          onRequestToolDetails={onRequestToolDetails}
+        />
+      ));
+    }, [
+      actionsDisabled,
+      activeSwitch,
+      agentFontFamily,
+      editingId,
+      instanceId,
+      onCancelEdit,
+      onNavigateVersion,
+      onRequestToolDetails,
+      onStartEdit,
+      onSubmitEdit,
+      sessionRows,
+      showDebug,
+      userFontFamily,
+    ]);
     const liveElement = live ? (
       <MessageRow
         key={live.renderKey}
@@ -425,6 +472,10 @@ export const MessageHistory = memo(
         instanceId={instanceId}
         chunks={live.chunks}
         streaming={live.streaming}
+        // While a switch is activating, the source conversation is being
+        // summarized/transferred before the target replies, so the wait can be
+        // a few seconds. Say so instead of showing bare dots.
+        waitingLabel={activeSwitch ? "Transferring context…" : undefined}
         showDebug={showDebug}
         userFontFamily={userFontFamily}
         agentFontFamily={agentFontFamily}

@@ -218,6 +218,26 @@ export const subscriptionShareSchema = z.object({
   sevenDayCurrentPct: z.number().nullable(),
 });
 
+// A cross-provider switch the user selected but that hasn't activated yet: the
+// chat still runs on its current provider until the next send starts a fresh
+// target session with a provider-neutral handoff (see the handoff service).
+// Rides on the chat snapshot so the model picker can show the pending target
+// without claiming the native switch already happened.
+export const pendingSwitchSchema = z.object({
+  // Where the chat is switching FROM: the provider/model recorded when the
+  // switch was selected. Lets the composer and the transcript divider label the
+  // switch ("from Opus 4.8 to GPT-5.6-Sol") before the target turn commits.
+  sourceProvider: chatProviderSchema,
+  sourceModel: z.string(),
+  targetProvider: chatProviderSchema,
+  targetModel: z.string(),
+  targetEffort: chatEffortSchema.nullable(),
+  status: z.enum(["pending", "preparing", "activating", "failed"]),
+  // Coarse classification of the last failed step, when status is "failed".
+  errorClass: z.string().nullable(),
+});
+export type PendingSwitch = z.infer<typeof pendingSwitchSchema>;
+
 export const chatSchema = z.object({
   id: z.string(),
   instanceId: z.string(),
@@ -255,6 +275,10 @@ export const chatSchema = z.object({
   // Server-computed (not stored): derived from the cumulative totals + the
   // resolved rate plan at GET time. Omitted when we can't make an estimate.
   subscriptionShare: subscriptionShareSchema.optional(),
+  // A selected-but-not-yet-activated cross-provider switch. Present only while
+  // one is pending; the picker shows the target model without claiming the
+  // switch completed. Cleared once the switch commits or is invalidated.
+  pendingSwitch: pendingSwitchSchema.optional(),
   createdAt: dateLikeSchema,
 });
 export const chatArraySchema = z.array(chatSchema);

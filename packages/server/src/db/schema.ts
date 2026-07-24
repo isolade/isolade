@@ -265,6 +265,16 @@ export const chatMessages = sqliteTable("chat_messages", {
     enum: ["sending", "confirmed", "unknown", "rejected"],
   }),
   deliveryError: text("delivery_error"),
+  // Provider identity for an assistant row, needed once a chat can hold turns
+  // from more than one provider (a cross-provider switch, see the handoff
+  // service). `sessionId`/`anchorId` above are provider-native values, so an
+  // edit can only fork them with the same provider's backend. Null on user
+  // rows and on legacy rows with no evidence of which provider produced them
+  // (the v7 migration backfills it only where a native session/anchor proves
+  // the chat's then-current provider). `model` is optional diagnostics and
+  // future model-specific replay.
+  provider: text("provider", { enum: ["anthropic", "openai"] }),
+  model: text("model"),
   createdAt: integer("created_at", { mode: "timestamp" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -444,6 +454,64 @@ export const usageEvents = sqliteTable(
   }),
 );
 
+// A pending cross-provider switch for a chat: the user picked a model from the
+// other provider, but the switch only activates on the next real user turn (a
+// fresh target native session gets the provider-neutral handoff, see the
+// handoff service). At most one pending switch per chat, so the chat id is the
+// key: selecting yet another model before sending replaces the row rather than
+// stacking. The row is transient state, cleared once the switch commits (the
+// first target request is accepted) or the source leaf stops identifying the
+// active branch (a branch change invalidates it).
+//
+// Handoff and summary TEXT is deliberately NOT stored here. When source-side
+// compaction or a forked plaintext summary is used, only a reference to the
+// auxiliary native session/turn is kept (auxSessionId/auxTurnId); the text is
+// read back from that native transcript. The Isolade message and event stores
+// remain the raw-transcript fallback.
+export const providerSwitches = sqliteTable("provider_switches", {
+  /** The chat this switch belongs to. One pending switch per chat. */
+  chatId: text("chat_id").primaryKey(),
+  // Where the switch is in its lifecycle:
+  //   pending    - recorded at selection, not yet activated by a user turn.
+  //   preparing  - reconstructing/estimating/reducing the handoff.
+  //   activating - a fresh target session started, awaiting provider acceptance.
+  //   failed     - a step failed; the switch stays retryable (see lastError).
+  status: text("status", { enum: ["pending", "preparing", "activating", "failed"] })
+    .notNull()
+    .default("pending"),
+  // The active leaf when the switch was recorded. Activation re-checks this
+  // against the live active leaf; a branch change in between invalidates the
+  // switch because the source leaf no longer identifies the conversation.
+  sourceLeafId: text("source_leaf_id"),
+  sourceProvider: text("source_provider", { enum: ["anthropic", "openai"] }).notNull(),
+  sourceModel: text("source_model").notNull(),
+  // The source native session and the turn's end position inside it, so a
+  // source-side compaction/summary fork resumes at exactly the active tip.
+  sourceSessionId: text("source_session_id"),
+  sourceAnchorId: text("source_anchor_id"),
+  targetProvider: text("target_provider", { enum: ["anthropic", "openai"] }).notNull(),
+  targetModel: text("target_model").notNull(),
+  targetEffort: text("target_effort"),
+  // Reference (never a copy of its text) to an auxiliary native session created
+  // during the attempt: a compacted Claude fork or a forked Codex thread that
+  // holds a plaintext handoff summary. auxTurnId pins the turn whose output is
+  // the summary. Reused across retries so a completed source-side summary isn't
+  // regenerated when only target startup failed.
+  auxSessionId: text("aux_session_id"),
+  auxTurnId: text("aux_turn_id"),
+  // Coarse error classification for the last failed step (e.g. source-usage,
+  // target-usage, target-context, transcript-missing), plus a human-readable
+  // detail. Drives the retry/cancel/confirm UI and the availability matrix.
+  errorClass: text("error_class"),
+  lastError: text("last_error"),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
 // Generic singleton/key-value store for small, machine-local, global state that
 // has no natural per-profile or per-instance home. One row per key, the value a
 // JSON blob owned by whichever module writes it. Today it backs the update-check
@@ -482,5 +550,7 @@ export type ChatMessageRender = typeof chatMessageRenders.$inferSelect;
 export type NewChatMessageRender = typeof chatMessageRenders.$inferInsert;
 export type UsageEvent = typeof usageEvents.$inferSelect;
 export type NewUsageEvent = typeof usageEvents.$inferInsert;
+export type ProviderSwitchRow = typeof providerSwitches.$inferSelect;
+export type NewProviderSwitchRow = typeof providerSwitches.$inferInsert;
 export type AppStateRow = typeof appState.$inferSelect;
 export type NewAppStateRow = typeof appState.$inferInsert;

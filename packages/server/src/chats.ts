@@ -25,12 +25,17 @@ import type { ChatMessage, Chat as ChatRow, QueuedMessage } from "./db/schema";
 // message into the tree (null = chat root). `sessionId`/`anchorId` snapshot
 // the provider session an assistant turn ran in and where it ended, so a
 // later edit can fork the session at that point (see db/schema.ts).
+// `provider`/`model` record which provider produced an assistant turn, so a
+// chat that has switched providers can tell each turn's native session apart
+// (a native fork is only valid with the same provider's backend).
 export interface MessageMeta {
   parentId?: string | null;
   sessionId?: string | null;
   anchorId?: string | null;
   deliveryStatus?: "sending" | "confirmed" | "unknown" | "rejected" | null;
   deliveryError?: string | null;
+  provider?: ChatProvider | null;
+  model?: string | null;
 }
 
 // Row shape returned from manager methods. Effort is always non-null at this
@@ -114,6 +119,8 @@ export class ChatManager {
         anchorId: meta.anchorId ?? null,
         deliveryStatus: meta.deliveryStatus ?? null,
         deliveryError: meta.deliveryError ?? null,
+        provider: meta.provider ?? null,
+        model: meta.model ?? null,
       })
       .run();
     return this.db.select().from(schema.chatMessages).where(eq(schema.chatMessages.id, id)).get()!;
@@ -352,9 +359,23 @@ export class ChatManager {
   // that has both a session snapshot and an anchor. Null means "no usable
   // snapshot" (chat root, or legacy rows that predate the columns), and the
   // caller starts a fresh provider session instead.
-  resolveForkPoint(parentId: string | null): { sessionId: string; anchorId: string } | null {
+  //
+  // `provider`, when given, restricts the fork to a session that provider owns:
+  // a native fork replays a provider-native session, so it's only valid when
+  // the anchor and the entire edited prefix belong to that provider. If a
+  // different provider appears between `parentId` and the anchor, this returns
+  // null and the caller starts a fresh session (feeding the edited prefix
+  // through the cross-provider handoff pipeline instead). A null provider on a
+  // row is treated as compatible: legacy anchored rows predate the column and a
+  // single-provider chat never conflicts.
+  resolveForkPoint(
+    parentId: string | null,
+    provider?: ChatProvider,
+  ): { sessionId: string; anchorId: string } | null {
     for (const msg of this.walkToRoot(parentId)) {
-      if (msg.role === "assistant" && msg.sessionId && msg.anchorId) {
+      if (msg.role !== "assistant") continue;
+      if (provider && msg.provider && msg.provider !== provider) return null;
+      if (msg.sessionId && msg.anchorId) {
         return { sessionId: msg.sessionId, anchorId: msg.anchorId };
       }
     }
@@ -470,6 +491,7 @@ export class ChatManager {
       "turn_interrupted",
       "render_seed",
       "api_retry",
+      "provider_switch",
       ...(includeDebug ? ["thinking", "raw"] : []),
     ];
     return this.db
@@ -522,6 +544,7 @@ export class ChatManager {
       "turn_interrupted",
       "render_seed",
       "api_retry",
+      "provider_switch",
       ...(includeDebug ? ["thinking", "raw"] : []),
     ];
     return this.db
@@ -946,6 +969,7 @@ export class ChatManager {
       "turn_interrupted",
       "render_seed",
       "api_retry",
+      "provider_switch",
       ...(includeDebug ? ["thinking", "raw"] : []),
     ];
     const events = this.db
@@ -1135,6 +1159,59 @@ export class ChatManager {
 
   updateEffort(chatId: string, effort: ChatEffort) {
     this.db.update(schema.chats).set({ effort }).where(eq(schema.chats.id, chatId)).run();
+  }
+
+  // Commit a cross-provider switch onto the chat row, atomically: set the
+  // target provider/model/effort and reset the active-session usage in one
+  // transaction (the target-session commit, run on the first accepted target
+  // request). Deliberately does NOT clear either provider's session-id column:
+  // the target's is written by its backend as the fresh session mints, and the
+  // source's is kept so its branch stays resumable. The per-message provider
+  // field disambiguates the two going forward.
+  commitProviderSwitch(
+    chatId: string,
+    next: { provider: ChatProvider; model: string; effort: ChatEffort },
+  ) {
+    this.db.transaction(() => {
+      this.db
+        .update(schema.chats)
+        .set({ provider: next.provider, model: next.model, effort: next.effort })
+        .where(eq(schema.chats.id, chatId))
+        .run();
+      this.resetActiveUsage(chatId);
+    });
+  }
+
+  // Reset the chat's active-session usage columns to their fresh state. These
+  // columns hold ONE native session's cumulative totals plus the last turn's
+  // breakdown, so a cross-provider switch must reset them in the target-session
+  // commit, before the first target usage event. Otherwise updateUsage would
+  // diff the fresh target total against the larger source total, clamp the
+  // negative delta to zero, and lose the target's usage from the append-only
+  // usage log (the lifetime source of truth, which this method never touches).
+  // Nulling (rather than zeroing) mirrors a brand-new chat, so the UI shows no
+  // usage until the first target event lands. `compacted` and the
+  // provider-reported context window belong to the retired session too.
+  resetActiveUsage(chatId: string) {
+    this.db
+      .update(schema.chats)
+      .set({
+        inputTokens: null,
+        cachedInputTokens: null,
+        cacheCreationInputTokens: null,
+        outputTokens: null,
+        reasoningOutputTokens: null,
+        lastInputTokens: null,
+        lastCachedInputTokens: null,
+        lastCacheCreationInputTokens: null,
+        lastOutputTokens: null,
+        lastReasoningOutputTokens: null,
+        modelContextWindow: null,
+        compacted: null,
+        costUsd: null,
+      })
+      .where(eq(schema.chats.id, chatId))
+      .run();
   }
 
   // Snapshot the running per-chat totals + the latest turn's breakdown +

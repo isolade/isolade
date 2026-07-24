@@ -345,6 +345,114 @@ describe("MessageHistory", () => {
     expect(html.match(/disabled=""/g)).toHaveLength(3);
   });
 
+  it("renders the provider-switch divider above the triggering user message", () => {
+    const trigger = message("u-trigger", "user");
+    const target: TranscriptMessage = {
+      ...message("a-target", "assistant"),
+      parentId: "u-trigger",
+    };
+    const html = renderToStaticMarkup(
+      <MessageHistory
+        instanceId="instance-test"
+        pages={[
+          {
+            key: "page",
+            messages: [trigger, target],
+            chunksByMessage: {
+              "a-target": [
+                {
+                  kind: "provider_switch",
+                  fromProvider: "anthropic",
+                  fromModel: "claude-opus-4-8",
+                  toProvider: "openai",
+                  toModel: "gpt-5.6-sol",
+                },
+                { kind: "text", text: "codex reply" },
+              ],
+            },
+          },
+        ]}
+        sessionRows={[]}
+        live={null}
+        scrollElementRef={createRef<HTMLDivElement>()}
+        showDebug={false}
+        userFontFamily="sans-serif"
+        agentFontFamily="sans-serif"
+        editingId={null}
+        actionsDisabled={false}
+        visible
+        hasOlder={false}
+        onStartEdit={() => {}}
+        onCancelEdit={() => {}}
+        onSubmitEdit={() => {}}
+        onNavigateVersion={() => {}}
+        onRequestToolDetails={() => {}}
+        onLoadOlder={() => {}}
+        onLayoutChange={() => {}}
+      />,
+    );
+
+    // The label uses catalog model names, with no provider prefix.
+    expect(html).toContain("Switched from Opus 4.8 to GPT-5.6-Sol");
+    // The divider renders ABOVE the user message that triggered the switch, and
+    // it is not duplicated inside the assistant bubble.
+    const dividerAt = html.indexOf("provider-switch-divider");
+    const triggerAt = html.indexOf('data-message-id="u-trigger"');
+    const targetAt = html.indexOf('data-message-id="a-target"');
+    expect(dividerAt).toBeGreaterThanOrEqual(0);
+    expect(dividerAt).toBeLessThan(triggerAt);
+    expect(triggerAt).toBeLessThan(targetAt);
+    expect(html.match(/provider-switch-divider/g)).toHaveLength(1);
+    expect(html).toContain("codex reply");
+  });
+
+  it("renders an optimistic switch divider above the submitted user message before any reply", () => {
+    // Simulates the instant a switch-triggering message is submitted: the user
+    // row exists (no assistant reply yet, no persisted marker), and activeSwitch
+    // supplies the divider optimistically.
+    const trigger = message("optimistic-user", "user");
+    const html = renderToStaticMarkup(
+      <MessageHistory
+        instanceId="instance-test"
+        pages={[]}
+        sessionRows={[{ renderKey: "optimistic-user", message: trigger }]}
+        live={null}
+        activeSwitch={{
+          userId: "optimistic-user",
+          chunk: {
+            kind: "provider_switch",
+            fromProvider: "anthropic",
+            fromModel: "claude-opus-4-8",
+            toProvider: "openai",
+            toModel: "gpt-5.6-sol",
+          },
+        }}
+        scrollElementRef={createRef<HTMLDivElement>()}
+        showDebug={false}
+        userFontFamily="sans-serif"
+        agentFontFamily="sans-serif"
+        editingId={null}
+        actionsDisabled={false}
+        visible
+        hasOlder={false}
+        onStartEdit={() => {}}
+        onCancelEdit={() => {}}
+        onSubmitEdit={() => {}}
+        onNavigateVersion={() => {}}
+        onRequestToolDetails={() => {}}
+        onLoadOlder={() => {}}
+        onLayoutChange={() => {}}
+      />,
+    );
+
+    expect(html).toContain("Switched from Opus 4.8 to GPT-5.6-Sol");
+    const dividerAt = html.indexOf("provider-switch-divider");
+    const userAt = html.indexOf('data-message-id="optimistic-user"');
+    expect(dividerAt).toBeGreaterThanOrEqual(0);
+    expect(dividerAt).toBeLessThan(userAt);
+    expect(html.match(/provider-switch-divider/g)).toHaveLength(1);
+  });
+
   it("renders persisted attachments without requiring message text", () => {
     const attached: TranscriptMessage = {
       ...message("attached"),

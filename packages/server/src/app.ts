@@ -11,6 +11,7 @@ import { ChatTurnService } from "./chat/chat-turn-service";
 import { ClaudeBackend } from "./chat/claude-backend";
 import { CodexBackend } from "./chat/codex-backend";
 import { CodexManager } from "./chat/codex-manager";
+import { ProviderSwitchStore } from "./chat/provider-switch-store";
 import { ChatStreamHub } from "./chat/stream-hub";
 import { annotateAggregateShares } from "./chat/subscription-share";
 import { ChatManager } from "./chats";
@@ -296,6 +297,7 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
   // broker, started by InstanceManager at create/restart/re-attach.
   const terminalManager = new TerminalManager(db);
   const chatManager = new ChatManager(db);
+  const providerSwitchStore = new ProviderSwitchStore(db);
   const uploadStore = new UploadStore(db);
   const realClaudeBackend = new ClaudeBackend(sandboxClient, chatManager);
   const codexManager = new CodexManager(sandboxClient);
@@ -517,6 +519,7 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
   // profile-scoped usage cache as /api/usage and the chat-list enrichment.
   const chatTurnService = new ChatTurnService({
     chatManager,
+    providerSwitchStore,
     uploadStore,
     instances,
     profiles,
@@ -525,6 +528,11 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
     chatStreamHub,
     claudeBackend,
     codexBackend,
+    // A cross-provider switch to Claude must start a fresh session, not reuse
+    // the chat's live process (positioned at an old Claude tip). Retiring it is
+    // the real backend's job, so route the callback through it even when a fake
+    // backend drives turns in tests.
+    disposeChatProcess: (chatId: string) => realClaudeBackend.disposeChat(chatId),
     profileUsageStats: (profileId: string) => profileUsageStats(profileId),
     deliveryConfirmationTimeoutMs: opts.deliveryConfirmationTimeoutMs,
   });
@@ -551,6 +559,7 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
     sessionManager,
     terminalManager,
     chatManager,
+    providerSwitchStore,
     uploadStore,
     chatStreamHub,
     codexManager,

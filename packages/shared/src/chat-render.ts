@@ -71,6 +71,18 @@ export const chatRenderChunkSchema = z.discriminatedUnion("kind", [
     label: z.string(),
     payload: z.unknown(),
   }),
+  // A cross-provider switch boundary: the turn this chunk leads was the first
+  // one after the chat moved from one provider to another (see the handoff
+  // service). Rendered as a divider so the transcript shows where the switch
+  // happened. Persisted like any other chunk, so it survives a reload. `from`
+  // is null when the source model/provider is unknown (a legacy switch).
+  z.object({
+    kind: z.literal("provider_switch"),
+    fromProvider: z.string().nullable(),
+    fromModel: z.string().nullable(),
+    toProvider: z.string(),
+    toModel: z.string(),
+  }),
 ]);
 
 export type TokenUsage = z.infer<typeof tokenUsageSchema>;
@@ -477,6 +489,22 @@ export function applyChatRenderEvent(
         source,
         label: rawEventLabel(source, p?.payload),
         payload: p?.payload,
+      });
+      return;
+    }
+    case "provider_switch": {
+      const p = payload as {
+        fromProvider?: string | null;
+        fromModel?: string | null;
+        toProvider?: string;
+        toModel?: string;
+      } | null;
+      chunks.push({
+        kind: "provider_switch",
+        fromProvider: p?.fromProvider ?? null,
+        fromModel: p?.fromModel ?? null,
+        toProvider: p?.toProvider ?? "",
+        toModel: p?.toModel ?? "",
       });
       return;
     }
