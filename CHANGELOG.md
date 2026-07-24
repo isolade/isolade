@@ -6,6 +6,8 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+## [0.3.1] - 2026-07-24
+
 ### Added
 
 - Claude Opus 5 is now available in the model picker and is the default Claude
