@@ -749,6 +749,64 @@ test.describe("message renderer browser gate", () => {
       .toBeLessThanOrEqual(1);
   });
 
+  test("keeps the composer tall enough as its available space changes", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await openProductionHarness(page, 1, { messages: 0 });
+
+    const textarea = page.getByPlaceholder("Message... (Enter to send, Shift+Enter for newline)");
+    await textarea.fill(
+      "A multiline composer draft should remain fully visible when its panel becomes narrower. ".repeat(
+        5,
+      ),
+    );
+    const wideHeight = await textarea.evaluate((element) => element.clientHeight);
+
+    await page.setViewportSize({ width: 520, height: 720 });
+    await expect
+      .poll(() => textarea.evaluate((element) => element.clientHeight >= element.scrollHeight))
+      .toBe(true);
+    const narrowSize = await textarea.evaluate((element) => ({
+      clientHeight: element.clientHeight,
+      scrollHeight: element.scrollHeight,
+    }));
+    expect(narrowSize.clientHeight).toBeGreaterThan(wideHeight);
+    expect(narrowSize.clientHeight).toBeGreaterThanOrEqual(narrowSize.scrollHeight);
+
+    // Even a viewport shorter than one rendered line must not make the
+    // textarea itself clip that line.
+    await page.setViewportSize({ width: 520, height: 40 });
+    await textarea.evaluate((element) => {
+      const setValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+      setValue?.call(element, "One line");
+      element.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await expect
+      .poll(() =>
+        textarea.evaluate((element) => {
+          const styles = window.getComputedStyle(element);
+          const firstLineHeight = Math.ceil(
+            Number.parseFloat(styles.lineHeight) +
+              Number.parseFloat(styles.paddingTop) +
+              Number.parseFloat(styles.paddingBottom),
+          );
+          return element.clientHeight >= firstLineHeight;
+        }),
+      )
+      .toBe(true);
+    const oneLineSize = await textarea.evaluate((element) => {
+      const styles = window.getComputedStyle(element);
+      return {
+        clientHeight: element.clientHeight,
+        firstLineHeight: Math.ceil(
+          Number.parseFloat(styles.lineHeight) +
+            Number.parseFloat(styles.paddingTop) +
+            Number.parseFloat(styles.paddingBottom),
+        ),
+      };
+    });
+    expect(oneLineSize.clientHeight).toBeGreaterThanOrEqual(oneLineSize.firstLineHeight);
+  });
+
   test("keeps a panel's only tab when it is dragged within its own strip", async ({ page }) => {
     await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
       if (route.request().method() === "PATCH") {

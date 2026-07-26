@@ -1,5 +1,5 @@
 import { ArrowUp, Paperclip, Square } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useLayoutEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -30,6 +30,28 @@ interface MessageBoxProps {
   className?: string;
 }
 
+function resizeTextarea(el: HTMLTextAreaElement) {
+  const styles = window.getComputedStyle(el);
+  const lineHeight = Number.parseFloat(styles.lineHeight);
+  const fontSize = Number.parseFloat(styles.fontSize);
+  const renderedLineHeight = Number.isFinite(lineHeight)
+    ? lineHeight
+    : (Number.isFinite(fontSize) ? fontSize : 16) * 1.2;
+  const verticalPadding =
+    Number.parseFloat(styles.paddingTop) + Number.parseFloat(styles.paddingBottom);
+  const verticalBorder =
+    Number.parseFloat(styles.borderTopWidth) + Number.parseFloat(styles.borderBottomWidth);
+  const firstLineHeight = renderedLineHeight + verticalPadding + verticalBorder;
+  const maxHeight = Math.max(firstLineHeight, Math.min(window.innerHeight * 0.6, 640));
+
+  // scrollHeight is the natural content height at the textarea's current
+  // width. It includes padding but excludes borders, while the inline height
+  // uses the app-wide border-box sizing.
+  el.style.height = "0px";
+  const contentHeight = el.scrollHeight + verticalBorder;
+  el.style.height = `${Math.ceil(Math.max(firstLineHeight, Math.min(contentHeight, maxHeight)))}px`;
+}
+
 // The composer is a single column: the textarea on top, an optional attachment
 // preview strip, then a control row with the attach button on the left and the
 // model picker + send button on the right. (It used to collapse onto one line
@@ -54,16 +76,54 @@ export function MessageBox({
 }: MessageBoxProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  useEffect(() => {
+  // Size before paint so drafts never flash at the previous value's height.
+  useLayoutEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
-    // Manual auto-grow: reset to 0 to read the natural scrollHeight at the
-    // current width, then clamp to a sane max. `field-sizing: content` would
-    // be neater but browsers (Safari notably) ignore max-height when it's on.
-    const maxHeight = Math.min(window.innerHeight * 0.6, 640);
-    el.style.height = "0px";
-    el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`;
+    resizeTextarea(el);
   }, [value]);
+
+  useLayoutEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+
+    // Wrapping changes when a docked panel is resized even if the draft does
+    // not. Observe the border-box width only, avoiding a feedback cycle when
+    // resizeTextarea changes the element's height.
+    let width = el.offsetWidth;
+    let resizeFrame: number | null = null;
+    const observer = new ResizeObserver(() => {
+      const nextWidth = el.offsetWidth;
+      if (nextWidth === width) return;
+      width = nextWidth;
+      if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
+      // ResizeObserver runs before paint. Mutating the observed element in its
+      // callback can leave a second notification undelivered, so resize on the
+      // next frame instead.
+      resizeFrame = requestAnimationFrame(() => {
+        resizeFrame = null;
+        resizeTextarea(el);
+      });
+    });
+    observer.observe(el);
+
+    const resizeForViewport = () => resizeTextarea(el);
+    window.addEventListener("resize", resizeForViewport);
+
+    // A late font load can alter both line height and wrapping without changing
+    // the textarea's border-box.
+    let active = true;
+    void document.fonts?.ready.then(() => {
+      if (active) resizeTextarea(el);
+    });
+
+    return () => {
+      active = false;
+      observer.disconnect();
+      if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
+      window.removeEventListener("resize", resizeForViewport);
+    };
+  }, []);
 
   // While a turn is active, Send adds to the durable queue. Stop remains a
   // separate control beside it.
