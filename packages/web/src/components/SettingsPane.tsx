@@ -469,7 +469,7 @@ export default function SettingsPane({
                       aria-pressed={selected}
                       onClick={() => chooseTheme(theme.id)}
                       className={cn(
-                        "flex items-center gap-3 rounded-lg border p-3 text-left transition-colors outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50",
+                        "flex items-center gap-3 rounded-lg border p-3 text-left outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50",
                         selected
                           ? "border-primary ring-2 ring-ring/40"
                           : "border-border hover:bg-accent/40",

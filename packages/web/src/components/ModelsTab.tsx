@@ -137,7 +137,7 @@ export default function ModelsTab({ activeProfileId, chatModels }: ModelsTabProp
                           disabled={!activeProfileId}
                           onClick={() => chooseTier(model.id, t.value)}
                           className={cn(
-                            "rounded px-2 py-1 text-xs transition-colors outline-none disabled:opacity-50",
+                            "rounded px-2 py-1 text-xs outline-none disabled:opacity-50",
                             selected
                               ? "bg-foreground text-background"
                               : "text-muted-foreground hover:text-foreground hover:bg-muted/50",

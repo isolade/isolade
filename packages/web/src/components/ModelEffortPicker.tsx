@@ -134,7 +134,7 @@ export function ModelEffortPicker({
                         )}
                         <span
                           className={cn(
-                            "relative z-10 size-2.5 rounded-full border transition-colors",
+                            "relative z-10 size-2.5 rounded-full border",
                             selected
                               ? "border-foreground bg-foreground"
                               : "border-muted-foreground/50 bg-background group-hover:border-foreground",
@@ -143,7 +143,7 @@ export function ModelEffortPicker({
                       </div>
                       <span
                         className={cn(
-                          "text-[10px] leading-none whitespace-nowrap transition-colors",
+                          "text-[10px] leading-none whitespace-nowrap",
                           selected
                             ? "font-medium text-foreground"
                             : "text-muted-foreground group-hover:text-foreground",

@@ -6,6 +6,11 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+### Changed
+
+- Interactive controls, dialogs, menus, and popovers now respond immediately
+  instead of fading, sliding, or easing between states.
+
 ## [0.3.1] - 2026-07-24
 
 ### Added

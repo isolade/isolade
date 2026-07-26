@@ -16,15 +16,11 @@ import { cn } from "./utils";
 // that appear verbatim in source (it can't see runtime-built strings), so the
 // `data-[state=…]:` variants have to be written out as literals. Hence two thin
 // adapters over one set of tokens rather than one string.
-// `transition-none`: the rows snap on hover/active rather than fading. The
-// plain-button rows have no transition anyway, but the Radix TabsTrigger base
-// carries `transition-all`, so this is what cancels the hover-fade there and
-// keeps both surfaces instant.
 // `select-none`: these are nav rows, not prose, so the label isn't selectable
 // text. Without it, right-clicking a row (to open its context menu) leaves the
 // browser's default word selection behind on the title.
 const SIDEBAR_ROW_LAYOUT =
-  "w-full flex items-center gap-1.5 rounded px-2 py-1 text-sm text-left transition-none select-none";
+  "w-full flex items-center gap-1.5 rounded px-2 py-1 text-sm text-left select-none";
 const SIDEBAR_ROW_ACTIVE = "bg-accent text-accent-foreground";
 const SIDEBAR_ROW_IDLE = "text-foreground hover:bg-accent/40";
 

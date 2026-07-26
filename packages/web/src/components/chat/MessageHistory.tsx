@@ -220,7 +220,7 @@ function VersionPager({
         data-disabled-at-rest={index <= 1 ? "true" : "false"}
         disabled={actionsDisabled || index <= 1}
         onClick={() => onNavigate(-1)}
-        className="flex h-6 w-6 items-center justify-center rounded transition-colors hover:text-foreground disabled:opacity-40 disabled:hover:text-muted-foreground"
+        className="flex h-6 w-6 items-center justify-center rounded hover:text-foreground disabled:opacity-40 disabled:hover:text-muted-foreground"
       >
         <ChevronLeft className="h-4.5 w-4.5" />
       </button>
@@ -233,7 +233,7 @@ function VersionPager({
         data-disabled-at-rest={index >= count ? "true" : "false"}
         disabled={actionsDisabled || index >= count}
         onClick={() => onNavigate(1)}
-        className="flex h-6 w-6 items-center justify-center rounded transition-colors hover:text-foreground disabled:opacity-40 disabled:hover:text-muted-foreground"
+        className="flex h-6 w-6 items-center justify-center rounded hover:text-foreground disabled:opacity-40 disabled:hover:text-muted-foreground"
       >
         <ChevronRight className="h-4.5 w-4.5" />
       </button>
@@ -338,7 +338,7 @@ export const MessageRow = memo(function MessageRow({
                   data-disabled-at-rest="false"
                   disabled={actionsDisabled}
                   onClick={() => onStartEdit(message.id)}
-                  className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100 disabled:pointer-events-none disabled:opacity-0"
+                  className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground opacity-0 hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100 disabled:pointer-events-none disabled:opacity-0"
                 >
                   <Pencil className="h-3.5 w-3.5" />
                 </button>
