@@ -54,6 +54,7 @@ interface Turn {
 export interface StartTurnOptions {
   chatId: string;
   messageId: string;
+  initialChunks?: ChatRenderChunk[];
   // Called once with the producer api. The promise resolves on success,
   // rejects on producer error. The producer should not catch its own
   // errors and turn them into events. Let them propagate and the hub
@@ -119,6 +120,9 @@ const DEFAULT_EVICTION_MS = 5 * 60_000;
 // from memory. Resume requests fall back to DB replay only.
 export class ChatStreamHub {
   private turns = new Map<string, Turn>();
+  private settleListeners = new Set<
+    (turn: { chatId: string; messageId: string; status: "done" | "error" }) => void
+  >();
   private readonly idleCancelMs: number;
   private readonly evictionMs: number;
 
@@ -165,6 +169,13 @@ export class ChatStreamHub {
     return null;
   }
 
+  onSettled(
+    listener: (turn: { chatId: string; messageId: string; status: "done" | "error" }) => void,
+  ): () => void {
+    this.settleListeners.add(listener);
+    return () => this.settleListeners.delete(listener);
+  }
+
   // The set of instance ids with at least one assistant turn streaming right
   // now. Drives the sidebar's per-instance "working" indicator. Settled turns
   // lingering in memory for reconnect-tailing are excluded, so only `running`.
@@ -208,6 +219,16 @@ export class ChatStreamHub {
       publish: (type, payload) => this.publish(turn, type, payload),
       renderChunks: () => turn.renderChunks.map((chunk) => ({ ...chunk })),
     };
+
+    if (opts.initialChunks && opts.initialChunks.length > 0) {
+      try {
+        this.publish(turn, "render_seed", opts.initialChunks);
+      } catch (error) {
+        turn.discarded = true;
+        this.turns.delete(turn.messageId);
+        throw error;
+      }
+    }
 
     // Kick off the producer. We deliberately don't await, since subscribers
     // attach before the producer makes any progress.
@@ -275,6 +296,15 @@ export class ChatStreamHub {
     const turn = this.turns.get(messageId);
     if (!turn || turn.chatId !== chatId) return null;
     return this.snapshot(turn, includeDebug);
+  }
+
+  // Publish an event from a coordinator that sits outside the turn producer.
+  // Steering acknowledgements arrive through a separate request path, but
+  // still belong at their exact position in this turn's durable event stream.
+  publishToTurn(chatId: string, messageId: string, type: string, payload: unknown): number | null {
+    const turn = this.turns.get(messageId);
+    if (!turn || turn.chatId !== chatId || turn.status !== "running") return null;
+    return this.publish(turn, type, payload);
   }
 
   private snapshot(turn: Turn, includeDebug: boolean): TurnRenderSnapshot {
@@ -412,6 +442,17 @@ export class ChatStreamHub {
       }
     }
     this.clearGraceTimer(turn);
+    for (const listener of this.settleListeners) {
+      try {
+        listener({
+          chatId: turn.chatId,
+          messageId: turn.messageId,
+          status: signal.kind === "done" ? "done" : "error",
+        });
+      } catch (err) {
+        console.warn("[stream-hub] settle listener threw:", err);
+      }
+    }
     // Keep the turn around for a bit so a delayed reconnect can still
     // tail the in-memory replay rather than re-reading the DB.
     turn.evictionTimer = setTimeout(() => this.evictNow(turn), this.evictionMs);

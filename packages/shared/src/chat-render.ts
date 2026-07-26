@@ -1,5 +1,11 @@
 import { z } from "zod";
-import { chatMessageSchema, chatSchema, transcriptMessageSchema } from "./domain";
+import {
+  chatMessageSchema,
+  chatSchema,
+  queuedMessageSchema,
+  transcriptMessageSchema,
+  uploadSchema,
+} from "./domain";
 
 export const tokenUsageSchema = z.object({
   inputTokens: z.number(),
@@ -48,6 +54,18 @@ export const chatRenderChunkSchema = z.discriminatedUnion("kind", [
     error: z.string().nullable(),
   }),
   z.object({
+    kind: z.literal("user_message"),
+    id: z.string(),
+    content: z.string(),
+    uploads: z.array(uploadSchema).optional(),
+    deliveryStatus: z.enum(["sending", "confirmed", "unknown", "rejected"]).optional(),
+    capabilities: z.object({ edit: z.boolean().optional() }).optional(),
+  }),
+  z.object({
+    kind: z.literal("interruption"),
+    id: z.string(),
+  }),
+  z.object({
     kind: z.literal("raw"),
     source: z.enum(["claude", "codex"]),
     label: z.string(),
@@ -81,6 +99,7 @@ export const chatViewPageSchema = z.object({
   hasMore: z.boolean(),
   chunksByMessage: z.record(z.string(), z.array(chatRenderChunkSchema)),
   inFlight: inFlightChatRenderSchema,
+  queuedMessages: z.array(queuedMessageSchema).default([]),
 });
 export type ChatViewPage = z.infer<typeof chatViewPageSchema>;
 
@@ -187,6 +206,16 @@ export function applyChatRenderEvent(
   payload: unknown,
 ): void {
   switch (type) {
+    case "render_seed": {
+      const parsed = z.array(chatRenderChunkSchema).safeParse(payload);
+      if (!parsed.success) return;
+      chunks.push(...parsed.data);
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        if (chunk?.kind === "tool") toolIndex.set(chunk.id, i);
+      }
+      return;
+    }
     case "delta": {
       const text = typeof payload === "string" ? payload : String(payload ?? "");
       const last = chunks[chunks.length - 1];
@@ -375,6 +404,69 @@ export function applyChatRenderEvent(
       const last = chunks[chunks.length - 1];
       if (last?.kind === "api_retry") chunks[chunks.length - 1] = next;
       else chunks.push(next);
+      return;
+    }
+    case "steered_user_message": {
+      const p = payload as {
+        id?: string;
+        content?: string;
+        uploads?: z.infer<typeof uploadSchema>[];
+        deliveryStatus?: "sending" | "confirmed" | "unknown" | "rejected";
+        capabilities?: { edit?: boolean };
+      } | null;
+      if (!p?.id) return;
+      const index = chunks.findIndex((chunk) => chunk.kind === "user_message" && chunk.id === p.id);
+      if (index >= 0) {
+        const current = chunks[index];
+        if (current?.kind === "user_message") {
+          const next = {
+            ...current,
+            content: p.content ?? current.content,
+            ...(p.uploads?.length ? { uploads: p.uploads } : {}),
+            deliveryStatus: p.deliveryStatus ?? "confirmed",
+            ...(p.capabilities?.edit ? { capabilities: { edit: true } } : {}),
+          };
+          const interruption = chunks[index - 1];
+          if (
+            p.deliveryStatus === "confirmed" &&
+            !(interruption?.kind === "interruption" && interruption.id === p.id)
+          ) {
+            chunks.splice(index, 1);
+            chunks.push(next);
+          } else {
+            chunks[index] = next;
+          }
+        }
+        return;
+      }
+      chunks.push({
+        kind: "user_message",
+        id: p.id,
+        content: p.content ?? "",
+        ...(p.uploads?.length ? { uploads: p.uploads } : {}),
+        deliveryStatus: p.deliveryStatus ?? "confirmed",
+        ...(p.capabilities?.edit ? { capabilities: { edit: true } } : {}),
+      });
+      return;
+    }
+    case "turn_interrupted": {
+      const p = payload as { id?: string } | null;
+      if (!p?.id) return;
+      const index = chunks.findIndex((chunk) => chunk.kind === "interruption" && chunk.id === p.id);
+      if (index < 0) {
+        chunks.push({ kind: "interruption", id: p.id });
+        return;
+      }
+      const marker = chunks[index];
+      const userIndex = chunks.findIndex(
+        (chunk) => chunk.kind === "user_message" && chunk.id === p.id,
+      );
+      const user = userIndex >= 0 ? chunks[userIndex] : undefined;
+      for (const removeIndex of [index, userIndex].toSorted((a, b) => b - a)) {
+        if (removeIndex >= 0) chunks.splice(removeIndex, 1);
+      }
+      if (marker?.kind === "interruption") chunks.push(marker);
+      if (user?.kind === "user_message") chunks.push(user);
       return;
     }
     case "raw": {

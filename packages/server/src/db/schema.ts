@@ -259,10 +259,50 @@ export const chatMessages = sqliteTable("chat_messages", {
   // the nearest ancestor that has both.
   sessionId: text("session_id"),
   anchorId: text("anchor_id"),
+  // User-message delivery is only confirmed once the provider echoes the
+  // stable client id. Assistant rows keep these null.
+  deliveryStatus: text("delivery_status", {
+    enum: ["sending", "confirmed", "unknown", "rejected"],
+  }),
+  deliveryError: text("delivery_error"),
   createdAt: integer("created_at", { mode: "timestamp" })
     .notNull()
     .$defaultFn(() => new Date()),
 });
+
+// Durable outbox for messages composed while a turn is active. "later"
+// entries are promoted into chat_messages using the same id. "next" and
+// Claude-native "now" entries are delivered into the active provider turn and
+// retained as an audit record after confirmation.
+export const queuedMessages = sqliteTable(
+  "queued_messages",
+  {
+    id: text("id").primaryKey(),
+    chatId: text("chat_id").notNull(),
+    content: text("content").notNull(),
+    mode: text("mode", { enum: ["later", "next", "now"] })
+      .notNull()
+      .default("later"),
+    status: text("status", {
+      enum: ["queued", "steering", "interrupting", "unknown", "rejected", "delivered"],
+    })
+      .notNull()
+      .default("queued"),
+    targetMessageId: text("target_message_id"),
+    // Claude-only checkpoint immediately before this in-turn message. When
+    // both fields are present the message can be edited by forking there.
+    editSessionId: text("edit_session_id"),
+    editAnchorId: text("edit_anchor_id"),
+    error: text("error"),
+    createdAt: integer("created_at", { mode: "timestamp" })
+      .notNull()
+      .$defaultFn(() => new Date()),
+    updatedAt: integer("updated_at", { mode: "timestamp" })
+      .notNull()
+      .$defaultFn(() => new Date()),
+  },
+  (t) => [index("idx_queued_messages_chat").on(t.chatId, t.status, t.createdAt)],
+);
 
 // Files attached to a user message (browser upload or clipboard paste). The
 // bytes live on the host under stateDir()/uploads/<instanceId>/<id>/<filename>
@@ -432,6 +472,8 @@ export type Chat = typeof chats.$inferSelect;
 export type NewChat = typeof chats.$inferInsert;
 export type ChatMessage = typeof chatMessages.$inferSelect;
 export type NewChatMessage = typeof chatMessages.$inferInsert;
+export type QueuedMessage = typeof queuedMessages.$inferSelect;
+export type NewQueuedMessage = typeof queuedMessages.$inferInsert;
 export type ChatEvent = typeof chatEvents.$inferSelect;
 export type NewChatEvent = typeof chatEvents.$inferInsert;
 export type UploadRow = typeof uploads.$inferSelect;

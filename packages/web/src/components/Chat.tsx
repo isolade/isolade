@@ -12,11 +12,14 @@ import {
 } from "react";
 import {
   API_BASE,
+  dispatchQueuedChatMessage,
+  enqueueChatMessage,
   getChatContextBreakdown,
   getChatToolDetails,
   getInFlightChatRender,
   listChatRenderChunks,
   listChatTranscript,
+  removeQueuedChatMessage,
   setChatActiveLeaf,
   updateChatModel,
 } from "../lib/api";
@@ -33,6 +36,7 @@ import type {
   Chat as ChatRow,
   ContextBreakdown,
   ModelOverrides,
+  QueuedMessage,
   TranscriptMessage,
   UpdateChatBody,
   Upload,
@@ -71,6 +75,7 @@ import {
   type MessageHistoryPage,
   type SessionMessageRow,
 } from "./chat/MessageHistory";
+import { QueuedMessages, reconcileQueuedMessageSnapshot } from "./chat/QueuedMessages";
 import { ContextBar, ContextBreakdownDetail, ContextDetail } from "./chat/UsagePanel";
 import { MessageBox } from "./MessageBox";
 import { ModelEffortPicker } from "./ModelEffortPicker";
@@ -92,7 +97,7 @@ function chunksFromPage(page: unknown): Record<string, StreamChunk[]> {
 
 function optimisticUserMessage(chatId: string, content: string): TranscriptMessage {
   return {
-    id: `optimistic-${chatId}`,
+    id: crypto.randomUUID(),
     chatId,
     role: "user",
     content,
@@ -179,6 +184,12 @@ function Chat({
     [historyPages, sessionRows],
   );
   const [input, setInput] = useState("");
+  const [queuedMessages, setQueuedMessages] = useState<QueuedMessage[]>([]);
+  const [queueNotice, setQueueNotice] = useState<string | null>(null);
+  // Queue rows appear optimistically before their POST is visible to a
+  // transcript poll. Keep browser-created rows protected from stale snapshots
+  // until they are promoted or explicitly removed.
+  const protectedQueuedIdsRef = useRef(new Set<string>());
   // Staged file attachments for the next send (browser upload / clipboard
   // paste). Uploads run in the background as files are added; sendMessage awaits
   // them for the ids. Scoped to this instance's bind-mounted uploads dir.
@@ -201,6 +212,7 @@ function Chat({
   // The optimistic user bubble of the in-flight turn, replaced by the
   // server's `user_message` frame (which carries the real id + parent).
   const pendingUserIdRef = useRef<string | null>(null);
+  const pendingAssistantVersionRef = useRef<TranscriptMessage["version"]>(null);
   const initialLiveRenderKeyRef = useRef(initialMessage ? `live-${crypto.randomUUID()}` : null);
   const liveRenderKeyRef = useRef<string | null>(initialLiveRenderKeyRef.current);
   const [liveRow, setLiveRow] = useState<{
@@ -682,6 +694,9 @@ function Chat({
           }
         }
         setSessionRows([]);
+        setQueuedMessages((local) =>
+          reconcileQueuedMessageSnapshot(local, page.queuedMessages, protectedQueuedIdsRef.current),
+        );
         setHasOlder(page.hasMore);
         setActiveLeaf(page.messages.at(-1)?.id ?? chatRef.current.activeLeafId ?? null);
         if (transcriptRequests.accepts(generation, ac) && page.inFlight) {
@@ -1241,8 +1256,10 @@ function Chat({
         cancelReveal();
         pendingCommit = null;
         terminalHandled = true;
+        const pendingVersion = pendingAssistantVersionRef.current;
+        pendingAssistantVersionRef.current = null;
         const msg: TranscriptMessage = snapshotState.message
-          ? { ...snapshotState.message, version: null }
+          ? { ...snapshotState.message, version: pendingVersion }
           : {
               id,
               chatId,
@@ -1254,7 +1271,7 @@ function Chat({
               parentId: turnUserIdRef.current ?? activeLeafRef.current ?? tipIdRef.current,
               content,
               createdAt: new Date(),
-              version: null,
+              version: pendingVersion,
             };
         setSessionRows((rows) => {
           // Skip duplicate commits when a resume races with the committed row.
@@ -1410,6 +1427,45 @@ function Chat({
         }
         // Meta events that don't produce chunks but update other UI.
         if (applyMetaEvent(ev.type, ev.payload)) return;
+        if (ev.type === "user_message_confirmed" || ev.type === "user_message_delivery") {
+          const payload = ev.payload as {
+            id?: unknown;
+            status?: unknown;
+            error?: unknown;
+          } | null;
+          const id = payload?.id;
+          if (typeof id !== "string") return;
+          const deliveryStatus =
+            ev.type === "user_message_confirmed"
+              ? "confirmed"
+              : payload?.status === "unknown" || payload?.status === "rejected"
+                ? payload.status
+                : "unknown";
+          const deliveryError = typeof payload?.error === "string" ? payload.error : null;
+          setHistoryPages((pages) =>
+            pages.map((page) => ({
+              ...page,
+              messages: page.messages.map((message) =>
+                message.id === id ? { ...message, deliveryStatus, deliveryError } : message,
+              ),
+            })),
+          );
+          setSessionRows((rows) =>
+            rows.map((row) =>
+              row.message.id === id
+                ? {
+                    ...row,
+                    message: {
+                      ...row.message,
+                      deliveryStatus,
+                      deliveryError,
+                    },
+                  }
+                : row,
+            ),
+          );
+          return;
+        }
         // Chunk-producing events flow through the shared reducer so
         // mount-time replay and live streaming end up with byte-for-
         // byte identical chunks.
@@ -1423,6 +1479,9 @@ function Chat({
           ev.type === "tool_call_start" ||
           ev.type === "tool_call_input" ||
           ev.type === "tool_call_result" ||
+          ev.type === "steered_user_message" ||
+          ev.type === "turn_interrupted" ||
+          ev.type === "render_seed" ||
           ev.type === "api_retry" ||
           ev.type === "raw"
         ) {
@@ -1535,7 +1594,67 @@ function Chat({
       // `force` bypasses the streaming guard for the bootstrap re-entry where
       // the optimistic state already has `streaming=true` from the useState
       // initializer.
-      if ((streaming || navigatingBranchRef.current) && !force) return;
+      if (navigatingBranchRef.current && !force) return;
+
+      if (streaming && !force) {
+        if (
+          currentModel !== appliedModelRef.current ||
+          currentEffort !== appliedEffortRef.current
+        ) {
+          const body: UpdateChatBody = {};
+          if (currentModel !== appliedModelRef.current) body.model = currentModel;
+          if (currentEffort !== appliedEffortRef.current) body.effort = currentEffort;
+          await applyModelChange(body);
+        }
+        const id = crypto.randomUUID();
+        const now = new Date();
+        const optimistic: QueuedMessage = {
+          id,
+          chatId,
+          content,
+          mode: "later",
+          status: "queued",
+          uploads: uploads.length > 0 ? uploads : undefined,
+          targetMessageId: null,
+          error: null,
+          createdAt: now,
+          updatedAt: now,
+        };
+        if (override === undefined) {
+          setInput("");
+          attachments.clear();
+        }
+        protectedQueuedIdsRef.current.add(id);
+        setQueuedMessages((queued) => [...queued, optimistic]);
+        try {
+          const persisted = await enqueueChatMessage(instanceId, chatId, {
+            id,
+            content,
+            uploadIds,
+          });
+          setQueuedMessages((queued) => {
+            const index = queued.findIndex((message) => message.id === id);
+            if (index < 0) return [...queued, persisted];
+            const next = [...queued];
+            next[index] = persisted;
+            return next;
+          });
+        } catch (error) {
+          setQueuedMessages((queued) =>
+            queued.map((message) =>
+              message.id === id
+                ? {
+                    ...message,
+                    status: "rejected",
+                    error: error instanceof Error ? error.message : String(error),
+                    updatedAt: new Date(),
+                  }
+                : message,
+            ),
+          );
+        }
+        return;
+      }
 
       invalidateTranscriptRequests();
 
@@ -1579,6 +1698,8 @@ function Chat({
           // Already uploaded, so previews resolve before the server swaps in
           // the persisted user message.
           uploads: uploads.length > 0 ? uploads : undefined,
+          deliveryStatus: "sending",
+          deliveryError: null,
           createdAt: new Date(),
           version: null,
         };
@@ -1595,6 +1716,7 @@ function Chat({
             instanceId,
             chatId,
             content,
+            userMessageId: optimisticId,
             uploadIds,
             includeDebug: showDebugRef.current,
             onEvent,
@@ -1602,6 +1724,7 @@ function Chat({
           }),
         );
       } finally {
+        pendingAssistantVersionRef.current = null;
         if (abortRef.current === ac) abortRef.current = null;
         if (!detachedControllersRef.current.has(ac)) setStreaming(false);
       }
@@ -1623,6 +1746,112 @@ function Chat({
     ],
   );
 
+  const removeQueued = useCallback(
+    async (id: string) => {
+      const previous = queuedMessages.find((message) => message.id === id);
+      protectedQueuedIdsRef.current.delete(id);
+      setQueuedMessages((queued) => queued.filter((message) => message.id !== id));
+      try {
+        const result = await removeQueuedChatMessage(instanceId, chatId, id);
+        if (!result.removed) {
+          setQueueNotice(
+            result.reason === "already_delivered"
+              ? "That message had already reached Claude and could not be taken back."
+              : "That provider cannot take back a committed steering message.",
+          );
+        }
+      } catch {
+        if (previous) {
+          protectedQueuedIdsRef.current.add(id);
+          setQueuedMessages((queued) => [...queued, previous]);
+        }
+      }
+    },
+    [chatId, instanceId, queuedMessages],
+  );
+
+  useEffect(() => {
+    if (!queueNotice) return;
+    const timer = window.setTimeout(() => setQueueNotice(null), 5_000);
+    return () => window.clearTimeout(timer);
+  }, [queueNotice]);
+
+  const dispatchQueued = useCallback(
+    async (id: string, mode: "next" | "now") => {
+      const immediate =
+        mode === "now" && chat.provider === "anthropic"
+          ? queuedMessages.find((message) => message.id === id)
+          : undefined;
+      const updateImmediateDelivery = (status: "sending" | "unknown" | "rejected") => {
+        if (!immediate) return;
+        applyEvent(liveChunksRef.current, liveToolIndexRef.current, "steered_user_message", {
+          id: immediate.id,
+          content: immediate.content,
+          uploads: immediate.uploads,
+          deliveryStatus: status,
+        });
+        setLiveRow((row) => (row ? { ...row, chunks: [...liveChunksRef.current] } : row));
+        scrollToBottom();
+      };
+
+      if (immediate) {
+        protectedQueuedIdsRef.current.delete(id);
+        applyEvent(liveChunksRef.current, liveToolIndexRef.current, "turn_interrupted", {
+          id,
+        });
+        updateImmediateDelivery("sending");
+        setQueuedMessages((queued) => queued.filter((message) => message.id !== id));
+      } else {
+        setQueuedMessages((queued) =>
+          queued.map((message) =>
+            message.id === id
+              ? {
+                  ...message,
+                  mode,
+                  status: mode === "now" ? "interrupting" : "steering",
+                  updatedAt: new Date(),
+                }
+              : message,
+          ),
+        );
+      }
+      try {
+        const updated = await dispatchQueuedChatMessage(instanceId, chatId, id, mode);
+        if (updated.status === "delivered") protectedQueuedIdsRef.current.delete(id);
+        if (immediate) {
+          if (updated.status === "unknown" || updated.status === "rejected") {
+            updateImmediateDelivery(updated.status);
+          }
+          return;
+        }
+        setQueuedMessages((queued) => {
+          if (updated.status === "delivered") {
+            return queued.filter((message) => message.id !== id);
+          }
+          return queued.map((message) => (message.id === id ? updated : message));
+        });
+      } catch (error) {
+        if (immediate) {
+          updateImmediateDelivery("unknown");
+          return;
+        }
+        setQueuedMessages((queued) =>
+          queued.map((message) =>
+            message.id === id
+              ? {
+                  ...message,
+                  status: "unknown",
+                  error: error instanceof Error ? error.message : String(error),
+                  updatedAt: new Date(),
+                }
+              : message,
+          ),
+        );
+      }
+    },
+    [chat.provider, chatId, instanceId, queuedMessages, scrollToBottom],
+  );
+
   // Pull image (and any file) blobs out of a paste and stage them as
   // attachments. Only prevents the default paste when there's actually a file,
   // so pasting text still works normally.
@@ -1637,6 +1866,141 @@ function Chat({
       attachments.add(files);
     },
     [attachments],
+  );
+
+  const sendInTurnEdit = useCallback(
+    async (messageId: string, content: string, uploads: Upload[]) => {
+      const trimmed = content.trim();
+      if ((!trimmed && uploads.length === 0) || streamingRef.current) return;
+
+      const currentMessages = messagesRef.current;
+      let sourceIndex = -1;
+      let source: TranscriptMessage | undefined;
+      let sourceChunks: StreamChunk[] | undefined;
+      for (let i = 0; i < currentMessages.length; i++) {
+        const candidate = currentMessages[i];
+        if (candidate?.role !== "assistant") continue;
+        const chunks =
+          historyPagesRef.current.find((page) => page.messages.some((m) => m.id === candidate.id))
+            ?.chunksByMessage[candidate.id] ??
+          sessionRowsRef.current.find((row) => row.message.id === candidate.id)?.chunks;
+        if (chunks?.some((chunk) => chunk.kind === "user_message" && chunk.id === messageId)) {
+          sourceIndex = i;
+          source = candidate;
+          sourceChunks = chunks;
+          break;
+        }
+      }
+      if (!source || !sourceChunks || sourceIndex < 0) return;
+      const chunkIndex = sourceChunks.findIndex(
+        (chunk) => chunk.kind === "user_message" && chunk.id === messageId,
+      );
+      if (chunkIndex < 0) return;
+
+      invalidateTranscriptRequests();
+      resetChunkCache();
+      setEditingId(null);
+      setStreaming(true);
+      liveLastSeqRef.current = -1;
+      turnUserIdRef.current = null;
+
+      if (currentModel !== appliedModelRef.current || currentEffort !== appliedEffortRef.current) {
+        const body: UpdateChatBody = {};
+        if (currentModel !== appliedModelRef.current) body.model = currentModel;
+        if (currentEffort !== appliedEffortRef.current) body.effort = currentEffort;
+        await applyModelChange(body);
+      }
+
+      const replacementId = crypto.randomUUID();
+      const prefix = sourceChunks.slice(0, chunkIndex);
+      const interruption = prefix.at(-1);
+      if (interruption?.kind === "interruption" && interruption.id === messageId) {
+        prefix[prefix.length - 1] = { ...interruption, id: replacementId };
+      }
+      prefix.push({
+        kind: "user_message",
+        id: replacementId,
+        content: trimmed,
+        ...(uploads.length > 0 ? { uploads } : {}),
+        deliveryStatus: "sending",
+        capabilities: { edit: true },
+      });
+      const oldVersion = source.version ?? {
+        index: 1,
+        count: 1,
+        previousId: null,
+        nextId: null,
+      };
+      pendingAssistantVersionRef.current = {
+        index: oldVersion.count + 1,
+        count: oldVersion.count + 1,
+        previousId: source.id,
+        nextId: null,
+      };
+
+      const retainedMessages = currentMessages.slice(0, sourceIndex);
+      pinNextCommitToBottom();
+      setHistoryPages([
+        {
+          key: pageKey(retainedMessages, `in-turn-edit-${messageId}`),
+          messages: retainedMessages,
+          chunksByMessage: Object.assign(
+            {},
+            ...historyPagesRef.current.map((page) => page.chunksByMessage),
+            Object.fromEntries(
+              sessionRowsRef.current.flatMap((row) =>
+                row.chunks ? [[row.message.id, row.chunks]] : [],
+              ),
+            ),
+          ),
+        },
+      ]);
+      setSessionRows([]);
+      const renderKey = `live-${crypto.randomUUID()}`;
+      liveRenderKeyRef.current = renderKey;
+      setLiveRow({
+        renderKey,
+        messageId: null,
+        parentId: source.parentId ?? null,
+        chunks: prefix,
+      });
+      setActiveLeaf(source.parentId ?? null);
+
+      const ac = new AbortController();
+      abortRef.current = ac;
+      try {
+        await drainTurn(ac, prefix, (onEvent) =>
+          runChatTurn({
+            apiBase: API_BASE,
+            instanceId,
+            chatId,
+            content: trimmed,
+            userMessageId: replacementId,
+            uploadIds: uploads.map((upload) => upload.id),
+            editMessageId: messageId,
+            includeDebug: showDebugRef.current,
+            onEvent,
+            signal: ac.signal,
+          }),
+        );
+      } finally {
+        pendingAssistantVersionRef.current = null;
+        if (abortRef.current === ac) abortRef.current = null;
+        if (!detachedControllersRef.current.has(ac)) setStreaming(false);
+      }
+    },
+    [
+      applyModelChange,
+      chatId,
+      currentEffort,
+      currentModel,
+      drainTurn,
+      instanceId,
+      invalidateTranscriptRequests,
+      pinNextCommitToBottom,
+      resetChunkCache,
+      setActiveLeaf,
+    ],
   );
 
   // Edit a user message: renders a sibling version optimistically (the path
@@ -1759,8 +2123,14 @@ function Chat({
   const handleCancelEdit = useCallback(() => setEditingId(null), []);
   const sendEditRef = useRef(sendEdit);
   sendEditRef.current = sendEdit;
+  const sendInTurnEditRef = useRef(sendInTurnEdit);
+  sendInTurnEditRef.current = sendInTurnEdit;
   const handleSubmitEdit = useCallback((id: string, content: string, uploads: Upload[]) => {
-    void sendEditRef.current(id, content, uploads);
+    if (messagesRef.current.some((message) => message.id === id && message.role === "user")) {
+      void sendEditRef.current(id, content, uploads);
+    } else {
+      void sendInTurnEditRef.current(id, content, uploads);
+    }
   }, []);
 
   // Switch branches on the server, then replace the bounded tail page. No
@@ -1899,6 +2269,64 @@ function Chat({
     },
     [chatId, instanceId, drainTurn],
   );
+
+  // Queue promotion is server-driven so it survives a browser disconnect.
+  // While this tab has queued work, reconcile the durable outbox and attach to
+  // any newly-started turn.
+  useEffect(() => {
+    if (pending || queuedMessages.length === 0) return;
+    let cancelled = false;
+    let syncing = false;
+    const sync = async () => {
+      if (syncing) return;
+      syncing = true;
+      try {
+        const page = await listChatTranscript(instanceId, chatId);
+        if (cancelled) return;
+        for (const message of page.messages) {
+          protectedQueuedIdsRef.current.delete(message.id);
+        }
+        const known = new Set(messagesRef.current.map((message) => message.id));
+        const missing = page.messages.filter((message) => !known.has(message.id));
+        const nextTurnStarted =
+          page.inFlight !== null && page.inFlight.messageId !== streamingMessageIdRef.current;
+        // Keep the local queue marker alive until the old stream's terminal
+        // event has committed. Otherwise a very fast automatic promotion can
+        // remove the final queued row and stop this reconciliation loop before
+        // it gets a chance to attach to the new turn.
+        if (streamingRef.current && (nextTurnStarted || missing.length > 0)) return;
+        setQueuedMessages((local) =>
+          reconcileQueuedMessageSnapshot(local, page.queuedMessages, protectedQueuedIdsRef.current),
+        );
+        if (streamingRef.current) return;
+
+        if (missing.length > 0) {
+          setSessionRows((rows) => [
+            ...rows,
+            ...missing.map((message) => ({
+              renderKey: message.id,
+              message,
+              chunks: page.chunksByMessage[message.id] as StreamChunk[] | undefined,
+            })),
+          ]);
+          setActiveLeaf(missing.at(-1)?.id ?? activeLeafRef.current);
+        }
+        if (!page.inFlight) return;
+        streamingRef.current = true;
+        attachResume(page.inFlight.messageId, page.inFlight.lastSeq, page.inFlight.chunks);
+      } catch (error) {
+        if (!cancelled) console.warn(`[chat] queue reconciliation failed (chat=${chatId}):`, error);
+      } finally {
+        syncing = false;
+      }
+    };
+    void sync();
+    const timer = window.setInterval(() => void sync(), 750);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [attachResume, chatId, instanceId, pending, queuedMessages.length, setActiveLeaf]);
 
   useEffect(() => {
     if (!streamingRef.current) return;
@@ -2074,17 +2502,29 @@ function Chat({
               e.target.value = "";
             }}
           />
+          <QueuedMessages
+            messages={queuedMessages}
+            notice={queueNotice}
+            canRetractSteering={chat.provider === "anthropic"}
+            onRemove={(id) => void removeQueued(id)}
+            onDispatch={(id, mode) => void dispatchQueued(id, mode)}
+          />
           <MessageBox
             className="backdrop-blur-md"
             value={input}
             onChange={setInput}
             onSubmit={() => void sendMessage()}
             onStop={() => {
+              const mid = streamingMessageIdRef.current;
+              const interruptionId = mid ?? `local-stop-${crypto.randomUUID()}`;
+              applyEvent(liveChunksRef.current, liveToolIndexRef.current, "turn_interrupted", {
+                id: interruptionId,
+              });
+              setLiveRow((row) => (row ? { ...row, chunks: [...liveChunksRef.current] } : row));
               // Tell the server to abort the producer (the local
               // abort below just tears down our reader. Without the
               // DELETE the server's CLI subprocess would happily run
               // to completion).
-              const mid = streamingMessageIdRef.current;
               if (mid) cancelChatTurn(API_BASE, instanceId, chatId, mid);
               abortRef.current?.abort();
             }}

@@ -146,14 +146,32 @@ export const updateChatBodySchema = z
 // with the created message. At least one of content/uploads must be present,
 // enforced in the route so the error message is specific.
 export const createChatMessageBodySchema = z.object({
+  id: z.string().min(1).optional(),
   content: z.string(),
   uploadIds: z.array(z.string()).optional(),
 });
+
+export const enqueueChatMessageBodySchema = z.object({
+  id: z.string().min(1),
+  content: z.string(),
+  uploadIds: z.array(z.string()).optional(),
+});
+
+export const dispatchQueuedMessageBodySchema = z.object({
+  mode: z.enum(["next", "now"]),
+});
+
+export const removeQueuedMessageResultSchema = z.object({
+  removed: z.boolean(),
+  reason: z.enum(["already_delivered", "not_retractable"]).optional(),
+});
+export type RemoveQueuedMessageResult = z.infer<typeof removeQueuedMessageResultSchema>;
 
 // Edit a user message: inserts a sibling version and recomputes the assistant
 // answer from that point (the response is the same SSE turn stream as a
 // normal send). The original branch stays navigable.
 export const editChatMessageBodySchema = z.object({
+  id: z.string().optional(),
   content: z.string(),
   uploadIds: z.array(z.string()).optional(),
 });

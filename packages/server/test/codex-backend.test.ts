@@ -114,6 +114,85 @@ async function run(script: Array<[string, unknown]>, model = "gpt-5-codex") {
 }
 
 describe("CodexBackend notification parsing", () => {
+  it("passes the stable user id and confirms it from the user item", async () => {
+    const { backend, mgr } = backendWith([
+      [
+        "item/started",
+        {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          item: { type: "userMessage", id: "item-1", clientId: "user-stable", content: [] },
+        },
+      ],
+      ["turn/completed", { turn: { status: "completed" } }],
+    ]);
+    let acknowledged = 0;
+    await backend.sendMessage({
+      vmId: "vm",
+      chatId: "chat",
+      message: "hi",
+      model: "gpt-5-codex",
+      effort: "medium",
+      sessionId: "thread-1",
+      userMessageId: "user-stable",
+      onUserMessageAcknowledged: () => acknowledged++,
+      onDelta: () => {},
+    });
+    expect(mgr.conn.sent.find((request) => request.method === "turn/start")?.params).toMatchObject({
+      clientUserMessageId: "user-stable",
+    });
+    expect(acknowledged).toBe(1);
+  });
+
+  it("ignores an interrupted turn's delayed completion during replacement startup", async () => {
+    const { backend } = backendWith([
+      [
+        "turn/completed",
+        {
+          threadId: "thread-1",
+          turn: { id: "turn-old", status: "interrupted" },
+        },
+      ],
+      [
+        "item/started",
+        {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          item: { type: "userMessage", id: "item-new", clientId: "user-new", content: [] },
+        },
+      ],
+      [
+        "item/agentMessage/delta",
+        { threadId: "thread-1", turnId: "turn-1", delta: "replacement answer" },
+      ],
+      [
+        "turn/completed",
+        {
+          threadId: "thread-1",
+          turn: { id: "turn-1", status: "completed" },
+        },
+      ],
+    ]);
+    let acknowledged = 0;
+    const deltas: string[] = [];
+
+    const result = await backend.sendMessage({
+      vmId: "vm",
+      chatId: "chat",
+      message: "replacement prompt",
+      model: "gpt-5-codex",
+      effort: "medium",
+      sessionId: "thread-1",
+      userMessageId: "user-new",
+      onUserMessageAcknowledged: () => acknowledged++,
+      onDelta: (delta) => deltas.push(delta),
+    });
+
+    expect(acknowledged).toBe(1);
+    expect(deltas).toEqual(["replacement answer"]);
+    expect(result.content).toBe("replacement answer");
+  });
+
   it("starts new chat threads as persistent", async () => {
     const mgr = new FakeCodexManager();
     mgr.conn.script = [["turn/completed", { turn: { status: "completed" } }]];

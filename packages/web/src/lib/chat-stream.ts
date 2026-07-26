@@ -27,6 +27,7 @@ export interface RunChatTurnOptions {
   instanceId: string;
   chatId: string;
   content: string;
+  userMessageId?: string;
   // Ids of files staged via uploadFile() to attach to this message. The server
   // associates them with the created message and cites their paths to the model.
   uploadIds?: string[];
@@ -213,8 +214,8 @@ function decodeSseEvent(ev: SseEvent): ChatTurnEvent | null {
 // Top-level: send a new user message and stream the assistant turn.
 // On recoverable disconnects, reconnect to the resume endpoint with
 // the last seen seq until terminated or retry budget exhausted. Throws
-// only if every attempt fails AND we never got a messageId (i.e. the
-// initial POST itself never made it).
+// only if every attempt fails. With a stable userMessageId, even an initial
+// POST that loses its response can be repeated without creating another turn.
 export async function runChatTurn(opts: RunChatTurnOptions): Promise<void> {
   const maxRetries = opts.maxRetries ?? DEFAULT_MAX_RETRIES;
   const backoffBase = opts.backoffBaseMs ?? DEFAULT_BACKOFF_BASE_MS;
@@ -234,7 +235,11 @@ export async function runChatTurn(opts: RunChatTurnOptions): Promise<void> {
     const resp = await apiFetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: opts.content, uploadIds: opts.uploadIds }),
+      body: JSON.stringify({
+        id: opts.userMessageId,
+        content: opts.content,
+        uploadIds: opts.uploadIds,
+      }),
       signal: opts.signal,
     });
     if (!resp.ok) {
@@ -275,11 +280,10 @@ export async function runChatTurn(opts: RunChatTurnOptions): Promise<void> {
         resp = await resume(messageId);
       }
     } catch (err) {
-      // Couldn't even open the connection. If we have a messageId,
-      // treat this as a recoverable disconnect and back off. Without
-      // one, the initial POST failed, so surface the error to the
-      // caller, nothing to resume.
-      if (messageId === null) throw err;
+      // A stable user id makes the initial POST idempotent too. If the
+      // connection died before message_id arrived, repeat that POST and the
+      // server either starts it once or returns the already-running turn.
+      if (messageId === null && !opts.userMessageId) throw err;
       if (opts.signal.aborted) return;
       failures++;
       await delay(backoffFor(failures, backoffBase, backoffCap), opts.signal);

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Chat, ChatManager } from "../chats";
-import type { Upload, UsageStats } from "../contracts";
+import type { ChatRenderChunk, Upload, UsageStats } from "../contracts";
 import type { ChatMessage } from "../db/schema";
 import type { DiffStatsPoller } from "../diff-stats";
 import type { InstanceManager } from "../instances";
@@ -11,11 +11,13 @@ import type { ChatBackend, UploadAttachment } from "./backend";
 import type { ChatStreamHub } from "./stream-hub";
 import { computeSubscriptionShare } from "./subscription-share";
 
+const DEFAULT_DELIVERY_CONFIRMATION_TIMEOUT_MS = 10_000;
+
 // The bytes are cited to the model by absolute path; this block tells the agent
 // what was attached and where to find it. Claude reads them with its Read tool,
 // and codex uses view_image or the shell. Kept out of the stored message content
 // (like the prelude), so the transcript shows only the user's own text.
-function buildAttachmentsPreamble(uploads: UploadAttachment[]): string {
+export function buildAttachmentsPreamble(uploads: UploadAttachment[]): string {
   const lines = uploads.map((u) => `- ${u.guestPath} (${u.mediaType})`);
   return (
     "<attachments>\n" +
@@ -45,6 +47,7 @@ export interface ChatTurnDeps {
   // than fetched here) so the per-turn `usage` enrichment reuses the same
   // cached numbers /api/usage and the chat list see.
   profileUsageStats: (profileId: string) => Promise<UsageStats>;
+  deliveryConfirmationTimeoutMs?: number;
 }
 
 // Owns the orchestration of a single assistant turn: user-message persistence,
@@ -67,16 +70,29 @@ export class ChatTurnService {
   // is forked at the nearest anchored turn before it, so the model answers
   // with exactly the context that preceded the edited message. The original
   // branch (messages and session) stays intact and navigable.
+  //
+  // `inTurnEdit` uses the same assistant-branch model without inserting a
+  // top-level user row. Its initial render is the source assistant prefix plus
+  // the replacement user chunk, and Claude forks from the acknowledgement
+  // checkpoint immediately before that chunk.
   start(opts: {
     instance: InstanceRecord;
     chat: Chat;
     content: string;
     // Ids of files staged via the upload endpoint to attach to this message.
     uploadIds?: string[];
+    userMessageId?: string;
+    assistantMessageId?: string;
     edit?: ChatMessage;
+    inTurnEdit?: {
+      sourceAssistant: ChatMessage;
+      initialChunks: ChatRenderChunk[];
+      sessionId: string;
+      anchorId: string;
+    };
   }): {
     assistantMessageId: string;
-    userMessage: ChatMessage & { uploads?: Upload[] };
+    userMessage?: ChatMessage & { uploads?: Upload[] };
   } {
     const {
       chatManager,
@@ -90,7 +106,16 @@ export class ChatTurnService {
       codexBackend,
       profileUsageStats,
     } = this.deps;
-    const { instance, chat, content, uploadIds, edit } = opts;
+    const {
+      instance,
+      chat,
+      content,
+      uploadIds,
+      userMessageId,
+      assistantMessageId: requestedAssistantMessageId,
+      edit,
+      inTurnEdit,
+    } = opts;
     const instanceId = instance.id;
     const chatId = chat.id;
 
@@ -101,7 +126,12 @@ export class ChatTurnService {
     let parentId: string | null;
     let sessionId: string | undefined;
     let fork: { anchorId: string } | undefined;
-    if (edit) {
+    if (inTurnEdit) {
+      parentId = inTurnEdit.sourceAssistant.parentId;
+      sessionId = inTurnEdit.sessionId;
+      fork = { anchorId: inTurnEdit.anchorId };
+      chatManager.updateSessionId(chatId, null);
+    } else if (edit) {
       // Legacy turns predate per-message session snapshots, but the chat
       // column knows the ACTIVE branch's session. Stamp it onto the branch's
       // nearest un-snapshotted assistant tip now, before the fork overwrites
@@ -145,8 +175,22 @@ export class ChatTurnService {
     // first SSE event and uses it both as the React key for the
     // streaming bubble and as the lookup key for replayed events on a
     // future reload or reconnect.
-    const assistantMessageId = randomUUID();
-    const userMessage = chatManager.beginTurn(chatId, assistantMessageId, content, parentId);
+    const assistantMessageId = requestedAssistantMessageId ?? randomUUID();
+    const userMessage = inTurnEdit
+      ? ({
+          id: userMessageId ?? randomUUID(),
+          chatId,
+          role: "user",
+          content,
+          parentId,
+          sessionId: null,
+          anchorId: null,
+          deliveryStatus: "sending",
+          deliveryError: null,
+          createdAt: new Date(),
+        } satisfies ChatMessage)
+      : chatManager.beginTurn(chatId, assistantMessageId, content, parentId, userMessageId);
+    if (inTurnEdit) chatManager.beginInFlightTurn(chatId, assistantMessageId);
     instances.touch(instanceId);
 
     // Claim the staged uploads for this message. Their bytes are already in the
@@ -162,17 +206,24 @@ export class ChatTurnService {
     // bubble reconciles with the persisted attachments (id + preview).
     const userMessageWithUploads: ChatMessage & { uploads?: Upload[] } =
       uploads.length > 0 ? { ...userMessage, uploads: uploadRows.map(toUpload) } : userMessage;
+    if (inTurnEdit && uploadRows.length > 0) {
+      const inline = inTurnEdit.initialChunks.find(
+        (chunk) => chunk.kind === "user_message" && chunk.id === userMessage.id,
+      );
+      if (inline?.kind === "user_message") inline.uploads = uploadRows.map(toUpload);
+    }
     // Kick off auto-titling on the first user message of an untitled
     // chat. Runs in parallel with the assistant response. The SSE
     // stream emits a `title` event when it completes so the sidebar
     // can update in place. The title is minted by the chat's own provider
     // CLI inside a VM (see the backends' generateTitle). If that fails we
     // fall back to a truncation of the first message below.
-    const needsTitle = instance.title === null;
+    const needsTitle = !inTurnEdit && instance.title === null;
 
     chatStreamHub.startTurn({
       chatId,
       messageId: assistantMessageId,
+      initialChunks: inTurnEdit?.initialChunks,
       run: async (api) => {
         // One backend for this turn, picked by the chat's own provider, used
         // for both the title and the actual response. Titling through the
@@ -207,7 +258,13 @@ export class ChatTurnService {
             .catch(() => {});
         }
 
-        let assistantContent = "";
+        let assistantContent =
+          inTurnEdit?.initialChunks
+            .filter((chunk): chunk is Extract<ChatRenderChunk, { kind: "text" }> => {
+              return chunk.kind === "text";
+            })
+            .map((chunk) => chunk.text)
+            .join("") ?? "";
         const pendingEventWork = new Set<Promise<void>>();
         const waitForPendingEvents = async () => {
           await Promise.allSettled([...pendingEventWork]);
@@ -217,6 +274,61 @@ export class ChatTurnService {
         // the success and abort paths, so even an interrupted turn stays
         // forkable later.
         const turnMeta: { sessionId?: string; anchorId?: string } = {};
+        let userMessageAcknowledged = false;
+        let deliveryConfirmationTimer: ReturnType<typeof setTimeout> | null = null;
+        const clearDeliveryConfirmationTimer = () => {
+          if (!deliveryConfirmationTimer) return;
+          clearTimeout(deliveryConfirmationTimer);
+          deliveryConfirmationTimer = null;
+        };
+        const confirmUserMessage = () => {
+          if (userMessageAcknowledged) return;
+          userMessageAcknowledged = true;
+          clearDeliveryConfirmationTimer();
+          if (inTurnEdit) {
+            api.publish("steered_user_message", {
+              id: userMessage.id,
+              content,
+              uploads: uploadRows.map(toUpload),
+              deliveryStatus: "confirmed",
+              capabilities: { edit: true },
+            });
+          } else {
+            chatManager.setUserMessageDelivery(userMessage.id, "confirmed");
+            api.publish("user_message_confirmed", { id: userMessage.id });
+          }
+        };
+        const markUserMessageUncertain = (error: string) => {
+          if (userMessageAcknowledged) return;
+          if (inTurnEdit) {
+            api.publish("steered_user_message", {
+              id: userMessage.id,
+              content,
+              uploads: uploadRows.map(toUpload),
+              deliveryStatus: "unknown",
+              capabilities: { edit: true },
+            });
+            return;
+          }
+          const delivery = chatManager.getMessage(userMessage.id);
+          if (!delivery) return;
+          if (delivery.deliveryStatus === "confirmed") return;
+          chatManager.setUserMessageDelivery(userMessage.id, "unknown", error);
+          try {
+            api.publish("user_message_delivery", {
+              id: userMessage.id,
+              status: "unknown",
+              error,
+            });
+          } catch (publishError) {
+            console.warn("[chat] failed to publish user delivery warning", publishError);
+          }
+        };
+        deliveryConfirmationTimer = setTimeout(
+          () => markUserMessageUncertain("the provider did not acknowledge this message in time"),
+          this.deps.deliveryConfirmationTimeoutMs ?? DEFAULT_DELIVERY_CONFIRMATION_TIMEOUT_MS,
+        );
+        deliveryConfirmationTimer.unref?.();
         try {
           // Environment-level prelude: prepended to the first user
           // message of a new chat (no provider session yet) and sent
@@ -245,6 +357,7 @@ export class ChatTurnService {
             model: chat.model,
             effort: chat.effort,
             sessionId,
+            userMessageId: userMessage.id,
             fork,
             signal: api.signal,
             onDelta: (text) => {
@@ -255,6 +368,7 @@ export class ChatTurnService {
               if (meta.sessionId !== undefined) turnMeta.sessionId = meta.sessionId;
               if (meta.anchorId !== undefined) turnMeta.anchorId = meta.anchorId;
             },
+            onUserMessageAcknowledged: confirmUserMessage,
             onEvent: (event) => {
               // Persist the full usage snapshot onto the chat row so
               // the next mount of the chat UI can rehydrate UsageState
@@ -308,18 +422,31 @@ export class ChatTurnService {
               }
             },
           });
+          // Successful completion is itself definitive evidence that the
+          // provider accepted the user input, even if an older provider
+          // version omitted or raced the explicit acknowledgement event.
+          confirmUserMessage();
           assistantContent = result.content || assistantContent;
           await waitForPendingEvents();
+          const renderChunks = api.renderChunks();
+          const persistedContent = inTurnEdit
+            ? renderChunks
+                .filter((chunk): chunk is Extract<ChatRenderChunk, { kind: "text" }> => {
+                  return chunk.kind === "text";
+                })
+                .map((chunk) => chunk.text)
+                .join("")
+            : assistantContent;
           chatManager.finalizeTurn(
             chatId,
             assistantMessageId,
-            assistantContent,
+            persistedContent,
             {
-              parentId: userMessage.id,
+              parentId: inTurnEdit ? inTurnEdit.sourceAssistant.parentId : userMessage.id,
               sessionId: turnMeta.sessionId ?? result.sessionId ?? null,
               anchorId: turnMeta.anchorId ?? null,
             },
-            api.renderChunks(),
+            renderChunks,
           );
           // Turn finished: float the instance up and flag it unread. The client
           // clears the flag immediately if the user is viewing this instance, so
@@ -330,6 +457,7 @@ export class ChatTurnService {
           diffStatsPoller.nudge(instanceId);
           if (titlePromise) await titlePromise.catch(() => {});
         } catch (err) {
+          markUserMessageUncertain(err instanceof Error ? err.message : String(err));
           await waitForPendingEvents();
           // Persist any partial text for both cancellation and provider
           // failures. The live client commits that same partial before showing
@@ -342,7 +470,7 @@ export class ChatTurnService {
                 assistantMessageId,
                 assistantContent,
                 {
-                  parentId: userMessage.id,
+                  parentId: inTurnEdit ? inTurnEdit.sourceAssistant.parentId : userMessage.id,
                   sessionId: turnMeta.sessionId ?? null,
                   anchorId: turnMeta.anchorId ?? null,
                 },
@@ -360,10 +488,15 @@ export class ChatTurnService {
             if (titlePromise) await titlePromise.catch(() => {});
           }
           throw err;
+        } finally {
+          clearDeliveryConfirmationTimer();
         }
       },
     });
 
-    return { assistantMessageId, userMessage: userMessageWithUploads };
+    return {
+      assistantMessageId,
+      ...(inTurnEdit ? {} : { userMessage: userMessageWithUploads }),
+    };
   }
 }

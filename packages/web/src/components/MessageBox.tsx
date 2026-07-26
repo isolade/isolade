@@ -1,4 +1,4 @@
-import { ArrowUp, Loader2, Paperclip, Square } from "lucide-react";
+import { ArrowUp, Paperclip, Square } from "lucide-react";
 import { useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -65,14 +65,9 @@ export function MessageBox({
     el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`;
   }, [value]);
 
-  // `loading` blocks submission but leaves the textarea editable, so the user
-  // can compose the next message while the agent is still streaming. Sending is
-  // allowed with empty text as long as there's at least one attachment.
-  const canSubmit = !disabled && !loading && (value.trim().length > 0 || !!hasAttachments);
-  // While loading, the trailing button swaps from Send → Stop and acts as an
-  // interrupt for the in-flight turn. We only show Stop when the parent
-  // wired an `onStop` handler. Without it the button falls back to a
-  // disabled spinner the way it always behaved.
+  // While a turn is active, Send adds to the durable queue. Stop remains a
+  // separate control beside it.
+  const canSubmit = !disabled && (value.trim().length > 0 || !!hasAttachments);
   const showStop = loading && !!onStop;
 
   const handleSubmit = () => {
@@ -127,7 +122,7 @@ export function MessageBox({
         <div className="ml-auto flex items-center gap-1">
           {leftToolbar}
           {rightToolbar}
-          {showStop ? (
+          {showStop && (
             <Button
               type="button"
               size="icon"
@@ -138,23 +133,18 @@ export function MessageBox({
             >
               <Square className="size-3 fill-current" />
             </Button>
-          ) : (
-            <Button
-              type="button"
-              size="icon"
-              variant="default"
-              className="size-8 rounded-full"
-              disabled={!canSubmit}
-              onClick={handleSubmit}
-              aria-label="Send"
-            >
-              {loading ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : (
-                <ArrowUp className="size-4" />
-              )}
-            </Button>
           )}
+          <Button
+            type="button"
+            size="icon"
+            variant="default"
+            className="size-8 rounded-full"
+            disabled={!canSubmit}
+            onClick={handleSubmit}
+            aria-label={loading ? "Queue message" : "Send"}
+          >
+            <ArrowUp className="size-4" />
+          </Button>
         </div>
       </div>
     </div>

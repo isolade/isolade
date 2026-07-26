@@ -62,8 +62,12 @@ import {
   profileSummarySchema,
   promptConfigSchema,
   providerAuthStatusSchema,
+  type QueuedMessage,
+  queuedMessageSchema,
+  type RemoveQueuedMessageResult,
   type ResourceStats,
   type RuntimeConfig,
+  removeQueuedMessageResultSchema,
   renameFileBodySchema,
   renameProfileBodySchema,
   resourceStatsSchema,
@@ -973,6 +977,53 @@ export async function listChatTranscript(
       signal: options.signal,
     }),
     chatViewPageSchema,
+  );
+}
+
+export async function enqueueChatMessage(
+  instanceId: string,
+  chatId: string,
+  body: { id: string; content: string; uploadIds?: string[] },
+): Promise<QueuedMessage> {
+  return parseResponse(
+    await apiFetch(`${API_BASE}/api/instances/${instanceId}/chats/${chatId}/queue`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+    queuedMessageSchema,
+  );
+}
+
+export async function removeQueuedChatMessage(
+  instanceId: string,
+  chatId: string,
+  messageId: string,
+): Promise<RemoveQueuedMessageResult> {
+  return parseResponse(
+    await apiFetch(`${API_BASE}/api/instances/${instanceId}/chats/${chatId}/queue/${messageId}`, {
+      method: "DELETE",
+    }),
+    removeQueuedMessageResultSchema,
+  );
+}
+
+export async function dispatchQueuedChatMessage(
+  instanceId: string,
+  chatId: string,
+  messageId: string,
+  mode: "next" | "now",
+): Promise<QueuedMessage> {
+  return parseResponse(
+    await apiFetch(
+      `${API_BASE}/api/instances/${instanceId}/chats/${chatId}/queue/${messageId}/dispatch`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      },
+    ),
+    queuedMessageSchema,
   );
 }
 

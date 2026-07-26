@@ -6,6 +6,7 @@ import { cors } from "hono/cors";
 import { ZodError } from "zod";
 import { AuthLoginManager } from "./auth-login";
 import type { ChatBackend } from "./chat/backend";
+import { ChatQueueService } from "./chat/chat-queue-service";
 import { ChatTurnService } from "./chat/chat-turn-service";
 import { ClaudeBackend } from "./chat/claude-backend";
 import { CodexBackend } from "./chat/codex-backend";
@@ -174,6 +175,9 @@ export interface CreateAppOptions {
   // disabled so proxied, tokenless requests still work. This is the browser dev
   // flow (scripts/dev.sh), where Vite proxies /api to a loopback-only server.
   authToken?: string;
+  // Test seam for the provider acknowledgement watchdog. Production uses the
+  // ChatTurnService default.
+  deliveryConfirmationTimeoutMs?: number;
 }
 
 export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
@@ -522,6 +526,16 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
     claudeBackend,
     codexBackend,
     profileUsageStats: (profileId: string) => profileUsageStats(profileId),
+    deliveryConfirmationTimeoutMs: opts.deliveryConfirmationTimeoutMs,
+  });
+  const chatQueueService = new ChatQueueService({
+    chatManager,
+    uploadStore,
+    instances,
+    chatStreamHub,
+    chatTurnService,
+    claudeBackend,
+    codexBackend,
   });
 
   // The dependency bundle every per-domain router pulls its slice from.
@@ -544,6 +558,7 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
     prAttachments,
     sandboxClient,
     chatTurnService,
+    chatQueueService,
     realClaudeBackend,
     claudeBackend,
     codexBackend,

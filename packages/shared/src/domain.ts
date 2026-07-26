@@ -310,9 +310,25 @@ export const chatMessageSchema = z.object({
   // attachments and for every assistant message. Optional so older producers
   // still parse.
   uploads: z.array(uploadSchema).optional(),
+  deliveryStatus: z.enum(["sending", "confirmed", "unknown", "rejected"]).nullable().optional(),
+  deliveryError: z.string().nullable().optional(),
   createdAt: dateLikeSchema,
 });
 export const chatMessageArraySchema = z.array(chatMessageSchema);
+
+export const queuedMessageSchema = z.object({
+  id: z.string(),
+  chatId: z.string(),
+  content: z.string(),
+  mode: z.enum(["later", "next", "now"]),
+  status: z.enum(["queued", "steering", "interrupting", "unknown", "rejected", "delivered"]),
+  targetMessageId: z.string().nullable().optional(),
+  error: z.string().nullable().optional(),
+  uploads: z.array(uploadSchema).optional(),
+  createdAt: dateLikeSchema,
+  updatedAt: dateLikeSchema,
+});
+export const queuedMessageArraySchema = z.array(queuedMessageSchema);
 
 // A bounded page of the active branch used by the high-performance chat
 // renderer. Version metadata is computed server-side from lightweight tree
@@ -556,6 +572,7 @@ export type Terminal = z.infer<typeof terminalSchema>;
 export type Chat = z.infer<typeof chatSchema>;
 export type SubscriptionShare = z.infer<typeof subscriptionShareSchema>;
 export type ChatMessage = z.infer<typeof chatMessageSchema>;
+export type QueuedMessage = z.infer<typeof queuedMessageSchema>;
 export type ChatMessageVersion = z.infer<typeof chatMessageVersionSchema>;
 export type TranscriptMessage = z.infer<typeof transcriptMessageSchema>;
 export type ChatEvent = z.infer<typeof chatEventSchema>;

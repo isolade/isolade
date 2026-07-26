@@ -1704,6 +1704,7 @@ test.describe("message renderer browser gate", () => {
       true,
     );
     await expect(stopped.row).toContainText("stop partial");
+    await expect(stopped.row.getByText("Agent interrupted")).toBeVisible();
   });
 
   test("production turn lifecycle does not remap warm history", async ({ page }) => {

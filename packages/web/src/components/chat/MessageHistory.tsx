@@ -1,4 +1,4 @@
-import { ChevronLeft, ChevronRight, Paperclip, Pencil } from "lucide-react";
+import { ChevronLeft, ChevronRight } from "lucide-react";
 import {
   forwardRef,
   memo,
@@ -9,18 +9,16 @@ import {
   useLayoutEffect,
   useMemo,
   useRef,
-  useState,
 } from "react";
-import { Button } from "@/components/ui/button";
 import type { TranscriptMessage, Upload } from "@/lib/contracts";
 import { RENDER_METRICS_ENABLED, recordRenderMetric } from "@/lib/render-metrics";
-import { useAttachments } from "@/lib/use-attachments";
 import { cn } from "@/lib/utils";
 import StreamingMarkdown from "../StreamingMarkdown";
-import { AttachmentStrip } from "./AttachmentStrip";
 import { StreamView } from "./blocks";
 import type { StreamChunk } from "./chunks";
-import { MessageUploads } from "./MessageUploads";
+import { UserMessage } from "./UserMessage";
+
+const EDITABLE_USER_MESSAGE = { edit: true } as const;
 
 export interface MessageHistoryPage {
   key: string;
@@ -72,132 +70,6 @@ function findFirstVisibleRow(
     [...candidates].find(
       (row) => row.getBoundingClientRect().bottom > viewport.top + preferredOffset,
     ) ?? null
-  );
-}
-
-function UserMessageEditor({
-  initial,
-  initialUploads,
-  instanceId,
-  fontFamily,
-  onCancel,
-  onSubmit,
-}: {
-  initial: string;
-  initialUploads: Upload[];
-  instanceId: string;
-  fontFamily: string;
-  onCancel: () => void;
-  onSubmit: (content: string, uploads: Upload[]) => void;
-}) {
-  const [draft, setDraft] = useState(initial);
-  const [submitting, setSubmitting] = useState(false);
-  const attachments = useAttachments(instanceId, initialUploads);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  useEffect(() => {
-    const element = textareaRef.current;
-    if (!element) return;
-    element.focus();
-    element.setSelectionRange(element.value.length, element.value.length);
-  }, []);
-  useEffect(() => {
-    const element = textareaRef.current;
-    if (!element) return;
-    const maxHeight = Math.min(window.innerHeight * 0.5, 480);
-    element.style.height = "0px";
-    element.style.height = `${Math.min(element.scrollHeight, maxHeight)}px`;
-  }, [draft]);
-
-  const canSubmit =
-    draft.trim().length > 0 || attachments.items.some((item) => item.status !== "error");
-  const submit = async () => {
-    if (!canSubmit || submitting) return;
-    setSubmitting(true);
-    const uploads = await attachments.resolveUploads();
-    if (!draft.trim() && uploads.length === 0) {
-      setSubmitting(false);
-      return;
-    }
-    onSubmit(draft, uploads);
-  };
-  return (
-    <div className="w-full rounded-2xl border border-input bg-secondary px-4 py-2.5">
-      <textarea
-        ref={textareaRef}
-        value={draft}
-        onChange={(event) => setDraft(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Escape") {
-            event.preventDefault();
-            onCancel();
-          } else if (event.key === "Enter" && !event.shiftKey) {
-            event.preventDefault();
-            void submit();
-          }
-        }}
-        onPaste={(event) => {
-          const files = Array.from(event.clipboardData.items)
-            .filter((item) => item.kind === "file")
-            .map((item) => item.getAsFile())
-            .filter((file): file is File => file !== null);
-          if (files.length === 0) return;
-          event.preventDefault();
-          attachments.add(files);
-        }}
-        rows={1}
-        className="w-full resize-none bg-transparent text-sm leading-relaxed text-secondary-foreground outline-none"
-        style={{ fontFamily }}
-      />
-      {attachments.items.length > 0 && (
-        <div className="mt-2">
-          <AttachmentStrip items={attachments.items} onRemove={attachments.remove} />
-        </div>
-      )}
-      <div className="mt-2 flex items-center justify-between gap-2">
-        <div>
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            className="hidden"
-            onChange={(event) => {
-              attachments.add(Array.from(event.target.files ?? []));
-              event.target.value = "";
-            }}
-          />
-          <Button
-            type="button"
-            size="icon-sm"
-            variant="ghost"
-            aria-label="Add attachment"
-            onClick={() => fileInputRef.current?.click()}
-          >
-            <Paperclip className="size-4" />
-          </Button>
-        </div>
-        <div className="flex gap-2">
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            className="h-7 rounded-full"
-            onClick={onCancel}
-          >
-            Cancel
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            className="h-7 rounded-full"
-            disabled={!canSubmit || submitting}
-            onClick={() => void submit()}
-          >
-            Send
-          </Button>
-        </div>
-      </div>
-    </div>
   );
 }
 
@@ -263,6 +135,7 @@ export const MessageRow = memo(function MessageRow({
   userFontFamily,
   agentFontFamily,
   isEditing,
+  editingUserMessageId = null,
   streaming = false,
   historical = false,
   actionsDisabled = false,
@@ -279,6 +152,7 @@ export const MessageRow = memo(function MessageRow({
   userFontFamily: string;
   agentFontFamily: string;
   isEditing: boolean;
+  editingUserMessageId?: string | null;
   streaming?: boolean;
   historical?: boolean;
   actionsDisabled?: boolean;
@@ -303,57 +177,27 @@ export const MessageRow = memo(function MessageRow({
       style={{ contentVisibility: "auto", containIntrinsicSize: "auto 96px" }}
     >
       {message.role === "user" ? (
-        <div
-          className={cn(
-            "group flex flex-col items-end gap-1",
-            isEditing ? "w-full" : "max-w-[80%]",
-          )}
-        >
-          {isEditing ? (
-            <UserMessageEditor
-              initial={message.content}
-              initialUploads={message.uploads ?? []}
-              instanceId={instanceId}
-              fontFamily={userFontFamily}
-              onCancel={onCancelEdit}
-              onSubmit={(content, uploads) => onSubmitEdit(message.id, content, uploads)}
-            />
-          ) : (
-            <>
-              {message.content && (
-                <div
-                  className="whitespace-pre-wrap break-words rounded-2xl bg-secondary px-4 py-2.5 text-sm text-secondary-foreground"
-                  style={{ fontFamily: userFontFamily }}
-                >
-                  {message.content}
-                </div>
-              )}
-              {message.uploads && message.uploads.length > 0 && (
-                <MessageUploads instanceId={instanceId} uploads={message.uploads} />
-              )}
-              <div className="flex h-6 items-center" data-chat-action>
-                <button
-                  type="button"
-                  aria-label="Edit message"
-                  data-disabled-at-rest="false"
-                  disabled={actionsDisabled}
-                  onClick={() => onStartEdit(message.id)}
-                  className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground opacity-0 hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100 disabled:pointer-events-none disabled:opacity-0"
-                >
-                  <Pencil className="h-3.5 w-3.5" />
-                </button>
-                {version && (
-                  <VersionPager
-                    index={version.index}
-                    count={version.count}
-                    actionsDisabled={actionsDisabled}
-                    onNavigate={(direction) => onNavigateVersion(message.id, direction)}
-                  />
-                )}
-              </div>
-            </>
-          )}
-        </div>
+        <UserMessage
+          message={message}
+          capabilities={EDITABLE_USER_MESSAGE}
+          instanceId={instanceId}
+          fontFamily={userFontFamily}
+          editing={isEditing}
+          actionsDisabled={actionsDisabled}
+          onStartEdit={onStartEdit}
+          onCancelEdit={onCancelEdit}
+          onSubmitEdit={onSubmitEdit}
+          footer={
+            version ? (
+              <VersionPager
+                index={version.index}
+                count={version.count}
+                actionsDisabled={actionsDisabled}
+                onNavigate={(direction) => onNavigateVersion(message.id, direction)}
+              />
+            ) : undefined
+          }
+        />
       ) : (
         <div
           className="w-full break-words pr-12 text-[15px] leading-relaxed text-foreground"
@@ -367,6 +211,13 @@ export const MessageRow = memo(function MessageRow({
                 chunks={chunks}
                 showDebug={showDebug}
                 streaming={streaming}
+                instanceId={instanceId}
+                userFontFamily={userFontFamily}
+                editingUserMessageId={editingUserMessageId}
+                actionsDisabled={actionsDisabled}
+                onStartUserMessageEdit={onStartEdit}
+                onCancelUserMessageEdit={onCancelEdit}
+                onSubmitUserMessageEdit={onSubmitEdit}
                 onRequestToolDetails={requestToolDetails}
               />
               {streaming && chunks.at(-1)?.kind === "text" && (
@@ -430,6 +281,7 @@ const HistoryPage = memo(function HistoryPage({
           userFontFamily={shared.userFontFamily}
           agentFontFamily={shared.agentFontFamily}
           isEditing={shared.editingId === message.id}
+          editingUserMessageId={shared.editingId}
           onStartEdit={shared.onStartEdit}
           onCancelEdit={shared.onCancelEdit}
           onSubmitEdit={shared.onSubmitEdit}
@@ -542,6 +394,7 @@ export const MessageHistory = memo(
             userFontFamily={userFontFamily}
             agentFontFamily={agentFontFamily}
             isEditing={editingId === row.message.id}
+            editingUserMessageId={editingId}
             actionsDisabled={actionsDisabled}
             onStartEdit={onStartEdit}
             onCancelEdit={onCancelEdit}
@@ -576,6 +429,7 @@ export const MessageHistory = memo(
         userFontFamily={userFontFamily}
         agentFontFamily={agentFontFamily}
         isEditing={false}
+        editingUserMessageId={editingId}
         actionsDisabled={actionsDisabled}
         onStartEdit={onStartEdit}
         onCancelEdit={onCancelEdit}
