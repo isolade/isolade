@@ -11,7 +11,8 @@ import {
 import type { SessionMessageRow } from "@/components/chat/MessageHistory";
 import PanelWorkspace, { DragLayer } from "@/components/home/PanelWorkspace";
 import WindowChrome from "@/components/home/WindowChrome";
-import type { Instance, PortForward } from "@/lib/contracts";
+import type { Chat, Instance, PortForward } from "@/lib/contracts";
+import { findChatModel } from "@/lib/contracts";
 import { type HarnessPage, makeOlderPage, makePages } from "./fixtures";
 import { getRenderMetrics, type MetricSnapshot } from "./metrics";
 import {
@@ -190,10 +191,36 @@ const PANEL_GESTURE_INSTANCE: Instance = {
   updatedAt: new Date(0),
 };
 
+const PANEL_GESTURE_CHAT: Chat = {
+  id: "panel-gesture-chat",
+  instanceId: PANEL_GESTURE_INSTANCE.id,
+  model: "claude-sonnet-5",
+  provider: "anthropic",
+  effort: "high",
+  claudeSessionId: null,
+  codexThreadId: null,
+  inputTokens: null,
+  cachedInputTokens: null,
+  cacheCreationInputTokens: null,
+  outputTokens: null,
+  reasoningOutputTokens: null,
+  costUsd: null,
+  lastInputTokens: null,
+  lastCachedInputTokens: null,
+  lastCacheCreationInputTokens: null,
+  lastOutputTokens: null,
+  lastReasoningOutputTokens: null,
+  modelContextWindow: null,
+  compacted: null,
+  activeLeafId: null,
+  createdAt: new Date(0),
+};
+
 function PanelGestureHarness() {
   const parameters = new URLSearchParams(window.location.search);
   const withChromeInset = parameters.get("chromeInset") === "1";
   const sidebarExpanded = parameters.get("sidebarExpanded") === "1";
+  const withChat = parameters.get("chat") === "1";
   // A forwarded port makes the browser tab render its preview <iframe> against
   // the given host port, which the test serves itself.
   const previewPort = Number(parameters.get("previewPort") ?? 0);
@@ -215,17 +242,17 @@ function PanelGestureHarness() {
           top: withChromeInset ? 0 : 80,
           width: 500,
           height: 400,
-          contain: "strict",
+          contain: withChat ? "layout style" : "strict",
         }}
       >
         <PanelWorkspace
           instance={PANEL_GESTURE_INSTANCE}
-          chats={[]}
+          chats={withChat ? [PANEL_GESTURE_CHAT] : []}
           terminals={[]}
           ports={ports}
           prs={[]}
           onDetachPr={() => {}}
-          chatModels={[]}
+          chatModels={withChat ? [findChatModel(PANEL_GESTURE_CHAT.model)!] : []}
           modelOverrides={{}}
           pendingFirstMessage={null}
           visible
