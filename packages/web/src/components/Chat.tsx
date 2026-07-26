@@ -36,6 +36,7 @@ import type {
   Chat as ChatRow,
   ContextBreakdown,
   ModelOverrides,
+  PendingSwitch,
   QueuedMessage,
   TranscriptMessage,
   UpdateChatBody,
@@ -52,6 +53,7 @@ import {
 } from "../lib/settings";
 import { useAttachments } from "../lib/use-attachments";
 import { AttachmentStrip } from "./chat/AttachmentStrip";
+import type { ProviderSwitchChunk } from "./chat/blocks";
 import {
   applyEvent,
   mergeToolDetails,
@@ -236,6 +238,36 @@ function Chat({
   const hydratedRef = useRef(false);
   const [currentModel, setCurrentModel] = useState(model);
   const [currentEffort, setCurrentEffort] = useState<ChatEffort>(effort);
+  // A selected-but-not-yet-activated cross-provider switch. While set, the
+  // picker shows the target model and the composer notes that the next message
+  // transfers the conversation. The server activates it on the next send and
+  // clears it (see the handoff service).
+  const [pendingSwitch, setPendingSwitch] = useState<PendingSwitch | undefined>(chat.pendingSwitch);
+  // Read the latest pending switch inside the send handler without adding it to
+  // that big callback's dependency list.
+  const pendingSwitchRef = useRef(pendingSwitch);
+  useEffect(() => {
+    pendingSwitchRef.current = pendingSwitch;
+  }, [pendingSwitch]);
+  // A send activates a pending switch server-side, so drop the composer hint
+  // once a turn starts streaming. (The picker keeps showing the target model,
+  // since currentModel already points at it.)
+  useEffect(() => {
+    if (streaming && pendingSwitch) setPendingSwitch(undefined);
+  }, [streaming, pendingSwitch]);
+  // The optimistic provider-switch divider: shown above the user message the
+  // instant it is submitted (before the target turn commits), keyed by that
+  // message's id so it follows the optimistic→server id swap. Cleared when the
+  // turn settles, at which point the persisted marker chunk on the committed
+  // assistant turn takes over (and, if the turn failed before committing, no
+  // divider remains). See ProviderSwitchDivider.
+  const [activeSwitch, setActiveSwitch] = useState<{
+    userId: string;
+    chunk: ProviderSwitchChunk;
+  } | null>(null);
+  useEffect(() => {
+    if (!streaming) setActiveSwitch(null);
+  }, [streaming]);
   // Server-synced (model, effort) pair. The picker stays interactive while a
   // turn is streaming. In that case we update the displayed values locally
   // and defer the PATCH until the user sends the next message. See
@@ -991,10 +1023,27 @@ function Chat({
         return null;
       });
       if (updated) {
-        appliedModelRef.current = updated.model;
-        appliedEffortRef.current = updated.effort;
-        setCurrentModel(updated.model);
-        setCurrentEffort(updated.effort);
+        if (updated.pendingSwitch) {
+          // A cross-provider selection: the chat still runs its current
+          // provider until the next send activates the switch. Reflect the
+          // TARGET so the picker shows what the user chose, and point the
+          // applied refs at the target so the next send does not re-PATCH
+          // (the server activates the already-recorded pending switch).
+          const { targetModel, targetEffort } = updated.pendingSwitch;
+          setPendingSwitch(updated.pendingSwitch);
+          setCurrentModel(targetModel);
+          appliedModelRef.current = targetModel;
+          if (targetEffort) {
+            setCurrentEffort(targetEffort);
+            appliedEffortRef.current = targetEffort;
+          }
+        } else {
+          setPendingSwitch(undefined);
+          appliedModelRef.current = updated.model;
+          appliedEffortRef.current = updated.effort;
+          setCurrentModel(updated.model);
+          setCurrentEffort(updated.effort);
+        }
       }
     },
     [instanceId, chatId],
@@ -1354,6 +1403,11 @@ function Chat({
           pendingUserIdRef.current = null;
           const serverMsg = ev.message;
           turnUserIdRef.current = serverMsg.id;
+          // Follow the optimistic→server id swap so the switch divider stays
+          // anchored to this user message.
+          setActiveSwitch((prev) =>
+            prev && prev.userId === pendingId ? { ...prev, userId: serverMsg.id } : prev,
+          );
           setSessionRows((rows) => {
             const idx = pendingId ? rows.findIndex((row) => row.message.id === pendingId) : -1;
             if (idx >= 0) {
@@ -1483,6 +1537,7 @@ function Chat({
           ev.type === "turn_interrupted" ||
           ev.type === "render_seed" ||
           ev.type === "api_retry" ||
+          ev.type === "provider_switch" ||
           ev.type === "raw"
         ) {
           const debugReplay = debugReplayRef.current;
@@ -1684,6 +1739,26 @@ function Chat({
       const optimisticId = reuseBootstrap ? last.id : crypto.randomUUID();
       pendingUserIdRef.current = optimisticId;
       turnUserIdRef.current = optimisticId;
+      // If this send activates a pending cross-provider switch, show the divider
+      // above this user message immediately (optimistically). It is keyed by the
+      // message id and updated when the server swaps in the real id; it clears
+      // when the turn settles, ceding to the persisted marker on the committed
+      // turn.
+      const sw = pendingSwitchRef.current;
+      setActiveSwitch(
+        sw
+          ? {
+              userId: optimisticId,
+              chunk: {
+                kind: "provider_switch",
+                fromProvider: sw.sourceProvider,
+                fromModel: sw.sourceModel,
+                toProvider: sw.targetProvider,
+                toModel: sw.targetModel,
+              },
+            }
+          : null,
+      );
       const renderKey = liveRenderKeyRef.current ?? `live-${crypto.randomUUID()}`;
       liveRenderKeyRef.current = renderKey;
       pinNextCommitToBottom();
@@ -2406,11 +2481,11 @@ function Chat({
     setActiveLeaf(errMsg.id);
   }, [creationError, chatId, setActiveLeaf]);
 
-  const currentProvider =
-    findChatModel(currentModel)?.provider ??
-    chatModels.find((m) => m.id === currentModel)?.provider;
-  const sameProviderModels = chatModels.filter((m) => m.provider === currentProvider);
-  const pickerModels = isFreshChat ? chatModels : sameProviderModels;
+  // The picker offers models from both providers. Selecting a cross-provider
+  // model records a pending switch that the next send activates with a
+  // provider-neutral handoff (see the handoff service); the chat keeps running
+  // its current provider until then.
+  const pickerModels = chatModels;
   const liveAssistantRow = useMemo<LiveAssistantRow | null>(() => {
     if (!liveRow) return null;
     return {
@@ -2450,6 +2525,7 @@ function Chat({
             pages={historyPages}
             sessionRows={sessionRows}
             live={liveAssistantRow}
+            activeSwitch={activeSwitch}
             scrollElementRef={scrollContainerRef}
             showDebug={showDebug}
             userFontFamily={userFontFamily}
@@ -2488,6 +2564,15 @@ function Chat({
         className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center pb-3"
       >
         <div className="pointer-events-auto w-full max-w-3xl px-4">
+          {pendingSwitch && (
+            <div className="mb-2 rounded-md border border-border bg-card/80 px-3 py-1.5 text-xs text-muted-foreground backdrop-blur-md">
+              Switching to{" "}
+              <span className="font-medium text-foreground">
+                {findChatModel(pendingSwitch.targetModel)?.name ?? pendingSwitch.targetModel}
+              </span>
+              . Your next message transfers this conversation to it.
+            </div>
+          )}
           {/* Hidden picker driven by the composer's paperclip button. */}
           <input
             ref={fileInputRef}

@@ -175,7 +175,7 @@ function seedV3Db(path: string): { chatId: string; newestOrphanId: string } {
   return { chatId, newestOrphanId };
 }
 
-describe("db migrations 3-9 (message tree, attachments, rendering, panel layout, and queue)", () => {
+describe("db migrations 3-10 (tree, attachments, rendering, layout, queue, provider identity)", () => {
   it("backfills linear parent chains, the active leaf, and the parent index", () => {
     const path = join(tmpdir(), `isolade-mig3-${randomUUID()}.db`);
     try {
@@ -206,17 +206,25 @@ describe("db migrations 3-9 (message tree, attachments, rendering, panel layout,
       const raw = new Database(path);
       const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(9);
+      expect(version).toBe(10);
       const messageColumns = raw
         .query("SELECT name FROM pragma_table_info('chat_messages')")
         .all() as Array<{ name: string }>;
       expect(messageColumns.map((column) => column.name)).toContain("delivery_status");
       expect(messageColumns.map((column) => column.name)).toContain("delivery_error");
+      expect(messageColumns.map((column) => column.name)).toContain("provider");
       expect(
         raw
           .query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'queued_messages'`)
           .get(),
       ).toEqual({ name: "queued_messages" });
+      expect(
+        raw
+          .query(
+            `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'provider_switches'`,
+          )
+          .get(),
+      ).toEqual({ name: "provider_switches" });
       // Migration 4 installed the uploads table.
       const uploadsTable = raw
         .query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'uploads'`)
@@ -380,7 +388,132 @@ describe("db migration 7 (panel layout)", () => {
       const version = (
         new Database(path).query("PRAGMA user_version").get() as { user_version: number }
       ).user_version;
-      expect(version).toBe(9);
+      expect(version).toBe(10);
+    } finally {
+      rmSync(path, { force: true });
+      rmSync(`${path}-wal`, { force: true });
+      rmSync(`${path}-shm`, { force: true });
+    }
+  });
+});
+
+// A v6 database for the columns migration 10 touches (chat_messages without the
+// provider/model columns, and no provider_switches table). Every other table
+// is installed at the current shape by createSchema's IF NOT EXISTS.
+function seedV6Db(path: string): {
+  chatId: string;
+  anchoredId: string;
+  sessionOnlyId: string;
+  bareAssistantId: string;
+  userId: string;
+} {
+  const sqlite = new Database(path);
+  sqlite.run(`
+    CREATE TABLE chats (
+      id TEXT PRIMARY KEY,
+      instance_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      effort TEXT,
+      claude_session_id TEXT,
+      codex_thread_id TEXT,
+      input_tokens INTEGER,
+      cached_input_tokens INTEGER,
+      cache_creation_input_tokens INTEGER,
+      output_tokens INTEGER,
+      reasoning_output_tokens INTEGER,
+      last_input_tokens INTEGER,
+      last_cached_input_tokens INTEGER,
+      last_cache_creation_input_tokens INTEGER,
+      last_output_tokens INTEGER,
+      last_reasoning_output_tokens INTEGER,
+      model_context_window INTEGER,
+      compacted INTEGER,
+      cost_usd REAL,
+      active_leaf_id TEXT,
+      in_flight_message_id TEXT,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch())
+    )
+  `);
+  sqlite.run(`
+    CREATE TABLE chat_messages (
+      id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      parent_id TEXT,
+      session_id TEXT,
+      anchor_id TEXT,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch())
+    )
+  `);
+
+  const chatId = randomUUID();
+  sqlite.run(
+    `INSERT INTO chats (id, instance_id, model, provider) VALUES (?, ?, 'claude-opus-4-8', 'anthropic')`,
+    [chatId, randomUUID()],
+  );
+  const userId = randomUUID();
+  const anchoredId = randomUUID();
+  const sessionOnlyId = randomUUID();
+  const bareAssistantId = randomUUID();
+  // A user row (never gets a provider), an assistant row with both session and
+  // anchor, one with only a session id, and one with neither (a turn that died
+  // before the backend reported its session).
+  sqlite.run(`INSERT INTO chat_messages (id, chat_id, role, content) VALUES (?, ?, 'user', 'hi')`, [
+    userId,
+    chatId,
+  ]);
+  sqlite.run(
+    `INSERT INTO chat_messages (id, chat_id, role, content, session_id, anchor_id) VALUES (?, ?, 'assistant', 'a', 'sess-1', 'anchor-1')`,
+    [anchoredId, chatId],
+  );
+  sqlite.run(
+    `INSERT INTO chat_messages (id, chat_id, role, content, session_id) VALUES (?, ?, 'assistant', 'b', 'sess-2')`,
+    [sessionOnlyId, chatId],
+  );
+  sqlite.run(
+    `INSERT INTO chat_messages (id, chat_id, role, content) VALUES (?, ?, 'assistant', 'c')`,
+    [bareAssistantId, chatId],
+  );
+  sqlite.run(`PRAGMA user_version = 6`);
+  sqlite.close();
+  return { chatId, anchoredId, sessionOnlyId, bareAssistantId, userId };
+}
+
+describe("db migration 10 (per-message provider identity)", () => {
+  it("backfills provider only for assistant rows with a native session or anchor", () => {
+    const path = join(tmpdir(), `isolade-mig7-${randomUUID()}.db`);
+    try {
+      const { anchoredId, sessionOnlyId, bareAssistantId, userId } = seedV6Db(path);
+      const db = createDb(path);
+
+      const provider = (id: string) =>
+        db.select().from(schema.chatMessages).where(eq(schema.chatMessages.id, id)).get()?.provider;
+
+      // Both kinds of native evidence prove the then-current provider.
+      expect(provider(anchoredId)).toBe("anthropic");
+      expect(provider(sessionOnlyId)).toBe("anthropic");
+      // No evidence: stay null rather than guess.
+      expect(provider(bareAssistantId)).toBeNull();
+      // User rows never carry a provider.
+      expect(provider(userId)).toBeNull();
+
+      const raw = new Database(path);
+      const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
+        .user_version;
+      expect(version).toBe(10);
+      const switchesTable = raw
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'provider_switches'")
+        .get() as { name: string } | null;
+      expect(switchesTable?.name).toBe("provider_switches");
+      // model stays null: the chat's model column is the active model, not
+      // necessarily each historical turn's, so it isn't backfilled.
+      const modelColumn = raw
+        .query("SELECT name FROM pragma_table_info('chat_messages') WHERE name = 'model'")
+        .get() as { name: string } | null;
+      expect(modelColumn?.name).toBe("model");
+      raw.close();
     } finally {
       rmSync(path, { force: true });
       rmSync(`${path}-wal`, { force: true });

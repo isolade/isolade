@@ -59,8 +59,17 @@ function defaultDbPath(): string {
  *
  * Version 9 records Claude transcript checkpoints for editable in-turn user
  * messages.
+ *
+ * Version 10 makes a chat able to hold turns from more than one provider (the
+ * cross-provider handoff service): `chat_messages.provider` / `model` record
+ * which provider produced each assistant turn, and a `provider_switches` table
+ * persists a pending switch across restarts. The provider backfill is
+ * deliberately conservative: it stamps `chats.provider` only onto assistant
+ * rows that carry a non-null native `session_id` or `anchor_id`, since those
+ * prove the row belongs to the chat's then-current provider. Rows with no such
+ * evidence stay NULL rather than being guessed.
  */
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 
 /**
  * The complete, current schema: one CREATE TABLE (plus indexes) per table in
@@ -209,6 +218,8 @@ function createSchema(sqlite: Database): void {
       anchor_id TEXT,
       delivery_status TEXT,
       delivery_error TEXT,
+      provider TEXT,
+      model TEXT,
       created_at INTEGER NOT NULL DEFAULT (unixepoch())
     )
   `);
@@ -312,6 +323,31 @@ function createSchema(sqlite: Database): void {
     CREATE TABLE IF NOT EXISTS app_state (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
+    )
+  `);
+
+  // Pending cross-provider switch per chat (see db/schema.ts). Transient: the
+  // row is cleared once the switch commits or the source leaf stops
+  // identifying the active branch. Only references to auxiliary native
+  // sessions are stored, never handoff/summary text.
+  sqlite.run(`
+    CREATE TABLE IF NOT EXISTS provider_switches (
+      chat_id TEXT PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'pending',
+      source_leaf_id TEXT,
+      source_provider TEXT NOT NULL,
+      source_model TEXT NOT NULL,
+      source_session_id TEXT,
+      source_anchor_id TEXT,
+      target_provider TEXT NOT NULL,
+      target_model TEXT NOT NULL,
+      target_effort TEXT,
+      aux_session_id TEXT,
+      aux_turn_id TEXT,
+      error_class TEXT,
+      last_error TEXT,
+      created_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER)),
+      updated_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER))
     )
   `);
 
@@ -531,6 +567,56 @@ const migrations: Record<number, (sqlite: Database) => void> = {
     if (!columns.some((column) => column.name === "edit_anchor_id")) {
       sqlite.run(`ALTER TABLE queued_messages ADD COLUMN edit_anchor_id TEXT`);
     }
+  },
+  10: (sqlite) => {
+    // Guard each ADD COLUMN: createSchema (run just before the ladder) creates
+    // chat_messages at the current shape when the table was absent from a
+    // partial older database, so the column can already exist here. Same
+    // defensive check migration 6 uses for chats.in_flight_message_id.
+    const hasColumn = (table: string, column: string) =>
+      sqlite.query(`SELECT name FROM pragma_table_info('${table}') WHERE name = ?`).get(column) !=
+      null;
+    if (!hasColumn("chat_messages", "provider")) {
+      sqlite.run(`ALTER TABLE chat_messages ADD COLUMN provider TEXT`);
+    }
+    if (!hasColumn("chat_messages", "model")) {
+      sqlite.run(`ALTER TABLE chat_messages ADD COLUMN model TEXT`);
+    }
+    // Conservative provider backfill: only assistant rows that recorded a
+    // native session or anchor prove they belong to the chat's then-current
+    // provider (every turn so far ran under a single provider). Rows without
+    // that evidence stay NULL, so a later edit/branch never hands one
+    // provider's session id to the other provider's fork. Model stays NULL
+    // (the chat's model column is the ACTIVE model, not necessarily each
+    // historical turn's, so guessing it would be wrong).
+    sqlite.run(`
+      UPDATE chat_messages
+      SET provider = (
+        SELECT c.provider FROM chats AS c WHERE c.id = chat_messages.chat_id
+      )
+      WHERE role = 'assistant'
+        AND (session_id IS NOT NULL OR anchor_id IS NOT NULL)
+    `);
+    sqlite.run(`
+      CREATE TABLE IF NOT EXISTS provider_switches (
+        chat_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'pending',
+        source_leaf_id TEXT,
+        source_provider TEXT NOT NULL,
+        source_model TEXT NOT NULL,
+        source_session_id TEXT,
+        source_anchor_id TEXT,
+        target_provider TEXT NOT NULL,
+        target_model TEXT NOT NULL,
+        target_effort TEXT,
+        aux_session_id TEXT,
+        aux_turn_id TEXT,
+        error_class TEXT,
+        last_error TEXT,
+        created_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER)),
+        updated_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER))
+      )
+    `);
   },
 };
 

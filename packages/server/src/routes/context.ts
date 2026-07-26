@@ -5,6 +5,7 @@ import type { ChatQueueService } from "../chat/chat-queue-service";
 import type { ChatTurnService } from "../chat/chat-turn-service";
 import type { ClaudeBackend } from "../chat/claude-backend";
 import type { CodexManager } from "../chat/codex-manager";
+import type { ProviderSwitchStore } from "../chat/provider-switch-store";
 import type { ChatStreamHub } from "../chat/stream-hub";
 import type { ChatManager } from "../chats";
 import type { UsageStats } from "../contracts";
@@ -40,6 +41,7 @@ export interface RouteContext {
   sessionManager: PersistentSessionManager;
   terminalManager: TerminalManager;
   chatManager: ChatManager;
+  providerSwitchStore: ProviderSwitchStore;
   uploadStore: UploadStore;
   chatStreamHub: ChatStreamHub;
   codexManager: CodexManager;

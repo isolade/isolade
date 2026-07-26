@@ -24,6 +24,7 @@ import type { RouteContext } from "./context";
 export function createChatsRouter(ctx: RouteContext): Hono {
   const {
     chatManager,
+    providerSwitchStore,
     uploadStore,
     instances,
     profiles,
@@ -37,6 +38,30 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     archivedError,
   } = ctx;
   const app = new Hono();
+
+  // Map the persisted pending switch (if any) to the client-facing shape the
+  // model picker reads. Returns undefined when there is no pending switch.
+  const pendingSwitchView = (chatId: string) => {
+    const row = providerSwitchStore.get(chatId);
+    if (!row) return undefined;
+    return {
+      sourceProvider: row.sourceProvider,
+      sourceModel: row.sourceModel,
+      targetProvider: row.targetProvider,
+      targetModel: row.targetModel,
+      targetEffort: row.targetEffort,
+      status: row.status,
+      errorClass: row.errorClass,
+    };
+  };
+
+  // Attach the pending-switch view to a chat row for any response that returns
+  // a chat. Kept separate from enrichChat (which is async for usage) so it can
+  // decorate synchronously.
+  const withPendingSwitch = <T extends { id: string }>(chat: T) => {
+    const pendingSwitch = pendingSwitchView(chat.id);
+    return pendingSwitch ? { ...chat, pendingSwitch } : chat;
+  };
 
   // Resolve a model id against the static catalog (Claude + Codex). Returns
   // undefined when the id is unknown.
@@ -54,7 +79,7 @@ export function createChatsRouter(ctx: RouteContext): Hono {
   // undefined and the UI omits the row.
   type ChatRow = ReturnType<typeof chatManager.get>;
   async function enrichChat(chat: NonNullable<ChatRow>) {
-    if (chat.inputTokens == null) return chat;
+    if (chat.inputTokens == null) return withPendingSwitch(chat);
     // Resolve the chat's profile so the share reads that profile's usage/plan.
     // /api/chats spans every profile, so this can't assume a single active one.
     // An orphaned chat (instance deleted) has no profile → leave the share off.
@@ -74,7 +99,7 @@ export function createChatsRouter(ctx: RouteContext): Hono {
         totalTokens: 0,
       },
     });
-    return share ? { ...chat, subscriptionShare: share } : chat;
+    return withPendingSwitch(share ? { ...chat, subscriptionShare: share } : chat);
   }
 
   // Initial turns and reconnects use the same atomic compact snapshot followed
@@ -267,7 +292,45 @@ export function createChatsRouter(ctx: RouteContext): Hono {
       return c.json({ error: `effort '${effort}' not supported by ${nextModelId}` }, 400);
     }
     const nextEffort = effort ?? clampEffortToModel(existing.effort, modelDef);
+
+    // A cross-provider model selection does NOT switch the chat now: it records
+    // a pending switch that the next real user turn activates with a
+    // provider-neutral handoff (see the handoff service). Crucially it does NOT
+    // clear the current provider's session id or per-message anchors, unlike the
+    // old same-provider-only updateModel path, so the source stays resumable if
+    // the switch is later abandoned.
+    if (model !== undefined && modelDef.provider !== existing.provider) {
+      const tip = chatManager.resolveTip(chatId);
+      const sourceSessionId =
+        existing.provider === "anthropic" ? existing.claudeSessionId : existing.codexThreadId;
+      // The source anchor is the active branch tip's own turn anchor, so a
+      // later source-side compaction/summary fork resumes at exactly this point.
+      const sourceAnchorId =
+        tip && tip.role === "assistant"
+          ? tip.anchorId
+          : (chatManager.resolveForkPoint(tip?.id ?? null, existing.provider)?.anchorId ?? null);
+      providerSwitchStore.upsert(chatId, {
+        sourceLeafId: tip?.id ?? null,
+        sourceProvider: existing.provider,
+        sourceModel: existing.model,
+        sourceSessionId: sourceSessionId ?? null,
+        sourceAnchorId,
+        targetProvider: modelDef.provider,
+        targetModel: model,
+        targetEffort: nextEffort,
+      });
+      // The chat row itself is untouched: it still runs the source provider
+      // until activation. Return it decorated with the pending switch.
+      const pending = chatManager.get(chatId);
+      return c.json(pending ? await enrichChat(pending) : pending);
+    }
+
+    // Same-provider change (or effort-only). If a pending cross-provider switch
+    // was recorded earlier, selecting a model back on the current provider
+    // reverts it, so drop the pending switch.
     if (model !== undefined) {
+      const existingSwitch = providerSwitchStore.get(chatId);
+      if (existingSwitch) providerSwitchStore.clear(chatId);
       chatManager.updateModel(chatId, model, modelDef.provider, nextEffort);
     } else {
       chatManager.updateEffort(chatId, nextEffort);
@@ -284,6 +347,7 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     // Shut down the chat's persistent `claude` process (and its background
     // tasks). The chat is gone, so the warm process has nothing to serve.
     realClaudeBackend.disposeChat(chatId);
+    providerSwitchStore.clear(chatId);
     uploadStore.removeForChat(chatId);
     chatManager.remove(chatId);
     return c.json({ ok: true });
@@ -781,6 +845,13 @@ export function createChatsRouter(ctx: RouteContext): Hono {
 
     const tip = chatManager.descendToTip(chatId, target);
     chatManager.setActiveLeaf(chatId, tip.id);
+
+    // A pending cross-provider switch is bound to the leaf it was recorded on.
+    // Changing the visible branch invalidates it, because its source leaf no
+    // longer identifies the active conversation (the user can re-select the
+    // target on the new branch).
+    const pending = providerSwitchStore.get(chatId);
+    if (pending && pending.sourceLeafId !== tip.id) providerSwitchStore.clear(chatId);
 
     // Re-point the chat's session at the branch's own session. Null when the
     // branch never recorded one (its turns all failed early): the next send

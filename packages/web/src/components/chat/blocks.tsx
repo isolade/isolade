@@ -4,6 +4,7 @@
 // matters lives in Chat.tsx. These only own their local open/closed toggles.
 
 import {
+  ArrowLeftRight,
   Bot,
   ChevronDown,
   FilePen,
@@ -19,7 +20,7 @@ import {
 } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
 import type { Upload } from "@/lib/contracts";
-import { summarizeChatToolInput } from "@/lib/contracts";
+import { findChatModel, summarizeChatToolInput } from "@/lib/contracts";
 import { cn } from "@/lib/utils";
 import StreamingMarkdown from "../StreamingMarkdown";
 import type { StreamChunk, ToolChunk } from "./chunks";
@@ -397,6 +398,45 @@ const InterruptionMarker = memo(function InterruptionMarker({ id }: { id: string
   );
 });
 
+// Prefer the catalog model name (e.g. "Opus 4.8"), falling back to the id.
+function modelLabel(modelId: string): string {
+  return findChatModel(modelId)?.name ?? modelId;
+}
+
+export type ProviderSwitchChunk = Extract<StreamChunk, { kind: "provider_switch" }>;
+
+// The provider-switch marker for a turn, if any. It leads the target turn's
+// chunks; the caller renders it above that turn's user message.
+export function providerSwitchOf(
+  chunks: StreamChunk[] | undefined,
+): ProviderSwitchChunk | undefined {
+  return chunks?.find((c): c is ProviderSwitchChunk => c.kind === "provider_switch");
+}
+
+// The divider marking where a chat switched providers, rendered above the user
+// message that triggered the switch (that message and everything after it ran
+// on the new model). Persisted like any other chunk, so it survives a reload.
+export const ProviderSwitchDivider = memo(function ProviderSwitchDivider({
+  chunk,
+}: {
+  chunk: ProviderSwitchChunk;
+}) {
+  const label = chunk.fromModel
+    ? `Switched from ${modelLabel(chunk.fromModel)} to ${modelLabel(chunk.toModel)}`
+    : `Switched to ${modelLabel(chunk.toModel)}`;
+  return (
+    <div
+      className="my-2 flex items-center gap-2 text-xs text-muted-foreground"
+      data-testid="provider-switch-divider"
+    >
+      <span className="h-px flex-1 bg-border" />
+      <ArrowLeftRight className="h-3.5 w-3.5 flex-shrink-0" />
+      <span className="font-medium">{label}</span>
+      <span className="h-px flex-1 bg-border" />
+    </div>
+  );
+});
+
 // Memoized so a re-render of Chat (e.g. a tab switch flipping `visible`, or a
 // streaming delta on a *different* message) doesn't reconcile every past
 // turn's tool/thinking/markdown blocks. History chunk arrays keep a stable
@@ -465,6 +505,9 @@ export const StreamView = memo(function StreamView({
         }
         if (chunk.kind === "api_retry") return <RetryBlock key={i} chunk={chunk} />;
         if (chunk.kind === "thought") return <ThoughtBlock key={chunk.id} chunk={chunk} />;
+        // The provider-switch divider renders above the triggering user message
+        // (see MessageRow.switchAbove), not inside the assistant bubble.
+        if (chunk.kind === "provider_switch") return null;
         if (!showDebug) return null;
         if (chunk.kind === "thinking") return <ThinkingBlock key={i} text={chunk.text} />;
         return (
