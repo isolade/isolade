@@ -6,6 +6,12 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+### Fixed
+
+- Codex chats now show reconnect progress while Codex retries an interrupted
+  OpenAI response stream, and terminal app-server errors settle immediately
+  instead of leaving the chat waiting for a second failure notification.
+
 ## [0.3.2] - 2026-07-26
 
 ### Changed

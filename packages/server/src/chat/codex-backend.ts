@@ -219,6 +219,52 @@ export class CodexBackend implements ChatBackend {
         reject(new Error(errMsg));
       });
 
+      // Retryable response-stream failures arrive on app-server's generic
+      // `error` notification with `willRetry=true`. Codex owns replaying the
+      // sampling request safely, including preserving tool-call history. Map
+      // its reconnect progress onto the same provider-agnostic event Claude
+      // uses so the chat does not look frozen during backoff. A non-retryable
+      // error is terminal, so reject immediately instead of waiting for the
+      // following failed turn/completed notification.
+      const offError = conn.on("error", (params) => {
+        const notification = params as {
+          error?: {
+            message?: unknown;
+            codexErrorInfo?: unknown;
+            additionalDetails?: unknown;
+          };
+          willRetry?: unknown;
+          threadId?: unknown;
+        } | null;
+        if (typeof notification?.threadId === "string" && notification.threadId !== threadId) {
+          return;
+        }
+
+        const message =
+          typeof notification?.error?.message === "string"
+            ? notification.error.message
+            : "turn failed";
+        if (notification?.willRetry !== true) {
+          cleanup();
+          reject(new Error(message));
+          return;
+        }
+
+        const progress = parseCodexRetryProgress(message);
+        opts.onEvent?.({
+          type: "api_retry",
+          attempt: progress.attempt,
+          maxRetries: progress.maxRetries,
+          // Codex does not expose its computed jittered delay over app-server.
+          retryDelayMs: 0,
+          errorStatus: codexErrorHttpStatus(notification.error?.codexErrorInfo),
+          error:
+            typeof notification.error?.additionalDetails === "string"
+              ? notification.error.additionalDetails
+              : null,
+        });
+      });
+
       // Codex broadcasts work-item lifecycle as JSON-RPC notifications:
       //   item/started   → params.item contains type, id, status="inProgress",
       //                    plus item-type-specific fields (command, cwd, …)
@@ -430,6 +476,7 @@ export class CodexBackend implements ChatBackend {
       // event AND a duplicate debug card.
       const HANDLED_METHODS = new Set<string>([
         "item/agentMessage/delta",
+        "error",
         "turn/completed",
         "turn/failed",
         "item/started",
@@ -453,6 +500,7 @@ export class CodexBackend implements ChatBackend {
         offDelta();
         offCompleted();
         offFailed();
+        offError();
         offStarted();
         offUpdated();
         offItemDone();
@@ -678,6 +726,25 @@ function extractCodexItem(params: unknown): CodexItem | null {
   const o = item as Record<string, unknown>;
   if (typeof o.id !== "string" || typeof o.type !== "string") return null;
   return o as CodexItem;
+}
+
+function parseCodexRetryProgress(message: string): { attempt: number; maxRetries: number } {
+  const match = message.match(/(\d+)\s*\/\s*(\d+)/);
+  if (!match) return { attempt: 0, maxRetries: 0 };
+  return {
+    attempt: Number(match[1]),
+    maxRetries: Number(match[2]),
+  };
+}
+
+function codexErrorHttpStatus(info: unknown): number | null {
+  if (!info || typeof info !== "object") return null;
+  for (const value of Object.values(info as Record<string, unknown>)) {
+    if (!value || typeof value !== "object") continue;
+    const status = (value as { httpStatusCode?: unknown }).httpStatusCode;
+    if (typeof status === "number") return status;
+  }
+  return null;
 }
 
 // Display name shown on the tool-call card. Codex item types are camelCase
