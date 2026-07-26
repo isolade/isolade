@@ -19,6 +19,8 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Fixed
 
+- The chat composer now grows when its panel gets narrower and always leaves
+  enough height for at least one line, so draft text is no longer clipped.
 - Codex chats now show reconnect progress while Codex retries an interrupted
   OpenAI response stream, and terminal app-server errors settle immediately
   instead of leaving the chat waiting for a second failure notification.
