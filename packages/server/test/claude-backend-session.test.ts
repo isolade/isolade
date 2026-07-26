@@ -79,7 +79,10 @@ describe("ClaudeBackend session lifecycle", () => {
       percentage: 10,
       categories: [],
     });
-    expect(await context).toMatchObject({ available: true, totalTokens: 20_000 });
+    expect(await context).toMatchObject({
+      available: true,
+      totalTokens: 20_000,
+    });
     expect(procs.length).toBe(1);
 
     // Turn 3: model and effort switch through controls on the SAME process.
@@ -196,9 +199,17 @@ describe("ClaudeBackend session lifecycle", () => {
     proc(procs, 0).emit({ type: "result", result: "one" });
     await p1;
 
-    backend.disposeChat("c");
-    proc(procs, 0).exit(0);
+    const disposing = backend.disposeChat("c");
+    let disposed = false;
+    void disposing.then(() => {
+      disposed = true;
+    });
     await tick();
+    expect(disposed).toBe(false);
+
+    proc(procs, 0).exit(0);
+    await disposing;
+    expect(disposed).toBe(true);
 
     // After disposal a new turn must start a brand-new process.
     const p2 = backend.sendMessage({

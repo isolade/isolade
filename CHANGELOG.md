@@ -16,6 +16,9 @@ _Changes landed on `main` that haven't shipped in a release yet._
   sent when the current turn ends. They can also be sent after the current tool
   call or immediately.
 - User messages now warn when delivery could not be confirmed.
+- You can now edit a message or switch between its versions while the model is
+  replying. Any partial reply remains on the original branch, and the
+  replacement starts from the selected conversation point.
 
 ### Fixed
 
@@ -109,7 +112,7 @@ _Changes landed on `main` that haven't shipped in a release yet._
 ### Fixed
 
 - Fixed chats getting permanently stuck in an error state (`has no agent
-  endpoint`) after an unclean shutdown. Startup and "Restart VM" now repair
+endpoint`) after an unclean shutdown. Startup and "Restart VM" now repair
   such VMs automatically.
 - Fixed streamed Claude output corrupting multibyte characters when a UTF-8
   sequence spans transport chunks.

@@ -1808,7 +1808,7 @@ test.describe("message renderer browser gate", () => {
       .fill("Run the lifecycle gate");
     await page.getByRole("button", { name: "Send" }).click();
     await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Edit message" }).first()).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Edit message" }).first()).toBeEnabled();
     expect(
       (await page.evaluate(() => window.__isoladeProductionChatHarness?.metrics()))
         ?.historyMappings,

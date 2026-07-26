@@ -18,6 +18,7 @@ import {
   updateChatBodySchema,
 } from "../contracts";
 import type { ChatMessage } from "../db/schema";
+import { KeyedQueue } from "../keyed-queue";
 import type { RouteContext } from "./context";
 
 // ---- Chats: models, CRUD, transcript/events, and the streaming turn ----
@@ -38,6 +39,23 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     archivedError,
   } = ctx;
   const app = new Hono();
+  const chatTransitions = new KeyedQueue();
+  const branchTransitionCounts = new Map<string, number>();
+
+  const beginBranchTransition = (chatId: string): (() => void) => {
+    branchTransitionCounts.set(chatId, (branchTransitionCounts.get(chatId) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (branchTransitionCounts.get(chatId) ?? 1) - 1;
+      if (remaining > 0) {
+        branchTransitionCounts.set(chatId, remaining);
+      } else {
+        branchTransitionCounts.delete(chatId);
+      }
+    };
+  };
 
   // Map the persisted pending switch (if any) to the client-facing shape the
   // model picker reads. Returns undefined when there is no pending switch.
@@ -71,6 +89,18 @@ export function createChatsRouter(ctx: RouteContext): Hono {
   const chatForInstance = (instanceId: string, chatId: string) => {
     const chat = chatManager.get(chatId);
     return chat?.instanceId === instanceId ? chat : undefined;
+  };
+
+  // A branch change first interrupts the active provider turn and waits for
+  // its partial response to persist. Only then do we shut down the chat's
+  // Claude process, which terminates its background jobs without racing the
+  // interrupt control message against stdin shutdown. Calling disposeChat for
+  // a Codex chat is a harmless no-op and also cleans up a stale Claude session
+  // if the chat's provider was changed while its previous turn was active.
+  const terminateForBranchChange = async (chatId: string): Promise<boolean> => {
+    await chatStreamHub.cancelInFlightForChat(chatId);
+    await realClaudeBackend.disposeChat(chatId);
+    return !chatManager.inFlightMessageId(chatId) && !chatStreamHub.inFlightFor(chatId);
   };
 
   // Compute the server-side subscriptionShare for a chat row, if the chat
@@ -186,7 +216,10 @@ export function createChatsRouter(ctx: RouteContext): Hono {
 
       if (userMessage) {
         const freshUserMessage = chatManager.getMessage(userMessage.id) ?? userMessage;
-        await safeWrite({ event: "user_message", data: JSON.stringify(freshUserMessage) });
+        await safeWrite({
+          event: "user_message",
+          data: JSON.stringify(freshUserMessage),
+        });
       }
       await safeWrite({ event: "message_id", data: JSON.stringify(messageId) });
       await safeWrite({ event: "snapshot", data: JSON.stringify(snapshot) });
@@ -196,7 +229,10 @@ export function createChatsRouter(ctx: RouteContext): Hono {
         return;
       }
       if (snapshot.status === "error") {
-        await safeWrite({ event: "error", data: snapshot.error ?? "turn failed" });
+        await safeWrite({
+          event: "error",
+          data: snapshot.error ?? "turn failed",
+        });
         sub?.unsubscribe();
         return;
       }
@@ -346,7 +382,7 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     chatStreamHub.cancelForChat(chatId);
     // Shut down the chat's persistent `claude` process (and its background
     // tasks). The chat is gone, so the warm process has nothing to serve.
-    realClaudeBackend.disposeChat(chatId);
+    void realClaudeBackend.disposeChat(chatId);
     providerSwitchStore.clear(chatId);
     uploadStore.removeForChat(chatId);
     chatManager.remove(chatId);
@@ -457,7 +493,13 @@ export function createChatsRouter(ctx: RouteContext): Hono {
       return c.json({ error: "content or an attachment is required" }, 400);
     }
     try {
-      const queued = chatQueueService.enqueue({ instanceId, chatId, id, content, uploadIds });
+      const queued = chatQueueService.enqueue({
+        instanceId,
+        chatId,
+        id,
+        content,
+        uploadIds,
+      });
       const uploads = uploadStore.listForMessage(id);
       // The active turn may have settled between the browser deciding to queue
       // and this request reaching the server.
@@ -633,16 +675,19 @@ export function createChatsRouter(ctx: RouteContext): Hono {
       }
     }
 
-    // Don't start a second turn while one is still running for this
-    // chat. The client UI gates this already (Stop button disables
-    // Send), but the server enforces it so two tabs racing to send
-    // can't produce overlapping CLI invocations.
-    if (chatManager.inFlightMessageId(chatId) || chatStreamHub.inFlightFor(chatId)) {
+    // Do not start another turn while either a provider turn or a branch
+    // transition owns this chat. Branch routes claim the chat before their
+    // first await, which closes the cancellation-to-replacement gap.
+    if (
+      branchTransitionCounts.has(chatId) ||
+      chatManager.inFlightMessageId(chatId) ||
+      chatStreamHub.inFlightFor(chatId)
+    ) {
       return c.json({ error: "another turn is in flight for this chat" }, 409);
     }
 
-    // Persist the user message and start the assistant turn (titling, prelude
-    // injection, usage persistence, abort semantics all live in the service).
+    // Start synchronously so the stream subscriber can attach before a fast
+    // provider publishes its final acknowledgement.
     const { assistantMessageId, userMessage } = chatTurnService.start({
       instance,
       chat,
@@ -726,90 +771,135 @@ export function createChatsRouter(ctx: RouteContext): Hono {
         return c.json({ error: "message delivery is unresolved" }, 409);
       }
     }
-    if (chatManager.inFlightMessageId(chatId) || chatStreamHub.inFlightFor(chatId)) {
-      return c.json({ error: "another turn is in flight for this chat" }, 409);
+    const releaseBranchTransition = beginBranchTransition(chatId);
+    const releaseQueueDispatch = chatQueueService.suspendDispatch(chatId);
+    let transition:
+      | {
+          kind: "turn";
+          assistantMessageId: string;
+          userMessage?: ChatMessage;
+        }
+      | { kind: "error"; error: string; status: 400 | 404 }
+      | null;
+    try {
+      transition = await chatTransitions.run(chatId, async () => {
+        if (!(await terminateForBranchChange(chatId))) return null;
+        const currentChat = chatForInstance(instanceId, chatId);
+        const currentInstance = instances.get(instanceId);
+        if (!currentChat || !currentInstance) return null;
+
+        const currentInTurn = edited ? undefined : chatManager.getQueuedMessage(messageId);
+        if (currentInTurn) {
+          if (
+            currentChat.provider !== "anthropic" ||
+            currentInTurn.status !== "delivered" ||
+            !currentInTurn.targetMessageId ||
+            !currentInTurn.editSessionId ||
+            !currentInTurn.editAnchorId
+          ) {
+            return {
+              kind: "error" as const,
+              error: "this in-turn message cannot be edited",
+              status: 400 as const,
+            };
+          }
+          const sourceAssistant = chatManager.getMessage(currentInTurn.targetMessageId);
+          if (
+            !sourceAssistant ||
+            sourceAssistant.chatId !== chatId ||
+            sourceAssistant.role !== "assistant"
+          ) {
+            return {
+              kind: "error" as const,
+              error: "the containing assistant turn was not found",
+              status: 404 as const,
+            };
+          }
+          const chunks =
+            chatManager.getMessageRenderChunks(chatId, [sourceAssistant.id], true, false)[
+              sourceAssistant.id
+            ] ?? [];
+          const chunkIndex = chunks.findIndex(
+            (chunk) => chunk.kind === "user_message" && chunk.id === currentInTurn.id,
+          );
+          if (chunkIndex < 0) {
+            return {
+              kind: "error" as const,
+              error: "the in-turn message was not found",
+              status: 404 as const,
+            };
+          }
+
+          const replacementId = id ?? randomUUID();
+          const assistantMessageId = randomUUID();
+          const initialChunks = chunks.slice(0, chunkIndex);
+          const interruption = initialChunks.at(-1);
+          if (interruption?.kind === "interruption" && interruption.id === currentInTurn.id) {
+            initialChunks[initialChunks.length - 1] = {
+              ...interruption,
+              id: replacementId,
+            };
+          }
+          initialChunks.push({
+            kind: "user_message",
+            id: replacementId,
+            content,
+            deliveryStatus: "sending",
+            capabilities: { edit: true },
+          });
+          chatManager.createDeliveredInTurnMessage({
+            id: replacementId,
+            chatId,
+            content,
+            mode: currentInTurn.mode === "now" ? "now" : "next",
+            targetMessageId: assistantMessageId,
+            editSessionId: currentInTurn.editSessionId,
+            editAnchorId: currentInTurn.editAnchorId,
+          });
+
+          chatTurnService.start({
+            instance: currentInstance,
+            chat: currentChat,
+            content,
+            uploadIds,
+            userMessageId: replacementId,
+            assistantMessageId,
+            inTurnEdit: {
+              sourceAssistant,
+              initialChunks,
+              sessionId: currentInTurn.editSessionId,
+              anchorId: currentInTurn.editAnchorId,
+            },
+          });
+          return { kind: "turn" as const, assistantMessageId };
+        }
+
+        const currentEdited = chatManager.getMessage(messageId);
+        if (!currentEdited || currentEdited.chatId !== chatId || currentEdited.role !== "user") {
+          return {
+            kind: "error" as const,
+            error: "message not found",
+            status: 404 as const,
+          };
+        }
+        const started = chatTurnService.start({
+          instance: currentInstance,
+          chat: currentChat,
+          content,
+          uploadIds,
+          edit: currentEdited,
+        });
+        return { kind: "turn" as const, ...started };
+      });
+    } finally {
+      releaseQueueDispatch();
+      releaseBranchTransition();
     }
-
-    if (inTurn) {
-      if (
-        chat.provider !== "anthropic" ||
-        inTurn.status !== "delivered" ||
-        !inTurn.targetMessageId ||
-        !inTurn.editSessionId ||
-        !inTurn.editAnchorId
-      ) {
-        return c.json({ error: "this in-turn message cannot be edited" }, 400);
-      }
-      const sourceAssistant = chatManager.getMessage(inTurn.targetMessageId);
-      if (
-        !sourceAssistant ||
-        sourceAssistant.chatId !== chatId ||
-        sourceAssistant.role !== "assistant"
-      ) {
-        return c.json({ error: "the containing assistant turn was not found" }, 404);
-      }
-      const chunks =
-        chatManager.getMessageRenderChunks(chatId, [sourceAssistant.id], true, false)[
-          sourceAssistant.id
-        ] ?? [];
-      const chunkIndex = chunks.findIndex(
-        (chunk) => chunk.kind === "user_message" && chunk.id === inTurn.id,
-      );
-      if (chunkIndex < 0) return c.json({ error: "the in-turn message was not found" }, 404);
-
-      const replacementId = id ?? randomUUID();
-      const assistantMessageId = randomUUID();
-      const initialChunks = chunks.slice(0, chunkIndex);
-      const interruption = initialChunks.at(-1);
-      if (interruption?.kind === "interruption" && interruption.id === inTurn.id) {
-        initialChunks[initialChunks.length - 1] = {
-          ...interruption,
-          id: replacementId,
-        };
-      }
-      initialChunks.push({
-        kind: "user_message",
-        id: replacementId,
-        content,
-        deliveryStatus: "sending",
-        capabilities: { edit: true },
-      });
-      chatManager.createDeliveredInTurnMessage({
-        id: replacementId,
-        chatId,
-        content,
-        mode: inTurn.mode === "now" ? "now" : "next",
-        targetMessageId: assistantMessageId,
-        editSessionId: inTurn.editSessionId,
-        editAnchorId: inTurn.editAnchorId,
-      });
-
-      realClaudeBackend.disposeChat(chatId);
-      chatTurnService.start({
-        instance,
-        chat,
-        content,
-        uploadIds,
-        userMessageId: replacementId,
-        assistantMessageId,
-        inTurnEdit: {
-          sourceAssistant,
-          initialChunks,
-          sessionId: inTurn.editSessionId,
-          anchorId: inTurn.editAnchorId,
-        },
-      });
-      return pumpTurnStream(c, chatId, assistantMessageId, c.req.query("debug") === "1");
+    if (!transition) return c.json({ error: "another turn is in flight for this chat" }, 409);
+    if (transition.kind === "error") {
+      return c.json({ error: transition.error }, transition.status);
     }
-
-    realClaudeBackend.disposeChat(chatId);
-    const { assistantMessageId, userMessage } = chatTurnService.start({
-      instance,
-      chat,
-      content,
-      uploadIds,
-      edit: edited,
-    });
+    const { assistantMessageId, userMessage } = transition;
 
     return pumpTurnStream(
       c,
@@ -835,48 +925,45 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     const { leafId } = setActiveLeafBodySchema.parse(await c.req.json());
     const target = chatManager.getMessage(leafId);
     if (!target || target.chatId !== chatId) return c.json({ error: "message not found" }, 404);
-    // A streaming turn belongs to the branch it started on. Re-pointing the
-    // session out from under it would corrupt both branches, so block the
-    // switch until it settles (the client disables navigation while
-    // streaming, this is the server-side guarantee).
-    if (chatManager.inFlightMessageId(chatId) || chatStreamHub.inFlightFor(chatId)) {
-      return c.json({ error: "another turn is in flight for this chat" }, 409);
+    const releaseBranchTransition = beginBranchTransition(chatId);
+    const releaseQueueDispatch = chatQueueService.suspendDispatch(chatId);
+    let updated: ReturnType<typeof chatManager.get> | null;
+    try {
+      updated = await chatTransitions.run(chatId, async () => {
+        if (!(await terminateForBranchChange(chatId))) return null;
+        const currentChat = chatForInstance(instanceId, chatId);
+        const currentTarget = chatManager.getMessage(leafId);
+        if (!currentChat || !currentTarget || currentTarget.chatId !== chatId) return null;
+
+        const tip = chatManager.descendToTip(chatId, currentTarget);
+        chatManager.setActiveLeaf(chatId, tip.id);
+
+        // A pending cross-provider switch is bound to the leaf it was recorded
+        // on. Changing branches invalidates it so a later send cannot apply a
+        // provider transition to the wrong conversation.
+        const pending = providerSwitchStore.get(chatId);
+        if (pending && pending.sourceLeafId !== tip.id) providerSwitchStore.clear(chatId);
+
+        // Re-point the chat's session at the branch's own session. Null when the
+        // branch never recorded one, so the next turn starts fresh rather than
+        // silently resuming another branch's session.
+        const branchSession = chatManager.resolveBranchSession(tip.id);
+        if (currentChat.provider === "anthropic") {
+          chatManager.updateSessionId(chatId, branchSession);
+        } else {
+          chatManager.updateSessionId(chatId, undefined, branchSession);
+        }
+        return chatManager.get(chatId);
+      });
+    } finally {
+      releaseQueueDispatch();
+      releaseBranchTransition();
     }
-
-    const tip = chatManager.descendToTip(chatId, target);
-    chatManager.setActiveLeaf(chatId, tip.id);
-
-    // A pending cross-provider switch is bound to the leaf it was recorded on.
-    // Changing the visible branch invalidates it, because its source leaf no
-    // longer identifies the active conversation (the user can re-select the
-    // target on the new branch).
-    const pending = providerSwitchStore.get(chatId);
-    if (pending && pending.sourceLeafId !== tip.id) providerSwitchStore.clear(chatId);
-
-    // Re-point the chat's session at the branch's own session. Null when the
-    // branch never recorded one (its turns all failed early): the next send
-    // then starts fresh rather than silently resuming another branch's
-    // session. The live CLI process (if any) is positioned at the OLD
-    // branch's session, so retire it whenever the session actually changes.
-    const branchSession = chatManager.resolveBranchSession(tip.id);
-    if (chat.provider === "anthropic") {
-      if ((chat.claudeSessionId ?? null) !== branchSession) {
-        chatManager.updateSessionId(chatId, branchSession);
-        realClaudeBackend.disposeChat(chatId);
-      }
-    } else if ((chat.codexThreadId ?? null) !== branchSession) {
-      chatManager.updateSessionId(chatId, undefined, branchSession);
-    }
-
-    const updated = chatManager.get(chatId);
-    return c.json(
-      updated
-        ? {
-            ...updated,
-            transcript: chatManager.getChatViewPage(chatId, null, 60),
-          }
-        : updated,
-    );
+    if (!updated) return c.json({ error: "another turn is in flight for this chat" }, 409);
+    return c.json({
+      ...updated,
+      transcript: chatManager.getChatViewPage(chatId, null, 60),
+    });
   });
 
   // Resume an in-flight turn after a network drop, or recover a completed

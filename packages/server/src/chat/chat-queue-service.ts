@@ -8,6 +8,7 @@ import type { ChatStreamHub } from "./stream-hub";
 
 export class ChatQueueService {
   private readonly dispatching = new Set<string>();
+  private readonly dispatchSuspensions = new Map<string, number>();
 
   constructor(
     private readonly deps: {
@@ -43,6 +44,7 @@ export class ChatQueueService {
   }
 
   async dispatchNext(chatId: string): Promise<string | null> {
+    if (this.dispatchSuspensions.has(chatId)) return null;
     if (this.dispatching.has(chatId)) return null;
     if (
       this.deps.chatManager.inFlightMessageId(chatId) ||
@@ -77,6 +79,26 @@ export class ChatQueueService {
     } finally {
       this.dispatching.delete(chatId);
     }
+  }
+
+  // Branch changes cancel and settle the active turn before rewinding the
+  // provider conversation. Suppress the settlement listener's automatic
+  // queue promotion during that window so a queued message cannot become a
+  // competing turn between cancellation and the replacement.
+  suspendDispatch(chatId: string): () => void {
+    this.dispatchSuspensions.set(chatId, (this.dispatchSuspensions.get(chatId) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.dispatchSuspensions.get(chatId) ?? 1) - 1;
+      if (remaining > 0) {
+        this.dispatchSuspensions.set(chatId, remaining);
+        return;
+      }
+      this.dispatchSuspensions.delete(chatId);
+      queueMicrotask(() => void this.dispatchNext(chatId));
+    };
   }
 
   async activate(
@@ -231,7 +253,10 @@ export class ChatQueueService {
     instanceId: string,
     chatId: string,
     messageId: string,
-  ): Promise<{ removed: boolean; reason?: "already_delivered" | "not_retractable" }> {
+  ): Promise<{
+    removed: boolean;
+    reason?: "already_delivered" | "not_retractable";
+  }> {
     const queued = this.deps.chatManager.getQueuedMessage(messageId);
     if (!queued || queued.chatId !== chatId) {
       throw new Error("queued message not found");

@@ -104,7 +104,12 @@ describe("MessageHistory", () => {
         instanceId="instance-test"
         pages={[]}
         sessionRows={[]}
-        live={{ renderKey: "turn", message: liveMessage, chunks: [], streaming: true }}
+        live={{
+          renderKey: "turn",
+          message: liveMessage,
+          chunks: [],
+          streaming: true,
+        }}
         scrollElementRef={createRef<HTMLDivElement>()}
         showDebug={false}
         userFontFamily="sans-serif"
@@ -211,6 +216,41 @@ describe("MessageHistory", () => {
     expect(claude).toContain("same message");
     expect(codex).not.toContain('aria-label="Edit message"');
     expect(claude).toContain('aria-label="Edit message"');
+  });
+
+  it("keeps message actions available while an assistant row is streaming", () => {
+    const html = renderToStaticMarkup(
+      <MessageHistory
+        instanceId="instance-test"
+        pages={[]}
+        sessionRows={[{ renderKey: "user", message: message("user") }]}
+        live={{
+          renderKey: "live",
+          message: message("live", "assistant"),
+          chunks: [],
+          streaming: true,
+        }}
+        scrollElementRef={createRef<HTMLDivElement>()}
+        showDebug={false}
+        userFontFamily="sans-serif"
+        agentFontFamily="sans-serif"
+        editingId={null}
+        actionsDisabled={false}
+        visible
+        hasOlder={false}
+        onStartEdit={() => {}}
+        onCancelEdit={() => {}}
+        onSubmitEdit={() => {}}
+        onNavigateVersion={() => {}}
+        onRequestToolDetails={() => {}}
+        onLoadOlder={() => {}}
+        onLayoutChange={() => {}}
+      />,
+    );
+
+    expect(html).toContain('aria-busy="false"');
+    expect(html).toContain('aria-label="Edit message"');
+    expect(html).not.toContain('aria-label="Edit message" disabled=""');
   });
 
   it("shows thinking progress and Claude's final summary without debug mode", () => {

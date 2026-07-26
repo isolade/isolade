@@ -341,6 +341,33 @@ export class ChatStreamHub {
     return true;
   }
 
+  // Cancel the running turn for a chat and resolve only after its producer has
+  // settled. Branch-changing routes use this to serialize the replacement
+  // behind provider teardown while letting the client switch optimistically.
+  // Waiting for the terminal hub signal also guarantees the turn service has
+  // persisted any partial response and cleared the durable in-flight marker.
+  async cancelInFlightForChat(chatId: string): Promise<boolean> {
+    const messageId = this.inFlightFor(chatId);
+    if (!messageId) return false;
+    const turn = this.turns.get(messageId);
+    if (!turn || turn.status !== "running") return false;
+    let settlementSubscriber: Subscriber = () => {};
+    const settled = new Promise<void>((resolve) => {
+      settlementSubscriber = (signal) => {
+        if (signal.kind === "event") return;
+        turn.subscribers.delete(settlementSubscriber);
+        resolve();
+      };
+      turn.subscribers.add(settlementSubscriber);
+    });
+    if (!this.cancel(messageId)) {
+      turn.subscribers.delete(settlementSubscriber);
+      return false;
+    }
+    await settled;
+    return true;
+  }
+
   // Tear down everything for a chat. Used by chat-delete and
   // instance-delete cascades so a deleted-while-streaming turn doesn't
   // linger and try to write to a DB row that no longer exists.

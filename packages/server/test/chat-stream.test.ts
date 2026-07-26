@@ -41,7 +41,10 @@ type Action =
   // already in progress, then invokes it after the owning chat was deleted.
   | { kind: "late_delta"; promise: Promise<void>; text: string }
   | { kind: "throw"; message: string }
-  | { kind: "abortable" }; // returns once abort signal fires
+  | { kind: "abortable" }
+  // Holds provider cleanup after cancellation so route serialization can be
+  // tested without a real CLI process.
+  | { kind: "abortable_cleanup"; promise: Promise<void> };
 
 interface FakeSendOpts {
   vmId: string;
@@ -120,6 +123,14 @@ class FakeBackend {
             once: true,
           });
         });
+      } else if (action.kind === "abortable_cleanup") {
+        await new Promise<void>((resolve) => {
+          opts.signal?.addEventListener("abort", () => resolve(), {
+            once: true,
+          });
+        });
+        await action.promise;
+        throw new Error("aborted");
       }
     }
     return { content };
@@ -319,7 +330,9 @@ describe("chat streaming resilience", () => {
       lastSeq: number;
       chunks: Array<{ kind: string; text?: string }>;
     };
-    expect(snapshot.lastSeq).toBe(1);
+    // The concurrently generated title may land before or after this initial
+    // snapshot. Either way, both text deltas must be inside its durable cursor.
+    expect(snapshot.lastSeq).toBeGreaterThanOrEqual(1);
     expect(snapshot.chunks).toEqual([{ kind: "text", text: "hello world" }]);
 
     expect(events[events.length - 1]!.event).toBe("done");
@@ -443,7 +456,9 @@ describe("chat streaming resilience", () => {
   });
 
   it("projects the initial POST stream for debug visibility and bounded tool payloads", async () => {
-    const oversizedInput = { command: "x".repeat(TOOL_INPUT_PREVIEW_CHARS * 4) };
+    const oversizedInput = {
+      command: "x".repeat(TOOL_INPUT_PREVIEW_CHARS * 4),
+    };
     const oversizedOutput = "y".repeat(TOOL_OUTPUT_PREVIEW_CHARS * 4);
     const script: Action[] = [
       { kind: "event", event: { type: "thinking", text: "private reasoning" } },
@@ -451,14 +466,25 @@ describe("chat streaming resilience", () => {
         kind: "event",
         event: { type: "raw", source: "claude", payload: { private: true } },
       },
-      { kind: "event", event: { type: "tool_call_start", id: "tool-large", name: "Bash" } },
       {
         kind: "event",
-        event: { type: "tool_call_input", id: "tool-large", input: oversizedInput },
+        event: { type: "tool_call_start", id: "tool-large", name: "Bash" },
       },
       {
         kind: "event",
-        event: { type: "tool_call_result", id: "tool-large", output: oversizedOutput },
+        event: {
+          type: "tool_call_input",
+          id: "tool-large",
+          input: oversizedInput,
+        },
+      },
+      {
+        kind: "event",
+        event: {
+          type: "tool_call_result",
+          id: "tool-large",
+          output: oversizedOutput,
+        },
       },
       { kind: "delta", text: "finished" },
     ];
@@ -521,7 +547,10 @@ describe("chat streaming resilience", () => {
       totalTokens: 22,
     };
     backend.setScript([
-      { kind: "event", event: { type: "usage", last: usage, total: usage, costUsd: 0.01 } },
+      {
+        kind: "event",
+        event: { type: "usage", last: usage, total: usage, costUsd: 0.01 },
+      },
       { kind: "delta", text: "answer" },
     ]);
 
@@ -586,7 +615,10 @@ describe("chat streaming resilience", () => {
   it("folds structural turn events into one completed render row", async () => {
     const { instanceId, chatId } = await makeChat();
     backend.setScript([
-      { kind: "event", event: { type: "tool_call_start", id: "tool-1", name: "Read" } },
+      {
+        kind: "event",
+        event: { type: "tool_call_start", id: "tool-1", name: "Read" },
+      },
       {
         kind: "event",
         event: { type: "tool_call_result", id: "tool-1", output: "ok" },
@@ -620,10 +652,17 @@ describe("chat streaming resilience", () => {
   it("persists structural output when a turn fails before producing text", async () => {
     const { instanceId, chatId } = await makeChat();
     backend.setScript([
-      { kind: "event", event: { type: "tool_call_start", id: "tool-1", name: "Read" } },
       {
         kind: "event",
-        event: { type: "tool_call_result", id: "tool-1", output: "partial result" },
+        event: { type: "tool_call_start", id: "tool-1", name: "Read" },
+      },
+      {
+        kind: "event",
+        event: {
+          type: "tool_call_result",
+          id: "tool-1",
+          output: "partial result",
+        },
       },
       { kind: "throw", message: "provider failed" },
     ]);
@@ -760,7 +799,11 @@ describe("chat streaming resilience", () => {
     expect(activeResponse.status).toBe(200);
     const active = (await activeResponse.json()) as {
       messages: { id: string; role: string; content: string }[];
-      inFlight: { messageId: string; lastSeq: number; chunks: unknown[] } | null;
+      inFlight: {
+        messageId: string;
+        lastSeq: number;
+        chunks: unknown[];
+      } | null;
     };
     expect(active.messages.map((message) => [message.role, message.content])).toEqual([
       ["user", "question"],
@@ -1092,7 +1135,10 @@ describe("chat streaming resilience", () => {
       release = resolve;
     });
     backend.setScript([
-      { kind: "event", event: { type: "tool_call_start", id: "tool-1", name: "Read" } },
+      {
+        kind: "event",
+        event: { type: "tool_call_start", id: "tool-1", name: "Read" },
+      },
       {
         kind: "event",
         event: { type: "tool_call_result", id: "tool-1", output: "done" },
@@ -1204,24 +1250,18 @@ describe("chat streaming resilience", () => {
     expect(interrupted).toBeGreaterThan(-1);
     expect(steered).toBeGreaterThan(interrupted);
     expect(continued).toBeGreaterThan(steered);
-    expect(JSON.parse(events[steered]!.data).capabilities).toEqual({ edit: true });
+    expect(JSON.parse(events[steered]!.data).capabilities).toEqual({
+      edit: true,
+    });
     expect(chatManager.getQueuedMessage("claude-now")).toMatchObject({
       editSessionId: "steering-session",
       editAnchorId: "before-steering",
     });
   });
 
-  it("edits a Claude in-turn message by forking at its acknowledgement checkpoint", async () => {
+  it("edits an active Claude in-turn message at its acknowledgement checkpoint", async () => {
     const { instanceId, chatId } = await makeChat();
-    let release!: () => void;
-    const blocked = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    backend.setScript([
-      { kind: "delta", text: "before " },
-      { kind: "wait", promise: blocked },
-      { kind: "delta", text: "original suffix" },
-    ]);
+    backend.setScript([{ kind: "delta", text: "before " }, { kind: "abortable" }]);
     const activeResponse = await fetch(
       `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
       {
@@ -1234,7 +1274,10 @@ describe("chat streaming resilience", () => {
     await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chatId}/queue`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: "claude-inline", content: "original steering" }),
+      body: JSON.stringify({
+        id: "claude-inline",
+        content: "original steering",
+      }),
     });
     const dispatch = await fetch(
       `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/queue/claude-inline/dispatch`,
@@ -1245,12 +1288,12 @@ describe("chat streaming resilience", () => {
       },
     );
     expect(dispatch.status).toBe(200);
-    release();
-    await readAllSse(activeResponse);
-    await chatStreamHub.drain();
 
     backend.setScript([
-      { kind: "meta", meta: { sessionId: "edited-session", anchorId: "edited-end" } },
+      {
+        kind: "meta",
+        meta: { sessionId: "edited-session", anchorId: "edited-end" },
+      },
       { kind: "ack" },
       { kind: "delta", text: "edited suffix" },
     ]);
@@ -1266,7 +1309,11 @@ describe("chat streaming resilience", () => {
       },
     );
     expect(editResponse.status).toBe(200);
-    await readAllSse(editResponse);
+    const [{ events: activeEvents }] = await Promise.all([
+      readAllSse(activeResponse),
+      readAllSse(editResponse),
+    ]);
+    expect(activeEvents.at(-1)?.event).toBe("error");
     await chatStreamHub.drain();
 
     expect(backend.lastOpts?.sessionId).toBe("steering-session");
@@ -1328,7 +1375,9 @@ describe("chat streaming resilience", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ removed: true });
-    expect(backend.lastCancelSteer).toMatchObject({ userMessageId: "retract-me" });
+    expect(backend.lastCancelSteer).toMatchObject({
+      userMessageId: "retract-me",
+    });
     expect(chatManager.getQueuedMessage("retract-me")).toBeUndefined();
   });
 
@@ -1704,6 +1753,136 @@ describe("chat streaming resilience", () => {
     return { userMessageId: userMessage.id };
   }
 
+  it("an edit cancels an in-flight turn and preserves its partial branch", async () => {
+    const { instanceId, chatId } = await makeChat();
+    await runTurn(instanceId, chatId, "first question", [
+      { kind: "meta", meta: { sessionId: "sess-1", anchorId: "anchor-1" } },
+      { kind: "delta", text: "first answer" },
+    ]);
+
+    backend.setScript([{ kind: "delta", text: "partial old answer" }, { kind: "abortable" }]);
+    const oldResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "question being replaced" }),
+      },
+    );
+    await waitForInFlight(chatId);
+    const original = chatManager
+      .getMessages(chatId)
+      .find((message) => message.content === "question being replaced")!;
+
+    backend.setScript([
+      { kind: "meta", meta: { sessionId: "sess-2", anchorId: "anchor-2" } },
+      { kind: "delta", text: "replacement answer" },
+    ]);
+    const editResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages/${original.id}/edit`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "replacement question" }),
+      },
+    );
+    expect(editResponse.status).toBe(200);
+    const [{ events: oldEvents }, { events: editEvents }] = await Promise.all([
+      readAllSse(oldResponse),
+      readAllSse(editResponse),
+    ]);
+    expect(oldEvents.at(-1)?.event).toBe("error");
+    expect(editEvents.at(-1)?.event).toBe("done");
+
+    const messages = chatManager.getMessages(chatId);
+    const partial = messages.find((message) => message.content === "partial old answer")!;
+    const replacement = messages.find((message) => message.content === "replacement question")!;
+    const replacementAnswer = messages.find((message) => message.content === "replacement answer")!;
+    expect(partial.parentId).toBe(original.id);
+    expect(replacement.parentId).toBe(original.parentId);
+    expect(replacementAnswer.parentId).toBe(replacement.id);
+    expect(chatManager.get(chatId)?.activeLeafId).toBe(replacementAnswer.id);
+  });
+
+  it("does not admit a normal send while an edit is cleaning up the old turn", async () => {
+    const { instanceId, chatId } = await makeChat();
+    await runTurn(instanceId, chatId, "first question", [
+      { kind: "meta", meta: { sessionId: "sess-1", anchorId: "anchor-1" } },
+      { kind: "delta", text: "first answer" },
+    ]);
+
+    let releaseCleanup!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => {
+      releaseCleanup = resolve;
+    });
+    backend.setScript([
+      { kind: "delta", text: "partial old answer" },
+      { kind: "abortable_cleanup", promise: cleanupGate },
+    ]);
+    const oldResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "question being replaced" }),
+      },
+    );
+    await waitForInFlight(chatId);
+    const original = chatManager
+      .getMessages(chatId)
+      .find((message) => message.content === "question being replaced")!;
+
+    backend.setScript([{ kind: "delta", text: "replacement started" }, { kind: "abortable" }]);
+    const editRequest = fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages/${original.id}/edit`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "replacement question" }),
+      },
+    );
+    for (let i = 0; i < 50 && !backend.lastSignal?.aborted; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(backend.lastSignal?.aborted).toBe(true);
+
+    const competingSend = fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: "must not slip through" }),
+    });
+    const queuedResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/queue`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: "queued-during-rewind",
+          content: "wait until replacement",
+        }),
+      },
+    );
+    expect(queuedResponse.status).toBe(201);
+
+    releaseCleanup();
+    const editResponse = await editRequest;
+    expect(editResponse.status).toBe(200);
+    expect((await competingSend).status).toBe(409);
+
+    const replacementMessageId = await waitForInFlight(chatId);
+    expect(chatManager.getQueuedMessage("queued-during-rewind")?.status).toBe("queued");
+    await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages/${replacementMessageId}`,
+      { method: "DELETE" },
+    );
+    await Promise.all([readAllSse(oldResponse), readAllSse(editResponse)]);
+    expect(
+      chatManager
+        .getMessages(chatId)
+        .some((message) => message.content === "must not slip through"),
+    ).toBe(false);
+  });
+
   it("edit forks the session at the previous turn and records a sibling branch", async () => {
     const { instanceId, chatId } = await makeChat();
     const turn1 = await runTurn(instanceId, chatId, "first question", [
@@ -1826,6 +2005,63 @@ describe("chat streaming resilience", () => {
       },
     );
     expect(editUnknown.status).toBe(404);
+  });
+
+  it("version navigation cancels an in-flight turn before activating the target branch", async () => {
+    const { instanceId, chatId } = await makeChat();
+    await runTurn(instanceId, chatId, "q1", [
+      { kind: "meta", meta: { sessionId: "sess-1", anchorId: "anchor-1" } },
+      { kind: "delta", text: "a1" },
+    ]);
+    const original = await runTurn(instanceId, chatId, "q2", [
+      { kind: "meta", meta: { sessionId: "sess-1", anchorId: "anchor-2" } },
+      { kind: "delta", text: "original answer" },
+    ]);
+    const originalAssistant = chatManager
+      .getMessages(chatId)
+      .find((message) => message.parentId === original.userMessageId)!;
+    await runTurn(
+      instanceId,
+      chatId,
+      "q2 edited",
+      [
+        { kind: "meta", meta: { sessionId: "sess-2", anchorId: "anchor-2b" } },
+        { kind: "delta", text: "edited answer" },
+      ],
+      original.userMessageId,
+    );
+
+    backend.setScript([{ kind: "delta", text: "partial branch work" }, { kind: "abortable" }]);
+    const oldResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "continue edited branch" }),
+      },
+    );
+    await waitForInFlight(chatId);
+
+    const switchResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/active-leaf`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ leafId: original.userMessageId }),
+      },
+    );
+    expect(switchResponse.status).toBe(200);
+    const switched = (await switchResponse.json()) as {
+      activeLeafId: string;
+      transcript: { messages: { id: string }[] };
+    };
+    const { events } = await readAllSse(oldResponse);
+    expect(events.at(-1)?.event).toBe("error");
+    expect(switched.activeLeafId).toBe(originalAssistant.id);
+    expect(switched.transcript.messages.at(-1)?.id).toBe(originalAssistant.id);
+    expect(
+      chatManager.getMessages(chatId).some((message) => message.content === "partial branch work"),
+    ).toBe(true);
   });
 
   it("active-leaf switches branches, descends to the tip, and re-points the session", async () => {
