@@ -171,7 +171,7 @@ const ThoughtBlock = memo(function ThoughtBlock({ chunk }: { chunk: ThoughtChunk
           )}
           <Sparkles
             className={cn(
-              "relative size-3.5 text-muted-foreground transition-colors",
+              "relative size-3.5 text-muted-foreground",
               active && "thinking-spark text-foreground/80",
             )}
           />
@@ -265,11 +265,11 @@ const ToolCallBlock = memo(function ToolCallBlock({
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}
-        className="group w-full flex items-center gap-2 text-left text-sm py-0.5 rounded transition-colors"
+        className="group w-full flex items-center gap-2 text-left text-sm py-0.5 rounded"
       >
         <Icon
           className={cn(
-            "h-3.5 w-3.5 flex-shrink-0 transition-colors",
+            "h-3.5 w-3.5 flex-shrink-0",
             chunk.isError
               ? "text-destructive"
               : isRunning

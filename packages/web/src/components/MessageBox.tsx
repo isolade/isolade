@@ -93,7 +93,7 @@ export function MessageBox({
   return (
     <div
       className={cn(
-        "flex flex-col gap-2 rounded-2xl border border-input bg-background px-3 py-2 shadow-xs transition-colors focus-within:border-ring/60 dark:bg-input/30",
+        "flex flex-col gap-2 rounded-2xl border border-input bg-background px-3 py-2 shadow-xs focus-within:border-ring/60 dark:bg-input/30",
         className,
       )}
     >

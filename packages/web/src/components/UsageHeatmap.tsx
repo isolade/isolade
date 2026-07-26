@@ -208,7 +208,7 @@ export default function UsageHeatmap({ days }: { days: UsageDay[] }) {
               aria-pressed={metric === m}
               onClick={() => setMetric(m)}
               className={cn(
-                "rounded px-2 py-0.5 text-xs capitalize transition-colors",
+                "rounded px-2 py-0.5 text-xs capitalize",
                 metric === m
                   ? "bg-foreground text-background"
                   : "text-muted-foreground hover:text-foreground",
@@ -265,7 +265,7 @@ export default function UsageHeatmap({ days }: { days: UsageDay[] }) {
                       <div
                         key={ri}
                         className={cn(
-                          "rounded-[2px] ring-1 ring-inset ring-black/[0.06] transition-colors",
+                          "rounded-[2px] ring-1 ring-inset ring-black/[0.06]",
                           color ? "" : "bg-muted",
                         )}
                         style={{

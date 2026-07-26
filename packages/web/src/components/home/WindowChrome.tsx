@@ -32,7 +32,7 @@ interface WindowChromeProps {
 // Ghost-button chrome: no hover fill or focus ring, just an icon colour shift,
 // so a control in the window chrome never reads as a stray tinted box.
 const chromeBase =
-  "text-muted-foreground hover:text-foreground hover:bg-transparent dark:hover:bg-transparent transition-colors focus-visible:ring-0";
+  "text-muted-foreground hover:text-foreground hover:bg-transparent dark:hover:bg-transparent focus-visible:ring-0";
 
 export default function WindowChrome({
   isTauri,

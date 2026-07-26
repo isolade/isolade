@@ -2047,7 +2047,7 @@ function Chat({
           aria-label="Jump to latest"
           onClick={() => scrollToBottom(true)}
           style={{ bottom: composerHeight + 12 }}
-          className="absolute left-1/2 -translate-x-1/2 flex h-8 w-8 items-center justify-center rounded-full border border-border bg-card text-muted-foreground shadow-md transition-colors hover:text-foreground"
+          className="absolute left-1/2 -translate-x-1/2 flex h-8 w-8 items-center justify-center rounded-full border border-border bg-card text-muted-foreground shadow-md hover:text-foreground"
         >
           <ArrowDown className="h-4 w-4" />
         </button>

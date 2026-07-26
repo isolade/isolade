@@ -222,7 +222,7 @@ function InstanceView({
                   size="icon"
                   aria-label="New tab"
                   title="New tab"
-                  className="size-7 opacity-40 hover:opacity-100 transition-opacity"
+                  className="size-7 opacity-40 hover:opacity-100"
                 >
                   <Plus className="size-4" />
                 </Button>

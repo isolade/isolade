@@ -172,7 +172,7 @@ export default function NetworkTab({ activeProfileId }: { activeProfileId: strin
               <label
                 key={value}
                 className={cn(
-                  "flex items-start gap-2.5 rounded-lg border p-3 cursor-pointer transition-colors",
+                  "flex items-start gap-2.5 rounded-lg border p-3 cursor-pointer",
                   selected
                     ? "border-primary ring-2 ring-ring/40"
                     : "border-border hover:bg-accent/40",

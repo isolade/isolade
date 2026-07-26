@@ -57,7 +57,7 @@ export default function TitleBarPrs({
               type="button"
               title={tooltip(pr)}
               onClick={() => void openExternal(pr.url)}
-              className="flex h-full items-center gap-1 rounded-md pl-1.5 pr-1 text-xs text-foreground transition-colors hover:text-foreground/80"
+              className="flex h-full items-center gap-1 rounded-md pl-1.5 pr-1 text-xs text-foreground hover:text-foreground/80"
             >
               <Icon className={cn("size-3.5 flex-shrink-0", color)} aria-hidden />
               <span className="tabular-nums">#{pr.number}</span>
@@ -67,7 +67,7 @@ export default function TitleBarPrs({
               aria-label={`Detach PR #${pr.number}`}
               title="Detach"
               onClick={() => onDetach(pr)}
-              className="grid size-4 flex-shrink-0 place-items-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-foreground/10 hover:text-foreground group-hover/pr:opacity-100"
+              className="grid size-4 flex-shrink-0 place-items-center rounded text-muted-foreground opacity-0 hover:bg-foreground/10 hover:text-foreground group-hover/pr:opacity-100"
             >
               <X className="size-3" />
             </button>

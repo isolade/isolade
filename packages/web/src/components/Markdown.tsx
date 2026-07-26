@@ -59,7 +59,7 @@ function CopyButton({ text }: { text: string }) {
             console.warn("[markdown] clipboard write failed:", err);
           });
       }}
-      className="text-muted-foreground hover:text-foreground transition-colors"
+      className="text-muted-foreground hover:text-foreground"
     >
       <Icon className="h-3 w-3" />
     </button>
@@ -208,7 +208,7 @@ const components: Components = {
   },
   tbody({ children }) {
     return (
-      <tbody className="[&_tr]:border-t [&_tr]:border-border [&_tr:nth-child(even)]:bg-muted/30 [&_tr:hover]:bg-muted/50 [&_tr]:transition-colors">
+      <tbody className="[&_tr]:border-t [&_tr]:border-border [&_tr:nth-child(even)]:bg-muted/30 [&_tr:hover]:bg-muted/50">
         {children}
       </tbody>
     );

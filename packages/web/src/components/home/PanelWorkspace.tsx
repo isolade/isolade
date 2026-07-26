@@ -1181,7 +1181,7 @@ function TabButton({
         // Flat tab: no per-tab box, just a foreground underline under the active
         // tab (the tab strip itself has no bottom border).
         "group/tab relative flex items-center gap-1 px-2 h-full text-xs cursor-pointer select-none whitespace-nowrap flex-shrink-0",
-        "after:absolute after:inset-x-0 after:bottom-0 after:h-0.5 after:bg-foreground after:transition-opacity",
+        "after:absolute after:inset-x-0 after:bottom-0 after:h-0.5 after:bg-foreground",
         active && panelFocused && "text-foreground after:opacity-100",
         active && !panelFocused && "text-foreground/70 after:opacity-35",
         !active && "text-muted-foreground hover:text-foreground after:opacity-0",
@@ -1213,7 +1213,7 @@ function TabButton({
       <Button
         variant="ghost"
         size="icon"
-        className="size-4 opacity-0 transition-none group-hover/tab:opacity-100 data-[active=true]:opacity-100 -mr-1"
+        className="size-4 opacity-0 group-hover/tab:opacity-100 data-[active=true]:opacity-100 -mr-1"
         data-active={active}
         onClick={(e) => {
           e.stopPropagation();
