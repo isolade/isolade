@@ -8,7 +8,7 @@ import { schema } from "../src/db";
 // Isolate XDG dirs so a test server's profile/auth/git/network state writes to a
 // throwaway temp tree, never the developer's real ~/.config / ~/.local. Returns
 // a restore() that puts the env back and removes the temp tree.
-function isolateXdg(): { restore: () => void } {
+function isolateXdg(): { root: string; restore: () => void } {
   const root = mkdtempSync(join(tmpdir(), "isolade-srv-"));
   const vars = ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"] as const;
   const prev = new Map(vars.map((v) => [v, process.env[v]] as const));
@@ -17,6 +17,7 @@ function isolateXdg(): { restore: () => void } {
   process.env.XDG_CACHE_HOME = join(root, "cache");
   process.env.XDG_STATE_HOME = join(root, "state");
   return {
+    root,
     restore() {
       for (const [v, value] of prev) {
         if (value === undefined) delete process.env[v];
@@ -53,11 +54,20 @@ function unregisterFetchHost(host: string) {
 }
 
 export function createTestServer(dbPathOrOpts?: string | CreateAppOptions) {
+  const xdg = isolateXdg();
   const opts: CreateAppOptions =
     typeof dbPathOrOpts === "string" || dbPathOrOpts === undefined
-      ? { dbPath: dbPathOrOpts || ":memory:", skipResync: true }
-      : { dbPath: ":memory:", skipResync: true, ...dbPathOrOpts };
-  const xdg = isolateXdg();
+      ? {
+          dbPath: dbPathOrOpts || ":memory:",
+          skipResync: true,
+          seedMountDir: join(xdg.root, "seed"),
+        }
+      : {
+          dbPath: ":memory:",
+          skipResync: true,
+          seedMountDir: join(xdg.root, "seed"),
+          ...dbPathOrOpts,
+        };
   const { app, instances, chatManager, chatStreamHub, db, websocket } = createApp(opts);
 
   // Real loopback server so WebSocket upgrades work, and the fetch shim below
