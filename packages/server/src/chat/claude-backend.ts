@@ -80,14 +80,15 @@ export class ClaudeBackend implements ChatBackend {
     this.chatCosts.delete(chatId);
   }
 
-  // Shut down the persistent process for one chat (chat deleted). Closes stdin
-  // so the CLI drains and exits, taking its background tasks with it.
-  disposeChat(chatId: string): void {
+  // Shut down the persistent process for one chat. Used when the chat is
+  // deleted or its conversation branch changes. Closes stdin so the CLI drains
+  // and exits, taking its background tasks with it.
+  disposeChat(chatId: string): Promise<void> {
     const session = this.sessions.get(chatId);
-    if (!session) return;
+    if (!session) return Promise.resolve();
     this.sessions.delete(chatId);
     this.clearIdle(chatId);
-    void session.shutdown();
+    return session.shutdown();
   }
 
   // Shut down every persistent process running in a VM (instance restart /
@@ -96,7 +97,7 @@ export class ClaudeBackend implements ChatBackend {
   // until the next turn. Mirrors codexManager.close(vmId).
   disposeForVm(vmId: string): void {
     for (const [chatId, session] of this.sessions) {
-      if (session.vmId === vmId) this.disposeChat(chatId);
+      if (session.vmId === vmId) void this.disposeChat(chatId);
     }
     const titleSession = this.titleSessions.get(vmId);
     if (titleSession) {
@@ -665,7 +666,10 @@ export class ClaudeBackend implements ChatBackend {
         ) {
           const text = typeof inner.delta.thinking === "string" ? inner.delta.thinking : "";
           const buffer = thinkingBuffers.get(inner.index)!;
-          thinkingBuffers.set(inner.index, { ...buffer, text: buffer.text + text });
+          thinkingBuffers.set(inner.index, {
+            ...buffer,
+            text: buffer.text + text,
+          });
           handled = true;
         } else if (
           inner?.type === "content_block_stop" &&
@@ -889,7 +893,12 @@ export class ClaudeBackend implements ChatBackend {
     try {
       const response = await session.getContextUsage();
       const breakdown = parseContextUsage(response);
-      return breakdown ?? { available: false, reason: "invalid context usage response" };
+      return (
+        breakdown ?? {
+          available: false,
+          reason: "invalid context usage response",
+        }
+      );
     } finally {
       if (this.sessions.get(opts.chatId) === session && !session.isDead()) {
         this.armIdle(opts.chatId, session);

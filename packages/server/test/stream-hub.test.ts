@@ -42,7 +42,10 @@ describe("ChatStreamHub", () => {
       .run();
     chatId = chatManager.create(instanceId, "claude-sonnet-4-5", "anthropic", "high").id;
     messageId = randomUUID();
-    hub = new ChatStreamHub(chatManager, { idleCancelMs: 60_000, evictionMs: 60_000 });
+    hub = new ChatStreamHub(chatManager, {
+      idleCancelMs: 60_000,
+      evictionMs: 60_000,
+    });
   });
 
   it("captures compact state atomically and delivers only later events", async () => {
@@ -137,14 +140,24 @@ describe("ChatStreamHub", () => {
         await hold;
         api.publish("thinking", { text: "secret" });
         api.publish("thinking_start", { id: "visible", provider: "claude" });
-        api.publish("thinking_tokens", { id: "visible", provider: "claude", tokens: 768 });
-        api.publish("raw", { source: "claude", payload: { value: "z".repeat(20_000) } });
+        api.publish("thinking_tokens", {
+          id: "visible",
+          provider: "claude",
+          tokens: 768,
+        });
+        api.publish("raw", {
+          source: "claude",
+          payload: { value: "z".repeat(20_000) },
+        });
         api.publish("tool_call_start", { id: "tool", name: "Bash" });
         api.publish("tool_call_input", {
           id: "tool",
           input: { command: `echo ${"x".repeat(20_000)}` },
         });
-        api.publish("tool_call_result", { id: "tool", output: "y".repeat(20_000) });
+        api.publish("tool_call_result", {
+          id: "tool",
+          output: "y".repeat(20_000),
+        });
       },
     });
     const subscriber = captureSubscriber();
@@ -167,7 +180,10 @@ describe("ChatStreamHub", () => {
       summary?: string;
       detailsAvailable?: boolean;
     };
-    const result = events[4]!.event.payload as { output: string; detailsAvailable?: boolean };
+    const result = events[4]!.event.payload as {
+      output: string;
+      detailsAvailable?: boolean;
+    };
     expect(JSON.stringify(input.input).length).toBeLessThan(1_200);
     expect(input.summary).toStartWith("echo ");
     expect(input.summary!.length).toBeLessThan(600);
@@ -238,7 +254,10 @@ describe("ChatStreamHub", () => {
     hub.subscribeSnapshot(chatId, messageId, false, subscriber.cb);
     expect(hub.cancel(messageId)).toBe(true);
     await subscriber.terminal;
-    expect(subscriber.signals.at(-1)).toEqual({ kind: "error", message: "aborted" });
+    expect(subscriber.signals.at(-1)).toEqual({
+      kind: "error",
+      message: "aborted",
+    });
 
     const deletedMessageId = randomUUID();
     const deletedSubscriber = captureSubscriber();
@@ -255,6 +274,26 @@ describe("ChatStreamHub", () => {
     await deletedSubscriber.terminal;
     expect(deletedSubscriber.signals.at(-1)?.kind).toBe("error");
     expect(hub.has(deletedMessageId)).toBe(false);
+  });
+
+  it("waits for a chat's cancelled producer to settle", async () => {
+    let finishedCleanup = false;
+    hub.startTurn({
+      chatId,
+      messageId,
+      run: async (api) => {
+        await new Promise<void>((_, reject) => {
+          api.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        }).finally(() => {
+          finishedCleanup = true;
+        });
+      },
+    });
+
+    expect(await hub.cancelInFlightForChat(chatId)).toBe(true);
+    expect(finishedCleanup).toBe(true);
+    expect(hub.inFlightFor(chatId)).toBe(null);
+    expect(await hub.cancelInFlightForChat(chatId)).toBe(false);
   });
 
   it("uses one bounded no-subscriber lifetime", async () => {
@@ -281,7 +320,10 @@ describe("ChatStreamHub", () => {
     await new Promise((resolve) => setTimeout(resolve, 80));
     expect(abandonedTurnAborted).toBe(true);
 
-    const fastHub = new ChatStreamHub(chatManager, { idleCancelMs: 40, evictionMs: 60_000 });
+    const fastHub = new ChatStreamHub(chatManager, {
+      idleCancelMs: 40,
+      evictionMs: 60_000,
+    });
     let aborted = false;
     fastHub.startTurn({
       chatId,

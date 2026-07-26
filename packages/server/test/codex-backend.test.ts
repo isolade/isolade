@@ -23,6 +23,9 @@ class FakeCodexConn {
   // When set, `turn/start` records the request but withholds its response until
   // this resolves, letting a test abort while the turn id is still pending.
   turnStartGate: Promise<void> | null = null;
+  // When set, holds the turn/interrupt response so tests can verify the
+  // backend does not release the caller before Codex acknowledges teardown.
+  interruptGate: Promise<void> | null = null;
 
   on(method: string, h: (p: unknown) => void) {
     const a = this.handlers.get(method) ?? [];
@@ -60,6 +63,9 @@ class FakeCodexConn {
         for (const [m, p] of this.script) this.fire(m, p);
       });
       return { turn: { id: "turn-1" } };
+    }
+    if (method === "turn/interrupt" && this.interruptGate) {
+      await this.interruptGate;
     }
     return {};
   }
@@ -121,7 +127,12 @@ describe("CodexBackend notification parsing", () => {
         {
           threadId: "thread-1",
           turnId: "turn-1",
-          item: { type: "userMessage", id: "item-1", clientId: "user-stable", content: [] },
+          item: {
+            type: "userMessage",
+            id: "item-1",
+            clientId: "user-stable",
+            content: [],
+          },
         },
       ],
       ["turn/completed", { turn: { status: "completed" } }],
@@ -158,7 +169,12 @@ describe("CodexBackend notification parsing", () => {
         {
           threadId: "thread-1",
           turnId: "turn-1",
-          item: { type: "userMessage", id: "item-new", clientId: "user-new", content: [] },
+          item: {
+            type: "userMessage",
+            id: "item-new",
+            clientId: "user-new",
+            content: [],
+          },
         },
       ],
       [
@@ -413,7 +429,11 @@ describe("CodexBackend notification parsing", () => {
       ["item/reasoning/summaryPartAdded", { itemId: "r1", summaryIndex: 1 }],
       [
         "item/reasoning/summaryTextDelta",
-        { itemId: "r1", summaryIndex: 1, delta: "**Checking the implementation**" },
+        {
+          itemId: "r1",
+          summaryIndex: 1,
+          delta: "**Checking the implementation**",
+        },
       ],
       [
         "item/completed",
@@ -598,8 +618,16 @@ describe("CodexBackend notification parsing", () => {
           "thread/tokenUsage/updated",
           {
             tokenUsage: {
-              last: { inputTokens: 100, outputTokens: 80, reasoningOutputTokens: 50 },
-              total: { inputTokens: 100, outputTokens: 80, reasoningOutputTokens: 50 },
+              last: {
+                inputTokens: 100,
+                outputTokens: 80,
+                reasoningOutputTokens: 50,
+              },
+              total: {
+                inputTokens: 100,
+                outputTokens: 80,
+                reasoningOutputTokens: 50,
+              },
               modelContextWindow: 400000,
             },
           },
@@ -690,6 +718,37 @@ describe("CodexBackend notification parsing", () => {
     });
   });
 
+  it("waits for Codex to acknowledge interruption before releasing the turn", async () => {
+    const { backend, mgr } = backendWith([]);
+    let releaseInterrupt!: () => void;
+    mgr.conn.interruptGate = new Promise<void>((resolve) => {
+      releaseInterrupt = resolve;
+    });
+    const ac = new AbortController();
+    const sending = backend.sendMessage({
+      vmId: "vm",
+      chatId: "chat",
+      message: "hi",
+      model: "gpt-5-codex",
+      effort: "medium",
+      sessionId: "thread-1",
+      signal: ac.signal,
+      onDelta: () => {},
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    ac.abort();
+    let settled = false;
+    void sending.catch(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(settled).toBe(false);
+
+    releaseInterrupt();
+    await expect(sending).rejects.toThrow("aborted");
+  });
+
   it("reports thread and turn ids through onMeta", async () => {
     const { backend } = backendWith([["turn/completed", { turn: { status: "completed" } }]]);
     const metas: Array<{ sessionId?: string; anchorId?: string }> = [];
@@ -744,7 +803,10 @@ describe("CodexBackend notification parsing", () => {
     const turnStart = mgr.conn.sent.find((s) => s.method === "turn/start");
     expect((turnStart!.params as { threadId: string }).threadId).toBe("thread-forked");
     // The chat's session column follows the forked thread immediately.
-    expect(updated).toContainEqual({ chatId: "chat-1", codexThreadId: "thread-forked" });
+    expect(updated).toContainEqual({
+      chatId: "chat-1",
+      codexThreadId: "thread-forked",
+    });
     expect(metas).toContainEqual({ sessionId: "thread-forked" });
   });
 

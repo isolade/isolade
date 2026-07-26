@@ -196,6 +196,7 @@ export class CodexBackend implements ChatBackend {
       let turnStartPromise: Promise<{ turn: { id: string } }> | null = null;
       let activeTurnId: string | null = null;
       let acknowledged = false;
+      let aborting = false;
       const belongsToTurn = (params: unknown): boolean => {
         const envelope = params as {
           threadId?: unknown;
@@ -224,6 +225,10 @@ export class CodexBackend implements ChatBackend {
         }
         return false;
       };
+      const rejectAborted = () => {
+        cleanup();
+        reject(new DOMException("aborted", "AbortError"));
+      };
       const offDelta = conn.on("item/agentMessage/delta", (params) => {
         if (!belongsToTurn(params)) return;
         const delta = (params as { delta?: string } | null)?.delta ?? "";
@@ -246,6 +251,7 @@ export class CodexBackend implements ChatBackend {
             turn?: { status?: string; error?: { message?: string } };
           } | null
         )?.turn;
+        if (aborting) return;
         if (turn?.status === "failed") {
           cleanup();
           reject(new Error(turn.error?.message ?? "turn failed"));
@@ -258,6 +264,7 @@ export class CodexBackend implements ChatBackend {
 
       const offFailed = conn.on("turn/failed", (params) => {
         if (!belongsToTurn(params)) return;
+        if (aborting) return;
         cleanup();
         const errMsg =
           (params as { error?: { message?: string } } | null)?.error?.message ?? "turn failed";
@@ -332,7 +339,11 @@ export class CodexBackend implements ChatBackend {
         if (existing) return existing;
         const state = { parts: new Map<number, string>(), done: false };
         reasoning.set(itemId, state);
-        opts.onEvent?.({ type: "thinking_start", id: itemId, provider: "codex" });
+        opts.onEvent?.({
+          type: "thinking_start",
+          id: itemId,
+          provider: "codex",
+        });
         return state;
       };
       const reasoningText = (state: { parts: Map<number, string> }) =>
@@ -587,33 +598,33 @@ export class CodexBackend implements ChatBackend {
 
       // User-initiated cancel: interrupt the actual Codex turn before
       // unblocking the chat. `turn/interrupt` needs the turn id returned by
-      // `turn/start`, so an early Stop waits for that response first. The
-      // interrupt is pushed onto app-server stdin (a synchronous `conn.send`)
-      // before the reject in `.finally` runs, so it is guaranteed to reach the
-      // app-server ahead of any later turn/start.
+      // `turn/start`, so an early Stop waits for that response first. Await the
+      // interrupt response before rejecting so a branch replacement
+      // cannot start another turn while the old one still owns tools.
       const onAbort = () => {
-        cleanup();
+        if (aborting) return;
+        aborting = true;
         const started = turnStartPromise;
         if (!started) {
-          reject(new DOMException("aborted", "AbortError"));
+          rejectAborted();
           return;
         }
         void started
-          .then((res) => {
+          .then(async (res) => {
             // Defensive: the turn-start result shape is asserted, not
             // validated. If codex ever omits the turn id there's nothing to
             // interrupt, so skip the send rather than throw into the catch.
             const turnId = res?.turn?.id;
             if (!turnId) return;
-            void conn
-              .send("turn/interrupt", { threadId, turnId })
-              .catch((err: Error) => console.warn("[codex] turn interrupt failed:", err));
+            await conn.send("turn/interrupt", { threadId, turnId }).catch((err: Error) => {
+              console.warn("[codex] turn interrupt failed:", err);
+            });
           })
           // turn/start has its own rejection handler below. Consume it on
           // this cancellation chain too so an abort racing a failed start
           // cannot create an unhandled rejection.
           .catch(() => {})
-          .finally(() => reject(new DOMException("aborted", "AbortError")));
+          .finally(rejectAborted);
       };
       if (opts.signal) {
         if (opts.signal.aborted) {
@@ -658,6 +669,10 @@ export class CodexBackend implements ChatBackend {
         turnId: turnStartPromise.then((result) => result.turn.id),
       });
       turnStartPromise.catch((err: Error) => {
+        if (aborting) {
+          rejectAborted();
+          return;
+        }
         cleanup();
         reject(err);
       });
@@ -743,7 +758,10 @@ export class CodexBackend implements ChatBackend {
     const threadId = active?.threadId ?? opts.sessionId;
     if (!threadId) return false;
     if (!active) await this.ensureThreadLive(conn, threadId);
-    const result = await conn.send("thread/read", { threadId, includeTurns: true });
+    const result = await conn.send("thread/read", {
+      threadId,
+      includeTurns: true,
+    });
     return containsClientUserMessageId(result, opts.userMessageId);
   }
 
@@ -872,7 +890,10 @@ function extractCodexItem(params: unknown): CodexItem | null {
   return o as CodexItem;
 }
 
-function parseCodexRetryProgress(message: string): { attempt: number; maxRetries: number } {
+function parseCodexRetryProgress(message: string): {
+  attempt: number;
+  maxRetries: number;
+} {
   const match = message.match(/(\d+)\s*\/\s*(\d+)/);
   if (!match) return { attempt: 0, maxRetries: 0 };
   return {

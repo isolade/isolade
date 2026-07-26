@@ -224,7 +224,12 @@ function Chat({
     chunks: StreamChunk[];
   } | null>(() =>
     initialLiveRenderKeyRef.current
-      ? { renderKey: initialLiveRenderKeyRef.current, messageId: null, parentId: null, chunks: [] }
+      ? {
+          renderKey: initialLiveRenderKeyRef.current,
+          messageId: null,
+          parentId: null,
+          chunks: [],
+        }
       : null,
   );
   const [hasOlder, setHasOlder] = useState(false);
@@ -709,7 +714,9 @@ function Chat({
         // Debug mode deliberately fills full structural data afterward in
         // focused batches, so one raw provider payload cannot block first
         // paint or inflate every hidden chat's warm state.
-        const page = await listChatTranscript(instanceId, chatId, { signal: ac.signal });
+        const page = await listChatTranscript(instanceId, chatId, {
+          signal: ac.signal,
+        });
         if (!transcriptRequests.accepts(generation, ac)) return;
         hydratedRef.current = true;
         pinNextCommitToBottom();
@@ -808,7 +815,10 @@ function Chat({
     const generation = transcriptRequests.current;
     const controller = transcriptRequests.createController();
     loadingOlderRef.current = true;
-    void listChatTranscript(instanceId, chatId, { before, signal: controller.signal })
+    void listChatTranscript(instanceId, chatId, {
+      before,
+      signal: controller.signal,
+    })
       .then((page) => {
         if (!transcriptRequests.accepts(generation, controller)) return;
         if (messages[0]?.id !== before) return;
@@ -877,7 +887,13 @@ function Chat({
                   }
                   return Object.keys(relevant).length === 0
                     ? page
-                    : { ...page, chunksByMessage: { ...page.chunksByMessage, ...relevant } };
+                    : {
+                        ...page,
+                        chunksByMessage: {
+                          ...page.chunksByMessage,
+                          ...relevant,
+                        },
+                      };
                 }),
               );
               setSessionRows((rows) =>
@@ -959,7 +975,10 @@ function Chat({
             const next = [...current];
             if (!mergeToolDetails(next, fetched, toolId).changed) return page;
             changed = true;
-            return { ...page, chunksByMessage: { ...page.chunksByMessage, [messageId]: next } };
+            return {
+              ...page,
+              chunksByMessage: { ...page.chunksByMessage, [messageId]: next },
+            };
           });
           return changed ? nextPages : pages;
         });
@@ -1144,9 +1163,12 @@ function Chat({
         revealRafRef.current = null;
         previousRevealTimestamp = null;
       };
-      const canRenderLive = () => visibleRef.current && document.visibilityState === "visible";
+      const isDetached = () => detachedControllersRef.current.has(ac);
+      const canRenderLive = () =>
+        !isDetached() && visibleRef.current && document.visibilityState === "visible";
       const canAnimateLive = () => canRenderLive() && !reduceMotion;
       const renderLive = (renderedChunks: StreamChunk[]) => {
+        if (isDetached()) return;
         if (!canRenderLive()) {
           hiddenLiveRenderDirtyRef.current = true;
           return;
@@ -1156,6 +1178,7 @@ function Chat({
         scrollToBottom();
       };
       const queueLiveRender = (renderedChunks: StreamChunk[]) => {
+        if (isDetached()) return;
         if (!canRenderLive()) {
           hiddenLiveRenderDirtyRef.current = true;
           return;
@@ -1243,6 +1266,7 @@ function Chat({
         });
       };
       const handleVisibilityChange = () => {
+        if (isDetached()) return;
         if (document.visibilityState !== "visible") {
           settleRevealWithoutAnimation(false);
           return;
@@ -1301,6 +1325,11 @@ function Chat({
       };
 
       const commit = (id: string, content: string) => {
+        if (isDetached()) {
+          pendingCommit = null;
+          terminalHandled = true;
+          return;
+        }
         cancelLiveRender();
         cancelReveal();
         pendingCommit = null;
@@ -1347,6 +1376,7 @@ function Chat({
       // Append a client-only assistant error bubble at the tip of the
       // visible branch (and advance the leaf so it stays visible).
       const appendErrorBubble = (content: string) => {
+        if (isDetached()) return;
         const errMsg: TranscriptMessage = {
           id: `err-${crypto.randomUUID()}`,
           chatId,
@@ -1361,6 +1391,7 @@ function Chat({
       };
 
       const onEvent = (ev: ChatTurnEvent) => {
+        if (isDetached()) return;
         if (ev.kind === "message_id") {
           serverMessageId = ev.messageId;
           streamingMessageIdRef.current = ev.messageId;
@@ -1385,7 +1416,10 @@ function Chat({
             ev.snapshot.message?.content &&
             ev.snapshot.message.content.length > 0
           ) {
-            snapshotChunks.push({ kind: "text", text: ev.snapshot.message.content });
+            snapshotChunks.push({
+              kind: "text",
+              text: ev.snapshot.message.content,
+            });
           }
           replaceChunksFromSnapshot(chunks, toolIndex, snapshotChunks, ev.snapshot.lastSeq, []);
           cancelReveal();
@@ -1408,6 +1442,7 @@ function Chat({
           setActiveSwitch((prev) =>
             prev && prev.userId === pendingId ? { ...prev, userId: serverMsg.id } : prev,
           );
+          setEditingId((id) => (id === pendingId ? serverMsg.id : id));
           setSessionRows((rows) => {
             const idx = pendingId ? rows.findIndex((row) => row.message.id === pendingId) : -1;
             if (idx >= 0) {
@@ -1629,12 +1664,39 @@ function Chat({
         }
       } finally {
         document.removeEventListener("visibilitychange", handleVisibilityChange);
-        cancelLiveRender();
-        cancelReveal();
+        // A branch change can start the replacement reader before this old
+        // fetch finishes unwinding. Its rAFs were cancelled when it detached,
+        // so do not let this stale cleanup cancel frames owned by the new turn.
+        if (!isDetached()) {
+          cancelLiveRender();
+          cancelReveal();
+        }
       }
     },
     [chatId, scrollToBottom, onTitle, setActiveLeaf],
   );
+
+  // Detach before aborting so the old drain cannot commit its partial
+  // response back into a UI that has already switched branches. Cancel its
+  // scheduled frames now, since the replacement reader starts immediately
+  // and owns these shared refs from that point onward. The server owns
+  // cancellation, durable partial persistence, and provider teardown.
+  const detachActiveDrain = useCallback((): void => {
+    const ac = abortRef.current;
+    if (ac) {
+      detachedControllersRef.current.add(ac);
+      if (abortRef.current === ac) abortRef.current = null;
+      ac.abort();
+    }
+    if (liveRenderRafRef.current !== null) {
+      cancelAnimationFrame(liveRenderRafRef.current);
+      liveRenderRafRef.current = null;
+    }
+    if (revealRafRef.current !== null) {
+      cancelAnimationFrame(revealRafRef.current);
+      revealRafRef.current = null;
+    }
+  }, []);
 
   const sendMessage = useCallback(
     async (override?: string, force = false, overrideUploadIds?: string[]) => {
@@ -1762,7 +1824,12 @@ function Chat({
       const renderKey = liveRenderKeyRef.current ?? `live-${crypto.randomUUID()}`;
       liveRenderKeyRef.current = renderKey;
       pinNextCommitToBottom();
-      setLiveRow({ renderKey, messageId: null, parentId: optimisticId, chunks: [] });
+      setLiveRow({
+        renderKey,
+        messageId: null,
+        parentId: optimisticId,
+        chunks: [],
+      });
       if (!reuseBootstrap) {
         const optimistic: TranscriptMessage = {
           id: optimisticId,
@@ -1799,7 +1866,9 @@ function Chat({
           }),
         );
       } finally {
-        pendingAssistantVersionRef.current = null;
+        if (!detachedControllersRef.current.has(ac)) {
+          pendingAssistantVersionRef.current = null;
+        }
         if (abortRef.current === ac) abortRef.current = null;
         if (!detachedControllersRef.current.has(ac)) setStreaming(false);
       }
@@ -1946,7 +2015,7 @@ function Chat({
   const sendInTurnEdit = useCallback(
     async (messageId: string, content: string, uploads: Upload[]) => {
       const trimmed = content.trim();
-      if ((!trimmed && uploads.length === 0) || streamingRef.current) return;
+      if ((!trimmed && uploads.length === 0) || navigatingBranchRef.current) return;
 
       const currentMessages = messagesRef.current;
       let sourceIndex = -1;
@@ -1966,12 +2035,38 @@ function Chat({
           break;
         }
       }
+      if (!source || !sourceChunks || sourceIndex < 0) {
+        const live = liveRowRef.current;
+        const chunks = liveChunksRef.current;
+        if (
+          live?.messageId &&
+          chunks.some((chunk) => chunk.kind === "user_message" && chunk.id === messageId)
+        ) {
+          sourceIndex = currentMessages.length;
+          source = {
+            id: live.messageId,
+            chatId,
+            role: "assistant",
+            content: "",
+            parentId: live.parentId,
+            createdAt: new Date(),
+            version: null,
+          };
+          sourceChunks = [...chunks];
+        }
+      }
       if (!source || !sourceChunks || sourceIndex < 0) return;
       const chunkIndex = sourceChunks.findIndex(
         (chunk) => chunk.kind === "user_message" && chunk.id === messageId,
       );
       if (chunkIndex < 0) return;
 
+      navigatingBranchRef.current = true;
+      setNavigatingBranch(true);
+      const activeMessageId = streamingMessageIdRef.current;
+      if (activeMessageId) cancelChatTurn(API_BASE, instanceId, chatId, activeMessageId);
+      detachActiveDrain();
+      streamingMessageIdRef.current = null;
       invalidateTranscriptRequests();
       resetChunkCache();
       setEditingId(null);
@@ -2041,10 +2136,11 @@ function Chat({
       });
       setActiveLeaf(source.parentId ?? null);
 
-      const ac = new AbortController();
-      abortRef.current = ac;
+      let replacementStarted = false;
       try {
-        await drainTurn(ac, prefix, (onEvent) =>
+        const ac = new AbortController();
+        abortRef.current = ac;
+        const replacement = drainTurn(ac, prefix, (onEvent) =>
           runChatTurn({
             apiBase: API_BASE,
             instanceId,
@@ -2058,10 +2154,25 @@ function Chat({
             signal: ac.signal,
           }),
         );
+        replacementStarted = true;
+        navigatingBranchRef.current = false;
+        setNavigatingBranch(false);
+        try {
+          await replacement;
+        } finally {
+          if (!detachedControllersRef.current.has(ac)) {
+            pendingAssistantVersionRef.current = null;
+          }
+          if (abortRef.current === ac) abortRef.current = null;
+          if (!detachedControllersRef.current.has(ac)) setStreaming(false);
+        }
       } finally {
-        pendingAssistantVersionRef.current = null;
-        if (abortRef.current === ac) abortRef.current = null;
-        if (!detachedControllersRef.current.has(ac)) setStreaming(false);
+        if (!replacementStarted) {
+          pendingAssistantVersionRef.current = null;
+          navigatingBranchRef.current = false;
+          setNavigatingBranch(false);
+          setStreaming(false);
+        }
       }
     },
     [
@@ -2069,6 +2180,7 @@ function Chat({
       chatId,
       currentEffort,
       currentModel,
+      detachActiveDrain,
       drainTurn,
       instanceId,
       invalidateTranscriptRequests,
@@ -2085,26 +2197,24 @@ function Chat({
   const sendEdit = useCallback(
     async (messageId: string, content: string, uploads: Upload[]) => {
       const trimmed = content.trim();
-      if ((!trimmed && uploads.length === 0) || streamingRef.current) return;
+      if ((!trimmed && uploads.length === 0) || navigatingBranchRef.current) return;
       const currentMessages = messagesRef.current;
       const editedIndex = currentMessages.findIndex((message) => message.id === messageId);
       const edited = currentMessages[editedIndex];
       if (!edited || editedIndex < 0) return;
 
+      navigatingBranchRef.current = true;
+      setNavigatingBranch(true);
+      const activeMessageId = streamingMessageIdRef.current;
+      if (activeMessageId) cancelChatTurn(API_BASE, instanceId, chatId, activeMessageId);
+      detachActiveDrain();
+      streamingMessageIdRef.current = null;
       invalidateTranscriptRequests();
       resetChunkCache();
 
       setEditingId(null);
       setStreaming(true);
       liveLastSeqRef.current = -1;
-
-      // Same deferred model/effort flush as a normal send.
-      if (currentModel !== appliedModelRef.current || currentEffort !== appliedEffortRef.current) {
-        const body: UpdateChatBody = {};
-        if (currentModel !== appliedModelRef.current) body.model = currentModel;
-        if (currentEffort !== appliedEffortRef.current) body.effort = currentEffort;
-        await applyModelChange(body);
-      }
 
       // The optimistic sibling: same parent as the edited message, so the
       // derived path swaps branches right away. Replaced by the server row
@@ -2153,13 +2263,30 @@ function Chat({
       setSessionRows([{ renderKey: optimistic.id, message: optimistic }]);
       const renderKey = `live-${crypto.randomUUID()}`;
       liveRenderKeyRef.current = renderKey;
-      setLiveRow({ renderKey, messageId: null, parentId: optimisticId, chunks: [] });
+      setLiveRow({
+        renderKey,
+        messageId: null,
+        parentId: optimisticId,
+        chunks: [],
+      });
       setActiveLeaf(optimisticId);
 
-      const ac = new AbortController();
-      abortRef.current = ac;
+      let replacementStarted = false;
       try {
-        await drainTurn(ac, null, (onEvent) =>
+        // Same deferred model/effort flush as a normal send.
+        if (
+          currentModel !== appliedModelRef.current ||
+          currentEffort !== appliedEffortRef.current
+        ) {
+          const body: UpdateChatBody = {};
+          if (currentModel !== appliedModelRef.current) body.model = currentModel;
+          if (currentEffort !== appliedEffortRef.current) body.effort = currentEffort;
+          await applyModelChange(body);
+        }
+
+        const ac = new AbortController();
+        abortRef.current = ac;
+        const replacement = drainTurn(ac, null, (onEvent) =>
           runChatTurn({
             apiBase: API_BASE,
             instanceId,
@@ -2172,9 +2299,21 @@ function Chat({
             signal: ac.signal,
           }),
         );
+        replacementStarted = true;
+        navigatingBranchRef.current = false;
+        setNavigatingBranch(false);
+        try {
+          await replacement;
+        } finally {
+          if (abortRef.current === ac) abortRef.current = null;
+          if (!detachedControllersRef.current.has(ac)) setStreaming(false);
+        }
       } finally {
-        if (abortRef.current === ac) abortRef.current = null;
-        if (!detachedControllersRef.current.has(ac)) setStreaming(false);
+        if (!replacementStarted) {
+          navigatingBranchRef.current = false;
+          setNavigatingBranch(false);
+          setStreaming(false);
+        }
       }
     },
     [
@@ -2185,16 +2324,14 @@ function Chat({
       currentModel,
       currentEffort,
       applyModelChange,
-      drainTurn,
+      detachActiveDrain,
       invalidateTranscriptRequests,
       resetChunkCache,
+      drainTurn,
     ],
   );
 
-  const handleStartEdit = useCallback((id: string) => {
-    if (streamingRef.current) return;
-    setEditingId(id);
-  }, []);
+  const handleStartEdit = useCallback((id: string) => setEditingId(id), []);
   const handleCancelEdit = useCallback(() => setEditingId(null), []);
   const sendEditRef = useRef(sendEdit);
   sendEditRef.current = sendEdit;
@@ -2212,7 +2349,7 @@ function Chat({
   // inactive branch bodies are kept in the renderer.
   const handleNavigateVersion = useCallback(
     (messageId: string, dir: 1 | -1) => {
-      if (streamingRef.current || navigatingBranchRef.current) return;
+      if (navigatingBranchRef.current) return;
       const info = messagesRef.current.find((message) => message.id === messageId)?.version;
       if (!info) return;
       const targetId = dir === -1 ? info.previousId : info.nextId;
@@ -2221,8 +2358,21 @@ function Chat({
       const controller = transcriptRequests.createController();
       navigatingBranchRef.current = true;
       setNavigatingBranch(true);
-      setChatActiveLeaf(instanceId, chatId, targetId, controller.signal)
-        .then((updated) => {
+      const activeMessageId = streamingMessageIdRef.current;
+      if (activeMessageId) cancelChatTurn(API_BASE, instanceId, chatId, activeMessageId);
+      detachActiveDrain();
+      setLiveRow(null);
+      liveRenderKeyRef.current = null;
+      liveChunksRef.current = [];
+      liveToolIndexRef.current = new Map();
+      debugReplayRef.current = null;
+      hiddenLiveRenderDirtyRef.current = false;
+      pendingUserIdRef.current = null;
+      turnUserIdRef.current = null;
+      streamingMessageIdRef.current = null;
+      void (async () => {
+        try {
+          const updated = await setChatActiveLeaf(instanceId, chatId, targetId, controller.signal);
           const page = updated.transcript;
           if (!transcriptRequests.accepts(generation, controller)) return;
           resetChunkCache();
@@ -2238,8 +2388,7 @@ function Chat({
           setHasOlder(page.hasMore);
           setActiveLeaf(updated.activeLeafId ?? page.messages.at(-1)?.id ?? null);
           setEditingId(null);
-        })
-        .catch(async (err: unknown) => {
+        } catch (err: unknown) {
           if (controller.signal.aborted) return;
           if (err instanceof DOMException && err.name === "AbortError") return;
           console.warn(`[chat] branch switch failed (chat=${chatId}):`, err);
@@ -2270,15 +2419,17 @@ function Chat({
               console.warn(`[chat] branch recovery failed (chat=${chatId}):`, recoveryError);
             }
           }
-        })
-        .finally(() => {
+        } finally {
           transcriptRequests.release(controller);
           navigatingBranchRef.current = false;
           setNavigatingBranch(false);
-        });
+          setStreaming(false);
+        }
+      })();
     },
     [
       chatId,
+      detachActiveDrain,
       instanceId,
       invalidateTranscriptRequests,
       pinNextCommitToBottom,
@@ -2531,9 +2682,9 @@ function Chat({
             userFontFamily={userFontFamily}
             agentFontFamily={agentFontFamily}
             editingId={editingId}
-            actionsDisabled={streaming || navigatingBranch}
+            actionsDisabled={navigatingBranch}
             visible={visible}
-            hasOlder={hasOlder && !streaming && !navigatingBranch}
+            hasOlder={hasOlder && !navigatingBranch}
             onStartEdit={handleStartEdit}
             onCancelEdit={handleCancelEdit}
             onSubmitEdit={handleSubmitEdit}
