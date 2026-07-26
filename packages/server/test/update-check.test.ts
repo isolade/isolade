@@ -127,7 +127,7 @@ describe("resolveAndMaybeCount", () => {
   it("counts the first check of a new day (sends periods) and records the time", async () => {
     stubOk();
     const store = tempStore();
-    const status = await resolveAndMaybeCount(store, "0.1.0", "macos", utc(2026, 5, 10));
+    const status = await resolveAndMaybeCount(store, "0.1.0", "macos", utc(2026, 5, 10), false);
 
     expect(new URL(lastUrl).searchParams.get("periods")).toBe("day,week,month,year"); // first-ever
     expect(status.available).toBe(true);
@@ -139,9 +139,9 @@ describe("resolveAndMaybeCount", () => {
   it("is resolve-only later the same UTC day: no periods, but refreshes the timestamp", async () => {
     stubOk();
     const store = tempStore();
-    await resolveAndMaybeCount(store, "0.1.0", "macos", utc(2026, 5, 10, 1)); // first → counts
+    await resolveAndMaybeCount(store, "0.1.0", "macos", utc(2026, 5, 10, 1), false); // first → counts
     const later = utc(2026, 5, 10, 23);
-    const after = await resolveAndMaybeCount(store, "0.1.0", "macos", later); // later, same UTC day
+    const after = await resolveAndMaybeCount(store, "0.1.0", "macos", later, false); // later, same UTC day
 
     // Second call sent no periods param → the endpoint records nothing.
     expect(new URL(lastUrl).searchParams.has("periods")).toBe(false);
@@ -164,7 +164,7 @@ describe("resolveAndMaybeCount", () => {
     }) as unknown as typeof fetch;
 
     const store = tempStore();
-    const status = await resolveAndMaybeCount(store, "0.1.0", "macos", utc(2026, 5, 10));
+    const status = await resolveAndMaybeCount(store, "0.1.0", "macos", utc(2026, 5, 10), false);
 
     expect(status.available).toBe(false);
     expect(status.checkedAt).toBeNull();

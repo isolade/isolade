@@ -136,6 +136,10 @@ const DEFAULT_SANDBOX_URL = process.env.ISOLADE_SANDBOX_URL || "http://localhost
 
 export interface CreateAppOptions {
   dbPath?: string;
+  // Seed bundle to import at boot. Production uses the nested-runtime mount;
+  // tests point this at their isolated temp tree so an ambient nested mount
+  // cannot change which profiles a fresh test app starts with.
+  seedMountDir?: string;
   // Test seam: replace the real claude/codex backends with a fake.
   // Both backends share the `ChatBackend` interface from
   // chat/claude-backend.ts. When provided, this fake is used for any
@@ -186,7 +190,7 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
   // in this instance's keep-set registration. No-op when the mount is absent
   // (every ordinary boot). Never blocks boot.
   try {
-    importSeedProfiles(db);
+    importSeedProfiles(db, opts.seedMountDir);
   } catch (err) {
     console.warn("[server] seed import failed:", err);
   }
