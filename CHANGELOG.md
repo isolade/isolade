@@ -6,6 +6,8 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+## [0.3.2] - 2026-07-26
+
 ### Changed
 
 - Interactive controls, dialogs, menus, and popovers now respond immediately
