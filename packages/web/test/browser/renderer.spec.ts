@@ -341,6 +341,58 @@ test.describe("message renderer browser gate", () => {
     ).toBeLessThanOrEqual(1);
   });
 
+  test("scrolls chat messages inside a keep-alive panel body", async ({ page }) => {
+    await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
+      await route.fulfill({
+        json: {
+          layout: {
+            type: "panel",
+            id: "chat-scroll-panel",
+            tabs: [
+              {
+                id: "chat-scroll-tab",
+                kind: "chat",
+                resourceId: "panel-gesture-chat",
+              },
+            ],
+            activeTabId: "chat-scroll-tab",
+          },
+        },
+      });
+    });
+    await page.route(
+      "**/api/instances/panel-gesture-instance/chats/panel-gesture-chat/transcript?*",
+      async (route) => {
+        await route.fulfill({ json: transcriptFixture("panel-gesture-chat", 60, true) });
+      },
+    );
+    await page.goto("/test/browser/harness/index.html?panelGesture=1&chat=1");
+
+    const body = page.locator('[data-body-layer="chat-scroll-tab"]');
+    const scrollElement = body.locator("[data-chat-scroll]");
+    await expect(body.locator("[data-message-id]")).toHaveCount(60);
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    );
+
+    const initial = await scrollElement.evaluate((element) => ({
+      scrollTop: element.scrollTop,
+      maxScrollTop: element.scrollHeight - element.clientHeight,
+    }));
+    expect(initial.scrollTop).toBeGreaterThan(0);
+    expect(initial.maxScrollTop).toBeGreaterThan(0);
+
+    await body.locator('[data-message-id="panel-gesture-chat-production-m58"]').hover();
+    await page.mouse.wheel(0, -500);
+    await expect
+      .poll(() => scrollElement.evaluate((element) => element.scrollTop))
+      .toBeLessThan(initial.scrollTop);
+    await expect(body.getByRole("button", { name: "Jump to latest" })).toBeVisible();
+  });
+
   test("emphasizes the active tab only in the focused panel", async ({ page }) => {
     await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
       await route.fulfill({

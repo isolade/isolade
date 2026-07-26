@@ -762,8 +762,8 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     return grouped;
   }, [allChats]);
   // A live instance keeps its complete chat subtree and DOM. Sidebar
-  // navigation only changes which strictly-contained pane is visible, so
-  // parsed Markdown, disclosure state, drafts, and scroll position survive.
+  // navigation only changes which retained pane is visible, so parsed
+  // Markdown, disclosure state, drafts, and scroll position survive.
   // Archived instances are released unless one is currently being viewed.
   const retainedInstances = useMemo(
     () =>
@@ -869,7 +869,12 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
                     aria-hidden={!isActive}
                     inert={!isActive}
                     style={{
-                      contain: "strict",
+                      // Keep this mode stable across sidebar switches so a
+                      // retained reading position does not reflow. Full
+                      // `strict` containment includes paint and size
+                      // containment, which can make an absolutely positioned
+                      // panel body's nested scroller inert in macOS WebKit.
+                      contain: "layout style",
                       opacity: isActive ? 1 : 0,
                       pointerEvents: isActive ? "auto" : "none",
                     }}

@@ -11,6 +11,12 @@ _Changes landed on `main` that haven't shipped in a release yet._
 - Interactive controls, dialogs, menus, and popovers now respond immediately
   instead of fading, sliding, or easing between states.
 
+### Fixed
+
+- Chat messages scroll normally again in the macOS app. The panel keep-alive
+  layer added in 0.3.1 could trigger a WebKit containment bug that made the
+  visible chat's scroll area inert.
+
 ## [0.3.1] - 2026-07-24
 
 ### Added
