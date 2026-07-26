@@ -413,6 +413,74 @@ describe("CodexBackend notification parsing", () => {
     ).rejects.toThrow("context exhausted");
   });
 
+  it("surfaces Codex response-stream reconnects as retry events", async () => {
+    const { events } = await run([
+      [
+        "error",
+        {
+          error: {
+            message: "Reconnecting... 2/5",
+            codexErrorInfo: {
+              responseStreamDisconnected: { httpStatusCode: 502 },
+            },
+            additionalDetails:
+              "stream disconnected before completion: error sending request for url",
+          },
+          willRetry: true,
+          threadId: "thread-1",
+          turnId: "turn-1",
+        },
+      ],
+      ["turn/completed", { turn: { status: "completed" } }],
+    ]);
+
+    expect(events).toContainEqual({
+      type: "api_retry",
+      attempt: 2,
+      maxRetries: 5,
+      retryDelayMs: 0,
+      errorStatus: 502,
+      error: "stream disconnected before completion: error sending request for url",
+    });
+    expect(events.some((event) => event.type === "raw")).toBe(false);
+  });
+
+  it("rejects non-retryable Codex error notifications immediately", async () => {
+    await expect(
+      run([
+        [
+          "error",
+          {
+            error: { message: "stream disconnected before completion" },
+            willRetry: false,
+            threadId: "thread-1",
+            turnId: "turn-1",
+          },
+        ],
+      ]),
+    ).rejects.toThrow("stream disconnected before completion");
+  });
+
+  it("ignores Codex error notifications for another thread", async () => {
+    const { events } = await run([
+      [
+        "error",
+        {
+          error: {
+            message: "Reconnecting... 3/5",
+            additionalDetails: "another thread disconnected",
+          },
+          willRetry: true,
+          threadId: "thread-2",
+          turnId: "turn-2",
+        },
+      ],
+      ["turn/completed", { turn: { status: "completed" } }],
+    ]);
+
+    expect(events.some((event) => event.type === "api_retry")).toBe(false);
+  });
+
   it("normalizes usage so input and cached are disjoint", async () => {
     // codex reports inputTokens as the FULL prompt (cached included). Our
     // schema keeps them disjoint, so the backend subtracts the cached subset.
