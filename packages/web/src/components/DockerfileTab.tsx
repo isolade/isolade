@@ -67,7 +67,7 @@ export default function DockerfileTab({ activeProfileId }: { activeProfileId: st
   };
 
   return (
-    <div className="flex flex-col h-full min-w-0 p-6 gap-3">
+    <div className="flex flex-col h-full min-w-0 px-6 pt-4 pb-6 gap-3">
       <div className="max-w-2xl space-y-1">
         <h2 className="text-sm font-medium">Dockerfile</h2>
         <p className="text-xs text-muted-foreground truncate">

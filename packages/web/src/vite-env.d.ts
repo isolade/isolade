@@ -24,10 +24,12 @@ interface Window {
   // port the isolade API server bound to this launch, the per-launch bearer
   // token every API request must present, and whether the host is on macOS Tahoe
   // (26+), whose larger, wider-spaced native window controls the title bar sizes
-  // its layout to match. Absent in a plain browser, where requests go same-origin
-  // (and the Vite dev proxy handles /api) against a tokenless server. See
+  // its layout to match, and the running app version (the same "<semver>[+dev]"
+  // string the sidecar reports to the update check). Absent in a plain browser,
+  // where requests go same-origin (and the Vite dev proxy handles /api) against a
+  // tokenless server, and the version is only known once the server answers. See
   // packages/web/src/lib/api.ts.
-  __ISOLADE__?: { port: number; token: string; tahoe: boolean };
+  __ISOLADE__?: { port: number; token: string; tahoe: boolean; version: string };
   // Capture-time override set by the demo recorder (the isolade-demo repo).
   // Unset in normal use. `disableTerminalWebgl` forces xterm's DOM renderer: the
   // WebGL canvas renders into a mismatched-DPR backing buffer under headed

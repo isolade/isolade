@@ -28,6 +28,8 @@ _Changes landed on `main` that haven't shipped in a release yet._
   chats used to get slower with every long conversation left open, and now takes
   the same time whether one chat is open or twenty. Reading positions, drafts,
   terminals, and browser previews are still preserved exactly as before.
+- Settings sections now start at the top of the window, with no empty strip
+  above them, and the About section no longer shifts as it loads.
 - The chat composer now grows when its panel gets narrower and always leaves
   enough height for at least one line, so draft text is no longer clipped.
 - Codex chats now show reconnect progress while Codex retries an interrupted

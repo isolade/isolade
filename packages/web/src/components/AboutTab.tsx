@@ -1,6 +1,7 @@
 import logoDark from "@/assets/logo_dark.svg";
 import logoLight from "@/assets/logo_light.svg";
-import { openExternal } from "../lib/tauri";
+import { cn } from "@/lib/utils";
+import { hostAppVersion, openExternal } from "../lib/tauri";
 import { useUpdateStatus } from "../lib/useUpdateStatus";
 
 function formatChecked(ts: number | null): string {
@@ -17,11 +18,13 @@ function formatChecked(ts: number | null): string {
 export default function AboutTab() {
   const { status, checking, recheck } = useUpdateStatus();
 
-  // The server reports the runtime version Tauri read from app/tauri.conf.json
-  // and passed to the sidecar. In a plain browser/dev session, that value is not
-  // available, so show an explicit fallback instead of a copied constant that can
-  // drift from the packaged app.
-  const version = status?.current && status.current !== "unknown" ? status.current : "unknown";
+  // The host injects the running binary's version before page scripts, so in the
+  // app it's on the first frame. In a plain browser/dev session there's no
+  // binary, and the only source is the server (which reads the same
+  // app/tauri.conf.json), so the line waits a beat rather than showing a copy
+  // baked into this bundle, which could drift from the app that's running.
+  const reported = status?.current && status.current !== "unknown" ? status.current : null;
+  const version = hostAppVersion() ?? reported;
   const showUpdates = !!status && status.current !== "unknown";
 
   return (
@@ -45,46 +48,61 @@ export default function AboutTab() {
           className="hidden h-80 w-auto select-none drop-shadow-xl transition-transform duration-500 ease-out hover:scale-[1.04] dark:block"
         />
 
-        <span className="text-xs text-muted-foreground tabular-nums">Version {version}</span>
+        {/* Holds its line even before a browser session learns the version, so
+            the centred lockup doesn't shift when the text arrives. */}
+        <span
+          className={cn("text-xs text-muted-foreground tabular-nums", !version && "invisible")}
+          aria-hidden={!version}
+        >
+          Version {version ?? "unknown"}
+        </span>
 
-        {showUpdates && (
-          <div className="mt-2 flex flex-col items-center gap-2">
-            {status.checkedAt === null ? (
-              // No check has ever succeeded, so don't claim either way.
-              <span className="text-sm text-muted-foreground">Couldn't check for updates.</span>
-            ) : status.available ? (
-              <span className="text-sm">
-                Update available: <span className="tabular-nums">{status.latest}</span>
-                {status.download && (
-                  <>
-                    {" · "}
-                    <button
-                      type="button"
-                      onClick={() => void openExternal(status.download ?? status.notes ?? "")}
-                      className="font-medium text-primary underline-offset-2 hover:underline"
-                    >
-                      get it
-                    </button>
-                  </>
-                )}
-              </span>
-            ) : (
-              <span className="text-sm text-muted-foreground">You're up to date.</span>
-            )}
+        {/* Always laid out, even before the status lands and in the browser
+            where there is none to show. The hero is centred vertically, so a
+            block that appeared once the fetch resolved would shove the whole
+            lockup up by half its height. Its two rows are one line each in
+            every state, so reserving the box keeps the hero still. */}
+        <div
+          className={cn("mt-2 flex flex-col items-center gap-2", !showUpdates && "invisible")}
+          aria-hidden={!showUpdates}
+        >
+          {!status ? (
+            <span className="text-sm text-muted-foreground">Checking for updates…</span>
+          ) : status.checkedAt === null ? (
+            // No check has ever succeeded, so don't claim either way.
+            <span className="text-sm text-muted-foreground">Couldn't check for updates.</span>
+          ) : status.available ? (
+            <span className="text-sm">
+              Update available: <span className="tabular-nums">{status.latest}</span>
+              {status.download && (
+                <>
+                  {" · "}
+                  <button
+                    type="button"
+                    onClick={() => void openExternal(status.download ?? status.notes ?? "")}
+                    className="font-medium text-primary underline-offset-2 hover:underline"
+                  >
+                    get it
+                  </button>
+                </>
+              )}
+            </span>
+          ) : (
+            <span className="text-sm text-muted-foreground">You're up to date.</span>
+          )}
 
-            <div className="flex items-center gap-3 text-xs text-muted-foreground">
-              <button
-                type="button"
-                onClick={() => void recheck()}
-                disabled={checking}
-                className="rounded-md border border-border px-2.5 py-1 hover:bg-muted disabled:opacity-60"
-              >
-                {checking ? "Checking…" : "Check for updates"}
-              </button>
-              <span>Last checked: {formatChecked(status.checkedAt)}</span>
-            </div>
+          <div className="flex items-center gap-3 text-xs text-muted-foreground">
+            <button
+              type="button"
+              onClick={() => void recheck()}
+              disabled={checking || !status}
+              className="rounded-md border border-border px-2.5 py-1 hover:bg-muted disabled:opacity-60"
+            >
+              {checking ? "Checking…" : "Check for updates"}
+            </button>
+            <span>Last checked: {formatChecked(status?.checkedAt ?? null)}</span>
           </div>
-        )}
+        </div>
       </div>
     </div>
   );

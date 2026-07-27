@@ -482,8 +482,9 @@ pub fn run() {
 
             // The running app version, surfaced to the sidecar so its once-per-
             // day update check can report it (see packages/server/src/
-            // update-check.ts). The value comes from tauri.conf.json via Tauri's
-            // package info. Only official releases — CI builds off a release/**
+            // update-check.ts), and to the webview below so the About pane can
+            // print it on its first frame instead of waiting on that check. The
+            // value comes from tauri.conf.json via Tauri's package info. Only official releases — CI builds off a release/**
             // branch, which compile with ISOLADE_OFFICIAL_BUILD set (baked in
             // here via option_env!, so nothing at runtime can flip it) — report
             // the bare version. Every other build, `bun run app` dev sessions and
@@ -501,7 +502,7 @@ pub fn run() {
             {
                 app_version.push_str("+dev");
             }
-            cmd.env("ISOLADE_APP_VERSION", app_version);
+            cmd.env("ISOLADE_APP_VERSION", &app_version);
 
             // The bearer token the API middleware enforces. Set once for both
             // the dev and release commands. Under `bun --watch` (dev) the sidecar
@@ -547,12 +548,14 @@ pub fn run() {
                     .resizable(true)
                     .accept_first_mouse(true)
                     // Tell the webview which loopback port the API server bound this
-                    // launch, the bearer token to authenticate with, and whether the host
-                    // is on Tahoe (so its title bar picks the matching control metrics).
-                    // Runs before page scripts, in dev and release alike. The token is
-                    // hex, so it's safe to embed verbatim in a JS string literal.
+                    // launch, the bearer token to authenticate with, whether the host
+                    // is on Tahoe (so its title bar picks the matching control metrics),
+                    // and the running version (so About prints it immediately, with the
+                    // same "+dev" rule the sidecar reports). Runs before page scripts, in
+                    // dev and release alike. The token is hex and the version is SemVer,
+                    // so both are safe to embed verbatim in a JS string literal.
                     .initialization_script(&format!(
-                        "window.__ISOLADE__={{port:{port},token:\"{token}\",tahoe:{is_tahoe}}};"
+                        "window.__ISOLADE__={{port:{port},token:\"{token}\",tahoe:{is_tahoe},version:\"{app_version}\"}};"
                     ));
 
             #[cfg(target_os = "macos")]

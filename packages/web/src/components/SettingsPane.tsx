@@ -107,9 +107,16 @@ interface SettingsPaneProps {
   // Shared with the instances sidebar: the title-bar toggle collapses whichever
   // sidebar occupies the slot, so the section nav hides when collapsed too.
   sidebarCollapsed: boolean;
-  // The settings surface reaches the top of the window. These blank drag rows
-  // keep its content below the floating traffic lights and controls while the
-  // sidebar background continues behind them.
+  // The settings surface reaches the top of the window. This blank drag row
+  // keeps the nav's first row below the floating traffic lights and controls
+  // while its background continues behind them.
+  //
+  // Nothing sits above a section, though: sections reach into the title-bar row
+  // and lead with their own content, be that a heading (in the sections that
+  // have one) or the content itself (in those that don't). Each section body
+  // adds only `pt-4`, so it clears the window edge without being pushed down a
+  // whole row. Keep that top padding smaller than the side and bottom padding
+  // when adding a section, so every section still starts at the same y.
   topInset?: number;
   topDrag?: {
     onMouseDown: (e: React.MouseEvent) => void;
@@ -384,7 +391,13 @@ export default function SettingsPane({
             bordered only where it meets chrome, with the top-left corner rounded
             when the nav is alongside it. */}
         <div className={contentFrame}>
-          {topInset > 0 && (
+          {/* Sections reach up into the title-bar row: nothing is stacked above
+              them, so whatever a section leads with lands level with the window
+              controls, which float over the nav beside it. The one exception is
+              a collapsed nav, when those controls float over this pane instead,
+              so the blank drag row comes back to hold content out from under
+              them. */}
+          {sidebarCollapsed && topInset > 0 && (
             // eslint-disable-next-line jsx-a11y/no-static-element-interactions
             <div className="flex-shrink-0 select-none" style={{ height: topInset }} {...topDrag} />
           )}
@@ -393,8 +406,15 @@ export default function SettingsPane({
           </TabsContent>
           <TabsContent
             value="debugging"
-            className="flex-1 min-w-0 min-h-0 overflow-y-auto p-6 space-y-4"
+            className="flex-1 min-w-0 min-h-0 overflow-y-auto px-6 pt-4 pb-6 space-y-4"
           >
+            <div className="max-w-2xl space-y-1">
+              <h2 className="text-sm font-medium">Debugging</h2>
+              <p className="text-xs text-muted-foreground">
+                Extra detail about what the agent is doing, for when a chat needs explaining.
+              </p>
+            </div>
+
             <label className="flex items-start gap-3 cursor-pointer select-none max-w-2xl">
               <input
                 type="checkbox"
@@ -451,12 +471,12 @@ export default function SettingsPane({
           </TabsContent>
           <TabsContent
             value="theme"
-            className="flex-1 min-w-0 min-h-0 overflow-y-auto p-6 space-y-6"
+            className="flex-1 min-w-0 min-h-0 overflow-y-auto px-6 pt-4 pb-6 space-y-6"
           >
             <div className="space-y-3 max-w-2xl">
-              <div className="flex flex-col gap-0.5">
-                <span className="text-sm">Theme</span>
-                <span className="text-xs text-muted-foreground">Choose how Isolade looks.</span>
+              <div className="space-y-1">
+                <h2 className="text-sm font-medium">Theme</h2>
+                <p className="text-xs text-muted-foreground">Choose how Isolade looks.</p>
               </div>
               <div className="grid grid-cols-2 gap-3">
                 {themes.map((theme) => {
