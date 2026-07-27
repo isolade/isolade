@@ -1,6 +1,6 @@
 import { Profiler, type ProfilerOnRenderCallback, useMemo, useState } from "react";
 import HomeTab from "@/components/home/HomeTab";
-import { getRenderMetrics } from "./metrics";
+import { getRenderMetrics, type MetricSnapshot } from "./metrics";
 import { installWorkspaceApiMock, type WorkspaceApiMock } from "./workspace-api-mock";
 
 // The whole workspace (sidebar + every retained instance + the new-chat pane)
@@ -21,6 +21,12 @@ export interface WorkspaceHarnessApi {
   waitFrames: (count?: number) => Promise<void>;
   resetProfile: () => Promise<void>;
   profile: () => CommitProfile;
+  /**
+   * Parser and renderer counters since the last reset. Retention exists so that
+   * revisiting a chat costs nothing, and the only way to state that is that no
+   * Markdown was re-parsed and no historical row was re-rendered.
+   */
+  renderMetrics: () => MetricSnapshot;
   /** Dirty one instance row, then let one poll cycle deliver it. */
   pollWithChange: () => Promise<CommitProfile>;
   /** Press an element and report the wall clock until the frame after it lands. */
@@ -95,6 +101,7 @@ export function WorkspaceHarness() {
         getRenderMetrics().reset();
       },
       profile: snapshot,
+      renderMetrics: () => getRenderMetrics().snapshot(),
       async pollWithChange() {
         await api.resetProfile();
         mock.touchInstance(0);

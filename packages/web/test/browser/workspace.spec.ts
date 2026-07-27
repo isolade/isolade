@@ -164,4 +164,57 @@ test.describe("retained workspace", () => {
     expect(restored?.id).toBe(reading?.id);
     expect(Math.abs((restored?.top ?? 0) - (reading?.top ?? 0))).toBeLessThanOrEqual(2);
   });
+
+  // Ported from the retention test that used to run against InstanceView, the
+  // pre-0.3.1 pane component the app no longer renders. Retention only pays for
+  // its memory if revisiting a chat is free, and "free" means no Markdown was
+  // re-parsed and no historical row was re-rendered. A single panel per instance
+  // here, so both chats are tabs in one strip and tab switching is exercised
+  // alongside instance switching.
+  test("re-parses nothing when revisiting instances and tabs @stress", async ({ page }) => {
+    const instances = 6;
+    const messages = 120;
+    await page.goto(
+      `/test/browser/harness/index.html?workspace=1&instances=${instances}` +
+        `&chatsPerInstance=2&messages=${messages}`,
+    );
+    await page.waitForFunction(
+      () => document.documentElement.dataset.workspaceHarnessReady === "true",
+    );
+    await expect(page.locator("[data-retained-instance]")).toHaveCount(instances);
+
+    // Warm every tab of every instance. Panel bodies mount on first activation,
+    // so the second tab's transcript only exists once it has been selected.
+    const warm = async () => {
+      for (let index = 0; index < instances; index++) {
+        await pressRow(page, index);
+        const tabs = page.locator('[data-retained-instance][aria-hidden="false"] [role="tab"]');
+        await expect(tabs).toHaveCount(2);
+        for (let tab = 0; tab < 2; tab++) {
+          await tabs.nth(tab).click();
+          await page.evaluate(() => window.__isoladeWorkspaceHarness?.waitFrames(2));
+        }
+      }
+    };
+    await warm();
+    await expect(page.locator("[data-message-id]")).toHaveCount(instances * 2 * messages, {
+      timeout: 60_000,
+    });
+
+    // Guards the assertion below from passing vacuously: warming really did
+    // parse this transcript, so a second pass finding zero means something.
+    const warmed = await page.evaluate(() => window.__isoladeWorkspaceHarness?.renderMetrics());
+    expect(warmed?.markdownRenders ?? 0).toBeGreaterThan(0);
+    expect(warmed?.parserInputBytes ?? 0).toBeGreaterThan(0);
+
+    // Everything is now mounted and parsed, so a second pass must do no work.
+    await page.evaluate(() => window.__isoladeWorkspaceHarness?.resetProfile());
+    await warm();
+
+    const metrics = await page.evaluate(() => window.__isoladeWorkspaceHarness?.renderMetrics());
+    expect(metrics?.markdownRenders).toBe(0);
+    expect(metrics?.parserInputBytes).toBe(0);
+    expect(metrics?.historyMappings).toBe(0);
+    expect(metrics?.historicalRowRenders).toBe(0);
+  });
 });

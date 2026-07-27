@@ -105,8 +105,6 @@ async function openProductionHarness(
   page: Page,
   chatCount: number,
   options: {
-    chatsPerInstance?: number;
-    instancePanes?: boolean;
     messages?: number;
     wrappingRows?: boolean;
     thoughts?: boolean;
@@ -132,10 +130,6 @@ async function openProductionHarness(
     });
   });
   const parameters = new URLSearchParams({ production: "1", chats: String(chatCount) });
-  if (options.instancePanes) parameters.set("instancePanes", "1");
-  if (options.chatsPerInstance) {
-    parameters.set("chatsPerInstance", String(options.chatsPerInstance));
-  }
   if (options.crossProviderPicker) parameters.set("crossProviderPicker", "1");
   await page.goto(`/test/browser/harness/index.html?${parameters}`);
   await page.waitForFunction(
@@ -894,139 +888,6 @@ test.describe("message renderer browser gate", () => {
     expect(await preview.evaluate((element) => element.parentElement === document.body)).toBe(true);
     expect(await preview.boundingBox()).toEqual({ x: 160, y: 120, width: 240, height: 180 });
     expect(await ghost.boundingBox()).toMatchObject({ x: 212, y: 172, height: 28 });
-  });
-
-  test("retains an instance chat's DOM and reading position across sidebar switches", async ({
-    page,
-  }) => {
-    const requests = await openProductionHarness(page, 2, {
-      instancePanes: true,
-      wrappingRows: true,
-    });
-    await expect(page.locator("[data-retained-instance] [data-message-id]")).toHaveCount(120);
-    const scrollElement = page.locator('[data-retained-instance="instance-a"] [data-chat-scroll]');
-    await scrollElement.hover();
-    let readerState = { distanceFromBottom: 0, scrollTop: 0 };
-    for (let attempt = 0; attempt < 8; attempt++) {
-      await page.mouse.wheel(0, -1_200);
-      await page.evaluate(() => window.__isoladeProductionChatHarness?.waitFrames(3));
-      readerState = await scrollElement.evaluate((element) => ({
-        distanceFromBottom: element.scrollHeight - element.scrollTop - element.clientHeight,
-        scrollTop: element.scrollTop,
-      }));
-      if (readerState.distanceFromBottom > 1_000) break;
-    }
-    expect(readerState.distanceFromBottom).toBeGreaterThan(500);
-    await expect(
-      page.locator('[data-retained-instance="instance-a"] [aria-label="Jump to latest"]'),
-    ).toBeVisible();
-    const readingPosition = readerState.scrollTop;
-    const retainedRow = page.locator('[data-message-id="chat-a-production-m30"]');
-    const retainedNode = await retainedRow.elementHandle();
-    const requestCount = requests.length;
-
-    await page.evaluate(() =>
-      window.__isoladeProductionChatHarness?.switchChatImmediately("chat-b"),
-    );
-    await page.evaluate(() => window.__isoladeProductionChatHarness?.waitFrames(3));
-    const restoredImmediately = await page.evaluate(() =>
-      window.__isoladeProductionChatHarness?.switchChatImmediately("chat-a"),
-    );
-    await page.evaluate(() => window.__isoladeProductionChatHarness?.waitFrames(3));
-
-    const settledPosition = await scrollElement.evaluate((element) => element.scrollTop);
-    expect(Math.abs((restoredImmediately?.scrollTop ?? 0) - readingPosition)).toBeLessThanOrEqual(
-      1,
-    );
-    expect(Math.abs(settledPosition - readingPosition)).toBeLessThanOrEqual(1);
-
-    const readingAnchor = await scrollElement.evaluate((element) => {
-      const viewport = element.getBoundingClientRect();
-      const row = [...element.querySelectorAll<HTMLElement>("[data-message-row]")].find(
-        (candidate) => candidate.getBoundingClientRect().bottom > viewport.top + 120,
-      );
-      if (!row?.dataset.messageId) throw new Error("Missing visible message anchor");
-      return { id: row.dataset.messageId, top: row.getBoundingClientRect().top };
-    });
-    await page.evaluate(() =>
-      window.__isoladeProductionChatHarness?.switchChatImmediately("chat-b"),
-    );
-    await page.locator("[data-production-stage]").evaluate((stage) => {
-      stage.style.width = "620px";
-      stage.style.alignSelf = "center";
-    });
-    await page.evaluate(() => window.__isoladeProductionChatHarness?.waitFrames(3));
-    await page.evaluate(() =>
-      window.__isoladeProductionChatHarness?.switchChatImmediately("chat-a"),
-    );
-    const anchorRow = page.locator(
-      `[data-retained-instance="instance-a"] [data-message-id="${readingAnchor.id}"]`,
-    );
-    const restoredAnchorTop = await anchorRow.evaluate((row) => row.getBoundingClientRect().top);
-    expect(Math.abs(restoredAnchorTop - readingAnchor.top)).toBeLessThanOrEqual(1);
-    await page.evaluate(() => window.__isoladeProductionChatHarness?.waitFrames(3));
-    expect(
-      Math.abs(
-        (await anchorRow.evaluate((row) => row.getBoundingClientRect().top)) - readingAnchor.top,
-      ),
-    ).toBeLessThanOrEqual(1);
-    expect(await retainedRow.evaluate((row, previous) => row === previous, retainedNode)).toBe(
-      true,
-    );
-    expect(requests).toHaveLength(requestCount);
-  });
-
-  test("bounds and retains a multi-instance multi-chat working set @stress", async ({
-    page,
-    browserName,
-  }) => {
-    test.skip(browserName !== "chromium", "The controlled memory gate is Chromium-only");
-    const instanceCount = 8;
-    const chatsPerInstance = 3;
-    const messagesPerChat = 60;
-    const totalChats = instanceCount * chatsPerInstance;
-    const requests = await openProductionHarness(page, totalChats, {
-      chatsPerInstance,
-      instancePanes: true,
-      messages: messagesPerChat,
-    });
-    await expect(page.locator("[data-retained-instance]")).toHaveCount(instanceCount);
-    await expect(page.locator("[data-retained-instance] [data-message-id]")).toHaveCount(
-      totalChats * messagesPerChat,
-    );
-    expect(new Set(requests).size).toBe(totalChats);
-    const warmRequestCount = requests.length;
-
-    await page.evaluate(() => window.__isoladeProductionChatHarness?.waitFrames(2));
-    await page.evaluate(() => window.__isoladeProductionChatHarness?.resetMetrics());
-    const instanceChatIds = Array.from(
-      { length: instanceCount },
-      (_, index) => `chat-${String.fromCharCode(97 + index * chatsPerInstance)}`,
-    );
-    for (let round = 0; round < 3; round++) {
-      for (const [instanceIndex, chatId] of instanceChatIds.entries()) {
-        await page.evaluate((id) => window.__isoladeProductionChatHarness?.switchChat(id), chatId);
-        const tabs = page.locator(
-          `[data-retained-instance="instance-${String.fromCharCode(97 + instanceIndex)}"] [role="tab"]`,
-        );
-        await expect(tabs).toHaveCount(chatsPerInstance);
-        for (let tabIndex = 0; tabIndex < chatsPerInstance; tabIndex++) {
-          await tabs.nth(tabIndex).click();
-          await page.evaluate(() => window.__isoladeProductionChatHarness?.waitFrames(1));
-        }
-      }
-    }
-
-    expect(requests).toHaveLength(warmRequestCount);
-    const retainedWork = await page.evaluate(() =>
-      window.__isoladeProductionChatHarness?.metrics(),
-    );
-    expect(retainedWork?.markdownRenders).toBe(0);
-    expect(retainedWork?.parserInputBytes).toBe(0);
-    expect(retainedWork?.historyMappings).toBe(0);
-    expect(retainedWork?.historicalRowRenders).toBe(0);
-    await page.evaluate(() => window.__isoladeProductionChatHarness?.unmountRetained());
-    await expect(page.locator("[data-retained-instance]")).toHaveCount(0);
   });
 
   test("positions a hydrated tail in its first populated commit", async ({ page }) => {
