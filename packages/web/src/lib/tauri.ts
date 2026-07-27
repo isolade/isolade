@@ -32,6 +32,17 @@ export function isTahoe(): boolean {
   return window.__ISOLADE__?.tahoe === true;
 }
 
+/**
+ * The running app's version, injected by the host (app/src/lib.rs) before page
+ * scripts, so it is there on the first frame. It is the binary's own version
+ * rather than anything baked into this bundle, "+dev" included, so it can't
+ * disagree with what the update check compares against. Null in a plain
+ * browser, where there is no binary and only the server can say.
+ */
+export function hostAppVersion(): string | null {
+  return window.__ISOLADE__?.version ?? null;
+}
+
 export const TRAFFIC_LIGHT = { width: 14, height: 14 };
 export const TRAFFIC_LIGHT_GAP = 9;
 
