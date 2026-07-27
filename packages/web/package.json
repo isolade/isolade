@@ -7,10 +7,11 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "bun test test/ --path-ignore-patterns='test/browser/**'",
-    "test:browser": "playwright test --grep-invert @stress",
+    "test:browser": "playwright test --grep-invert \"@stress|@bench\"",
     "test:browser:stress": "playwright test --grep @stress --workers=1",
-    "test:browser:headed": "playwright test --grep-invert @stress --headed",
-    "test:browser:update": "playwright test --grep-invert @stress --update-snapshots",
+    "test:browser:bench": "playwright test --grep @bench --workers=1",
+    "test:browser:headed": "playwright test --grep-invert \"@stress|@bench\" --headed",
+    "test:browser:update": "playwright test --grep-invert \"@stress|@bench\" --update-snapshots",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

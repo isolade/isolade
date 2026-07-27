@@ -246,7 +246,7 @@ function PanelGestureHarness() {
         }}
       >
         <PanelWorkspace
-          instance={PANEL_GESTURE_INSTANCE}
+          instanceId={PANEL_GESTURE_INSTANCE.id}
           chats={withChat ? [PANEL_GESTURE_CHAT] : []}
           terminals={[]}
           ports={ports}

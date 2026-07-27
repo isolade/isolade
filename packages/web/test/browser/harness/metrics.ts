@@ -9,6 +9,7 @@ export const metricNames = [
   "markdownRenders",
   "parserInputBytes",
   "previewInputBytes",
+  "retainedWorkspaceRenders",
 ] as const;
 
 export type MetricName = (typeof metricNames)[number];
@@ -32,6 +33,7 @@ function emptySnapshot(): MetricSnapshot {
     markdownRenders: 0,
     parserInputBytes: 0,
     previewInputBytes: 0,
+    retainedWorkspaceRenders: 0,
   };
 }
 

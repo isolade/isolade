@@ -4,7 +4,8 @@ export type RenderMetricName =
   | "historyMappings"
   | "markdownInputBytes"
   | "parserInputBytes"
-  | "previewInputBytes";
+  | "previewInputBytes"
+  | "retainedWorkspaceRenders";
 
 export const RENDER_METRICS_ENABLED = false;
 

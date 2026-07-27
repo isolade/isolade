@@ -94,7 +94,9 @@ export function MessageBox({
     let resizeFrame: number | null = null;
     const observer = new ResizeObserver(() => {
       const nextWidth = el.offsetWidth;
-      if (nextWidth === width) return;
+      // Zero width means the pane's rendering is skipped while it is off
+      // screen. Re-fitting against that would only have to be undone on reveal.
+      if (nextWidth === 0 || nextWidth === width) return;
       width = nextWidth;
       if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
       // ResizeObserver runs before paint. Mutating the observed element in its

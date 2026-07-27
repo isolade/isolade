@@ -8,6 +8,7 @@ export type RenderMetricName = Extract<
   | "markdownInputBytes"
   | "parserInputBytes"
   | "previewInputBytes"
+  | "retainedWorkspaceRenders"
 >;
 
 export const RENDER_METRICS_ENABLED = true;
