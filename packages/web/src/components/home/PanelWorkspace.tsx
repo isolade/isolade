@@ -31,6 +31,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { RENDER_METRICS_ENABLED, recordRenderMetric } from "@/lib/render-metrics";
 import { cn } from "@/lib/utils";
 import { useWindowDrag } from "@/lib/window-drag";
 import {
@@ -46,7 +47,6 @@ import type {
   AttachedPr,
   ChatModelDefinition,
   Chat as ChatT,
-  Instance,
   Layout,
   LayoutNode,
   ModelOverrides,
@@ -183,7 +183,7 @@ function containsPanel(node: LayoutNode, panelId: string): boolean {
 }
 
 interface PanelWorkspaceProps {
-  instance: Instance;
+  instanceId: string;
   chats: ChatT[];
   terminals: TerminalT[];
   ports: PortForward[];
@@ -211,7 +211,7 @@ interface PanelWorkspaceProps {
 }
 
 export default function PanelWorkspace({
-  instance,
+  instanceId,
   chats,
   terminals,
   ports,
@@ -230,7 +230,7 @@ export default function PanelWorkspace({
   onTerminalCreated,
   onTerminalDeleted,
 }: PanelWorkspaceProps) {
-  const instanceId = instance.id;
+  if (RENDER_METRICS_ENABLED) recordRenderMetric("retainedWorkspaceRenders");
   const [layout, setLayout] = useState<Layout | null>(null);
   const [hydrated, setHydrated] = useState(false);
   const [drag, setDrag] = useState<DragState | null>(null);
@@ -703,6 +703,12 @@ export default function PanelWorkspace({
     // reads and writes forces a fresh layout per body, on every frame of a
     // divider drag.
     const rootRect = root.getBoundingClientRect();
+    // An off-screen retained workspace has its rendering skipped, so every slot
+    // measures as zero. Writing those zeros onto the bodies would collapse their
+    // scrollers, and a collapsed scroller comes back with scrollTop clamped to
+    // 0. Leaving the last real positions in place costs nothing while hidden and
+    // means the reveal needs no repair.
+    if (rootRect.width === 0 && rootRect.height === 0) return;
     const slots = new Map<string, DOMRect>();
     for (const slot of root.querySelectorAll<HTMLElement>("[data-body-id]")) {
       const panelId = slot.dataset.bodyId;
@@ -868,6 +874,9 @@ function ScrollableTabList({
   const updateEdges = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
+    // A skipped (off-screen) workspace measures as zero, which would drop both
+    // scroll arrows and then re-add them on reveal. Keep the last real answer.
+    if (el.clientWidth === 0) return;
     const left = el.scrollLeft > 1;
     const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 1;
     setEdges((current) =>

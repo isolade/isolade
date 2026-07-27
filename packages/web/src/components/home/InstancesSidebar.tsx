@@ -10,7 +10,7 @@ import {
   RotateCw,
   Trash2,
 } from "lucide-react";
-import { type ReactNode, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -59,23 +59,39 @@ function rowLabel(conv: Instance): string {
   return conv.title?.trim() || "Untitled";
 }
 
-// One chat row. `activity` enables the working/unread treatments, on for the
-// active list, off for archived rows (their VM is stopped, so they're
-// quiescent). `menu` is the row's context-menu body.
-function InstanceRow({
+interface RowActions {
+  onSelect: (id: string) => void;
+  onRename: (id: string) => void;
+  onRestart: (id: string) => void;
+  onPin: (id: string) => void;
+  onUnpin: (id: string) => void;
+  onArchive: (id: string) => void;
+  onUnarchive: (id: string) => void;
+  onDelete: (id: string) => void;
+}
+
+// One chat row, with the context menu it owns. `activity` enables the
+// working/unread treatments: on for the active list, off for archived rows
+// (their VM is stopped, so they're quiescent). Archived rows get the
+// unarchive/delete menu instead of the live one.
+//
+// Memoized, and given only stable props, because each row carries a Radix
+// context menu (a Root, a Trigger and a portalled Content, several components
+// deep). The once-a-second instance poll changes one row at a time, and
+// re-rendering the whole list for it is a visible cost by the time a few dozen
+// chats are open.
+const InstanceRow = memo(function InstanceRow({
   conv,
   isActive,
   activity,
   demo,
-  onSelect,
-  menu,
+  actions,
 }: {
   conv: Instance;
   isActive: boolean;
   activity: boolean;
   demo: string;
-  onSelect: () => void;
-  menu: ReactNode;
+  actions: RowActions;
 }) {
   const isRestarting = conv.status === "restarting";
   // `initializing`: the VM booted but the environment's sync initializers
@@ -89,13 +105,65 @@ function InstanceRow({
   // the unselected rows: working → shimmer, unread → bold, otherwise → plain.
   const showWorking = activity && conv.working && !isActive;
   const showUnread = activity && conv.unread && !isActive && !conv.working;
+  // `activity` doubles as "this row's VM is live", which is exactly the set of
+  // rows whose menu offers the VM-bound actions.
+  const menu = activity ? (
+    <>
+      <ContextMenuItem onSelect={() => actions.onRename(conv.id)}>
+        <Pencil className="size-3.5" />
+        Rename
+      </ContextMenuItem>
+      <ContextMenuItem onSelect={() => actions.onRestart(conv.id)}>
+        <RotateCw className="size-3.5" />
+        Restart
+      </ContextMenuItem>
+      {conv.pinned ? (
+        <ContextMenuItem data-demo="ctx-unpin" onSelect={() => actions.onUnpin(conv.id)}>
+          <PinOff className="size-3.5" />
+          Unpin
+        </ContextMenuItem>
+      ) : (
+        <ContextMenuItem data-demo="ctx-pin" onSelect={() => actions.onPin(conv.id)}>
+          <Pin className="size-3.5" />
+          Pin
+        </ContextMenuItem>
+      )}
+      <ContextMenuItem data-demo="ctx-archive" onSelect={() => actions.onArchive(conv.id)}>
+        <Archive className="size-3.5" />
+        Archive
+      </ContextMenuItem>
+      <ContextMenuItem
+        variant="destructive"
+        data-demo="ctx-delete"
+        onSelect={() => actions.onDelete(conv.id)}
+      >
+        <Trash2 className="size-3.5" />
+        Delete
+      </ContextMenuItem>
+    </>
+  ) : (
+    <>
+      <ContextMenuItem onSelect={() => actions.onUnarchive(conv.id)}>
+        <ArchiveRestore className="size-3.5" />
+        Unarchive
+      </ContextMenuItem>
+      <ContextMenuItem
+        variant="destructive"
+        data-demo="ctx-delete"
+        onSelect={() => actions.onDelete(conv.id)}
+      >
+        <Trash2 className="size-3.5" />
+        Delete
+      </ContextMenuItem>
+    </>
+  );
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <button
           type="button"
           data-demo={demo}
-          onClick={onSelect}
+          onClick={() => actions.onSelect(conv.id)}
           className={sidebarRowClass(isActive)}
         >
           {(isRestarting || isInitializing) && (
@@ -134,7 +202,7 @@ function InstanceRow({
       <ContextMenuContent>{menu}</ContextMenuContent>
     </ContextMenu>
   );
-}
+});
 
 // The instances list. The window chrome (traffic lights, sidebar-collapse /
 // settings / history controls) lives in the title bar now, so this is purely
@@ -169,43 +237,11 @@ export default function InstancesSidebar({
   const [pinnedOpen, setPinnedOpen] = useState(true);
   const [archivedOpen, setArchivedOpen] = useState(false);
 
-  // Context menu shared by the live chats (active + pinned). Same VM-bound
-  // actions in both sections; only the pin toggle flips between Pin and Unpin
-  // based on the row's current state.
-  const liveMenu = (conv: Instance) => (
-    <>
-      <ContextMenuItem onSelect={() => onRename(conv.id)}>
-        <Pencil className="size-3.5" />
-        Rename
-      </ContextMenuItem>
-      <ContextMenuItem onSelect={() => onRestart(conv.id)}>
-        <RotateCw className="size-3.5" />
-        Restart
-      </ContextMenuItem>
-      {conv.pinned ? (
-        <ContextMenuItem data-demo="ctx-unpin" onSelect={() => onUnpin(conv.id)}>
-          <PinOff className="size-3.5" />
-          Unpin
-        </ContextMenuItem>
-      ) : (
-        <ContextMenuItem data-demo="ctx-pin" onSelect={() => onPin(conv.id)}>
-          <Pin className="size-3.5" />
-          Pin
-        </ContextMenuItem>
-      )}
-      <ContextMenuItem data-demo="ctx-archive" onSelect={() => onArchive(conv.id)}>
-        <Archive className="size-3.5" />
-        Archive
-      </ContextMenuItem>
-      <ContextMenuItem
-        variant="destructive"
-        data-demo="ctx-delete"
-        onSelect={() => onDelete(conv.id)}
-      >
-        <Trash2 className="size-3.5" />
-        Delete
-      </ContextMenuItem>
-    </>
+  // One object holding every per-row action, so a row's props stay stable and
+  // its memo holds. HomeTab already hands these down with stable identities.
+  const actions = useMemo<RowActions>(
+    () => ({ onSelect, onRename, onRestart, onPin, onUnpin, onArchive, onUnarchive, onDelete }),
+    [onSelect, onRename, onRestart, onPin, onUnpin, onArchive, onUnarchive, onDelete],
   );
 
   return (
@@ -279,8 +315,7 @@ export default function InstancesSidebar({
                   isActive={!isDrafting && selectedId === conv.id}
                   activity
                   demo="pinned-row"
-                  onSelect={() => onSelect(conv.id)}
-                  menu={liveMenu(conv)}
+                  actions={actions}
                 />
               </li>
             ))}
@@ -296,8 +331,7 @@ export default function InstancesSidebar({
                 isActive={!isDrafting && selectedId === conv.id}
                 activity
                 demo="instance-row"
-                onSelect={() => onSelect(conv.id)}
-                menu={liveMenu(conv)}
+                actions={actions}
               />
             </li>
           ))}
@@ -349,23 +383,7 @@ export default function InstancesSidebar({
                   isActive={!isDrafting && selectedId === conv.id}
                   activity={false}
                   demo="archived-row"
-                  onSelect={() => onSelect(conv.id)}
-                  menu={
-                    <>
-                      <ContextMenuItem onSelect={() => onUnarchive(conv.id)}>
-                        <ArchiveRestore className="size-3.5" />
-                        Unarchive
-                      </ContextMenuItem>
-                      <ContextMenuItem
-                        variant="destructive"
-                        data-demo="ctx-delete"
-                        onSelect={() => onDelete(conv.id)}
-                      >
-                        <Trash2 className="size-3.5" />
-                        Delete
-                      </ContextMenuItem>
-                    </>
-                  }
+                  actions={actions}
                 />
               </li>
             ))}

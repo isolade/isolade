@@ -44,7 +44,7 @@ import SettingsPane, {
 import UpdateBanner from "../UpdateBanner";
 import InstancesSidebar from "./InstancesSidebar";
 import NewInstancePane from "./NewInstancePane";
-import PanelWorkspace from "./PanelWorkspace";
+import RetainedInstancePane from "./RetainedInstancePane";
 import WindowChrome from "./WindowChrome";
 
 type View =
@@ -95,6 +95,37 @@ function reconcileApiRows<T extends { id: string }>(previous: T[], incoming: T[]
     : reconciled;
 }
 
+// Chats grouped by instance, where a group keeps its identity as long as its
+// members do. Every retained pane takes its group as a prop, so a rebuilt-from-
+// scratch map would hand all of them a fresh array on each 3s chat poll and
+// defeat their memoization. Only the instance whose chats actually moved gets a
+// new array.
+function reconcileChatGroups(
+  previous: ReadonlyMap<string, Chat[]>,
+  chats: Chat[],
+): Map<string, Chat[]> {
+  const grouped = new Map<string, Chat[]>();
+  for (const chat of chats) {
+    const existing = grouped.get(chat.instanceId);
+    if (existing) existing.push(chat);
+    else grouped.set(chat.instanceId, [chat]);
+  }
+  for (const [instanceId, group] of grouped) {
+    const before = previous.get(instanceId);
+    if (
+      before &&
+      before.length === group.length &&
+      before.every((chat, index) => chat === group[index])
+    ) {
+      grouped.set(instanceId, before);
+    }
+  }
+  return grouped;
+}
+
+const EMPTY_CHATS: Chat[] = [];
+const EMPTY_TERMINALS: Terminal[] = [];
+
 // Pathname-based routing: /c/<id> deep-links to a specific instance. Relies
 // on Vite's built-in SPA fallback in dev and Tauri's webview serving index.html
 // for unknown paths in prod. In-app navigation uses history.pushState so no
@@ -141,6 +172,10 @@ function loadSidebarCollapsed(): boolean {
 
 export default function HomeTab({ isTauri }: HomeTabProps) {
   const [instances, setInstances] = useState<Instance[]>([]);
+  // Latest rows for handlers that only need to read one, so they can stay
+  // referentially stable across the once-a-second poll.
+  const instancesRef = useRef(instances);
+  instancesRef.current = instances;
   const [renaming, setRenaming] = useState<{
     id: string;
     title: string;
@@ -425,15 +460,17 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     return () => window.removeEventListener("popstate", sync);
   }, []);
 
-  const handleNew = () => {
+  // Everything the sidebar is handed is a stable identity, so a poll that
+  // touches one instance re-renders that one row rather than the whole list.
+  const handleNew = useCallback(() => {
     submissionIdRef.current++;
     setView({ kind: "drafting" });
-  };
+  }, []);
 
-  const handleSelect = (id: string) => {
+  const handleSelect = useCallback((id: string) => {
     submissionIdRef.current++;
     setView({ kind: "instance", id });
-  };
+  }, []);
 
   // Settings opens as an overlay over the current view, so we leave `view` (and
   // any in-flight draft submission) alone, with no submissionId bump.
@@ -556,37 +593,40 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
   // Detach a PR badge from a chat. Optimistic: drop it locally so it disappears
   // at once, then persist. The 1s instance poll reconciles either way, so a
   // failed request just self-heals on the next round.
-  const handleDetachPr = (instanceId: string, pr: AttachedPr) => {
-    setInstances((prev) =>
-      prev.map((c) =>
-        c.id === instanceId
-          ? {
-              ...c,
-              prs: (c.prs ?? []).filter(
-                (p) =>
-                  !(
-                    p.host === pr.host &&
-                    p.owner === pr.owner &&
-                    p.repo === pr.repo &&
-                    p.number === pr.number
-                  ),
-              ),
-            }
-          : c,
-      ),
-    );
-    void detachInstancePr(instanceId, {
-      host: pr.host,
-      owner: pr.owner,
-      repo: pr.repo,
-      number: pr.number,
-    }).catch(() => void refreshInstances());
-  };
+  const handleDetachPr = useCallback(
+    (instanceId: string, pr: AttachedPr) => {
+      setInstances((prev) =>
+        prev.map((c) =>
+          c.id === instanceId
+            ? {
+                ...c,
+                prs: (c.prs ?? []).filter(
+                  (p) =>
+                    !(
+                      p.host === pr.host &&
+                      p.owner === pr.owner &&
+                      p.repo === pr.repo &&
+                      p.number === pr.number
+                    ),
+                ),
+              }
+            : c,
+        ),
+      );
+      void detachInstancePr(instanceId, {
+        host: pr.host,
+        owner: pr.owner,
+        repo: pr.repo,
+        number: pr.number,
+      }).catch(() => void refreshInstances());
+    },
+    [refreshInstances],
+  );
 
-  const handleRename = (id: string) => {
-    const current = instances.find((c) => c.id === id);
+  const handleRename = useCallback((id: string) => {
+    const current = instancesRef.current.find((c) => c.id === id);
     setRenaming({ id, title: current?.title ?? "" });
-  };
+  }, []);
 
   const submitRename = async (title: string) => {
     if (!renaming) return;
@@ -600,93 +640,108 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     }
   };
 
-  const handleRestart = async (id: string) => {
-    // Optimistic: flip to "restarting" so the badge appears immediately.
-    setInstances((prev) =>
-      prev.map((c) => (c.id === id ? { ...c, status: "restarting", lastError: null } : c)),
-    );
-    try {
-      const updated = await restartInstance(id);
-      setInstances((prev) => prev.map((c) => (c.id === id ? updated : c)));
-    } catch (err) {
-      // Server side already persisted status=error + lastError, so pull the
-      // canonical row so the UI reflects exactly what the server has.
-      console.error("[home] restart failed", err);
-      void refreshInstances();
-    }
-  };
+  const handleRestart = useCallback(
+    async (id: string) => {
+      // Optimistic: flip to "restarting" so the badge appears immediately.
+      setInstances((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, status: "restarting", lastError: null } : c)),
+      );
+      try {
+        const updated = await restartInstance(id);
+        setInstances((prev) => prev.map((c) => (c.id === id ? updated : c)));
+      } catch (err) {
+        // Server side already persisted status=error + lastError, so pull the
+        // canonical row so the UI reflects exactly what the server has.
+        console.error("[home] restart failed", err);
+        void refreshInstances();
+      }
+    },
+    [refreshInstances],
+  );
 
   // Archive a chat: stop its VM and move it into the sidebar's Archived
   // section. Optimistic: flip the row locally so it drops out of the active
   // list at once. The reconcile (and the 1s poll) settle the real state.
-  const handleArchive = async (id: string) => {
-    setInstances((prev) =>
-      prev.map((c) =>
-        c.id === id
-          ? {
-              ...c,
-              archived: true,
-              status: "stopped",
-              working: false,
-              unread: false,
-            }
-          : c,
-      ),
-    );
-    // The archived chat leaves the main list. If we were viewing it, fall back
-    // to the draft view (same as the old delete flow).
-    if (view.kind === "instance" && view.id === id) setView({ kind: "drafting" });
-    try {
-      const updated = await archiveInstance(id);
-      setInstances((prev) => prev.map((c) => (c.id === id ? updated : c)));
-    } catch (err) {
-      console.error("[home] archive failed", err);
-      void refreshInstances();
-    }
-  };
+  const handleArchive = useCallback(
+    async (id: string) => {
+      setInstances((prev) =>
+        prev.map((c) =>
+          c.id === id
+            ? {
+                ...c,
+                archived: true,
+                status: "stopped",
+                working: false,
+                unread: false,
+              }
+            : c,
+        ),
+      );
+      // The archived chat leaves the main list. If we were viewing it, fall back
+      // to the draft view (same as the old delete flow).
+      setView((v) => (v.kind === "instance" && v.id === id ? { kind: "drafting" } : v));
+      try {
+        const updated = await archiveInstance(id);
+        setInstances((prev) => prev.map((c) => (c.id === id ? updated : c)));
+      } catch (err) {
+        console.error("[home] archive failed", err);
+        void refreshInstances();
+      }
+    },
+    [refreshInstances],
+  );
 
   // Unarchive a chat: clear the flag and boot its VM back up. Optimistic flip
   // to "restarting" so it rejoins the active list immediately.
-  const handleUnarchive = async (id: string) => {
-    setInstances((prev) =>
-      prev.map((c) =>
-        c.id === id ? { ...c, archived: false, status: "restarting", lastError: null } : c,
-      ),
-    );
-    try {
-      const updated = await unarchiveInstance(id);
-      setInstances((prev) => prev.map((c) => (c.id === id ? updated : c)));
-    } catch (err) {
-      console.error("[home] unarchive failed", err);
-      void refreshInstances();
-    }
-  };
+  const handleUnarchive = useCallback(
+    async (id: string) => {
+      setInstances((prev) =>
+        prev.map((c) =>
+          c.id === id ? { ...c, archived: false, status: "restarting", lastError: null } : c,
+        ),
+      );
+      try {
+        const updated = await unarchiveInstance(id);
+        setInstances((prev) => prev.map((c) => (c.id === id ? updated : c)));
+      } catch (err) {
+        console.error("[home] unarchive failed", err);
+        void refreshInstances();
+      }
+    },
+    [refreshInstances],
+  );
 
   // Pin a chat: lift it into the sidebar's Pinned section. Optimistic flip so
   // it jumps sections at once; the 1s poll settles the canonical row (and its
   // recency order). No VM lifecycle, so nothing else changes.
-  const handlePin = async (id: string) => {
-    setInstances((prev) => prev.map((c) => (c.id === id ? { ...c, pinned: true } : c)));
-    try {
-      const updated = await pinInstance(id);
-      setInstances((prev) => prev.map((c) => (c.id === id ? updated : c)));
-    } catch (err) {
-      console.error("[home] pin failed", err);
-      void refreshInstances();
-    }
-  };
+  const handlePin = useCallback(
+    async (id: string) => {
+      setInstances((prev) => prev.map((c) => (c.id === id ? { ...c, pinned: true } : c)));
+      try {
+        const updated = await pinInstance(id);
+        setInstances((prev) => prev.map((c) => (c.id === id ? updated : c)));
+      } catch (err) {
+        console.error("[home] pin failed", err);
+        void refreshInstances();
+      }
+    },
+    [refreshInstances],
+  );
 
   // Unpin a chat: drop it back into the main list. Optimistic, mirroring pin.
-  const handleUnpin = async (id: string) => {
-    setInstances((prev) => prev.map((c) => (c.id === id ? { ...c, pinned: false } : c)));
-    try {
-      const updated = await unpinInstance(id);
-      setInstances((prev) => prev.map((c) => (c.id === id ? updated : c)));
-    } catch (err) {
-      console.error("[home] unpin failed", err);
-      void refreshInstances();
-    }
-  };
+  const handleUnpin = useCallback(
+    async (id: string) => {
+      setInstances((prev) => prev.map((c) => (c.id === id ? { ...c, pinned: false } : c)));
+      try {
+        const updated = await unpinInstance(id);
+        setInstances((prev) => prev.map((c) => (c.id === id ? updated : c)));
+      } catch (err) {
+        console.error("[home] unpin failed", err);
+        void refreshInstances();
+      }
+    },
+    [refreshInstances],
+  );
 
   // Drop all client-side state tied to a set of just-deleted instances (chats
   // and terminals). Their panel layouts live in the DB and vanish with the
@@ -752,13 +807,14 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
   const activeInstanceId = view.kind === "instance" ? view.id : null;
   const activeInstance =
     activeInstanceId != null ? (instances.find((c) => c.id === activeInstanceId) ?? null) : null;
+  // Written during render on purpose: it only carries the previous grouping so
+  // unchanged groups can keep their identity. A discarded render leaves behind
+  // groups holding the same chat rows, so the next one still reconciles
+  // correctly against them.
+  const chatGroupsRef = useRef<ReadonlyMap<string, Chat[]>>(new Map());
   const chatsByInstance = useMemo(() => {
-    const grouped = new Map<string, Chat[]>();
-    for (const chat of allChats) {
-      const chats = grouped.get(chat.instanceId) ?? [];
-      chats.push(chat);
-      grouped.set(chat.instanceId, chats);
-    }
+    const grouped = reconcileChatGroups(chatGroupsRef.current, allChats);
+    chatGroupsRef.current = grouped;
     return grouped;
   }, [allChats]);
   // A live instance keeps its complete chat subtree and DOM. Sidebar
@@ -780,12 +836,19 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
   // first title event. Each remaining chat lands in exactly one section:
   // archived (its own collapsed disclosure), else pinned (the "Pinned" heading
   // at the top), else the main active list.
-  const sidebarInstances = instances.filter(
-    (c) => c.title !== null && c.title.trim() !== "" && (c.profileId ?? null) === activeProfileId,
-  );
-  const archivedInstances = sidebarInstances.filter((c) => c.archived);
-  const pinnedInstances = sidebarInstances.filter((c) => !c.archived && c.pinned);
-  const activeInstances = sidebarInstances.filter((c) => !c.archived && !c.pinned);
+  const { archivedInstances, pinnedInstances, activeInstances } = useMemo(() => {
+    const sidebarInstances = instances.filter(
+      (c) => c.title !== null && c.title.trim() !== "" && (c.profileId ?? null) === activeProfileId,
+    );
+    return {
+      archivedInstances: sidebarInstances.filter((c) => c.archived),
+      pinnedInstances: sidebarInstances.filter((c) => !c.archived && c.pinned),
+      activeInstances: sidebarInstances.filter((c) => !c.archived && !c.pinned),
+    };
+  }, [activeProfileId, instances]);
+
+  const handleRequestDelete = useCallback((id: string) => setConfirmingDelete(id), []);
+  const handleRequestClearArchive = useCallback(() => setConfirmingClearArchive(true), []);
 
   // Dropping the overlay reveals the untouched background view (same instance,
   // same scroll position), so there's nothing to restore here.
@@ -828,8 +891,8 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
               onUnpin={handleUnpin}
               onArchive={handleArchive}
               onUnarchive={handleUnarchive}
-              onDelete={(id) => setConfirmingDelete(id)}
-              onClearArchive={() => setConfirmingClearArchive(true)}
+              onDelete={handleRequestDelete}
+              onClearArchive={handleRequestClearArchive}
             />
           )}
 
@@ -862,48 +925,29 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
               {retainedInstances.map((instance) => {
                 const isActive = instance.id === activeInstanceId;
                 return (
-                  <div
+                  <RetainedInstancePane
                     key={instance.id}
-                    data-retained-instance={instance.id}
-                    className="absolute inset-0 flex min-h-0"
-                    aria-hidden={!isActive}
-                    inert={!isActive}
-                    style={{
-                      // Keep this mode stable across sidebar switches so a
-                      // retained reading position does not reflow. Full
-                      // `strict` containment includes paint and size
-                      // containment, which can make an absolutely positioned
-                      // panel body's nested scroller inert in macOS WebKit.
-                      contain: "layout style",
-                      opacity: isActive ? 1 : 0,
-                      pointerEvents: isActive ? "auto" : "none",
-                    }}
-                  >
-                    <PanelWorkspace
-                      instance={instance}
-                      chats={chatsByInstance.get(instance.id) ?? []}
-                      terminals={terminalsByInstance[instance.id] ?? []}
-                      ports={instance.ports ?? []}
-                      prs={instance.prs ?? []}
-                      chatModels={chatModels}
-                      modelOverrides={modelOverrides}
-                      pendingFirstMessage={
-                        isActive && view.kind === "instance"
-                          ? (view.pendingFirstMessage ?? null)
-                          : null
-                      }
-                      visible={isActive}
-                      sidebarCollapsed={sidebarCollapsed}
-                      chromeInset={chromeWidth}
-                      isTauri={isTauri}
-                      onTitleAutoUpdated={handleTitleAutoUpdated}
-                      onDetachPr={(pr) => handleDetachPr(instance.id, pr)}
-                      onChatCreated={registerChat}
-                      onChatDeleted={unregisterChat}
-                      onTerminalCreated={registerTerminal}
-                      onTerminalDeleted={unregisterTerminal}
-                    />
-                  </div>
+                    instance={instance}
+                    chats={chatsByInstance.get(instance.id) ?? EMPTY_CHATS}
+                    terminals={terminalsByInstance[instance.id] ?? EMPTY_TERMINALS}
+                    active={isActive}
+                    pendingFirstMessage={
+                      isActive && view.kind === "instance"
+                        ? (view.pendingFirstMessage ?? null)
+                        : null
+                    }
+                    chatModels={chatModels}
+                    modelOverrides={modelOverrides}
+                    sidebarCollapsed={sidebarCollapsed}
+                    chromeInset={chromeWidth}
+                    isTauri={isTauri}
+                    onTitleAutoUpdated={handleTitleAutoUpdated}
+                    onDetachPr={handleDetachPr}
+                    onChatCreated={registerChat}
+                    onChatDeleted={unregisterChat}
+                    onTerminalCreated={registerTerminal}
+                    onTerminalDeleted={unregisterTerminal}
+                  />
                 );
               })}
 

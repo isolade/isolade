@@ -22,6 +22,12 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Fixed
 
+- The app stays responsive with many chats open. Chats you are not looking at
+  are kept alive so switching back to them is instant, but they no longer cost
+  anything to keep around: opening a menu, typing in a new chat, or switching
+  chats used to get slower with every long conversation left open, and now takes
+  the same time whether one chat is open or twenty. Reading positions, drafts,
+  terminals, and browser previews are still preserved exactly as before.
 - The chat composer now grows when its panel gets narrower and always leaves
   enough height for at least one line, so draft text is no longer clipped.
 - Codex chats now show reconnect progress while Codex retries an interrupted

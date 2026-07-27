@@ -689,7 +689,12 @@ function Chat({
     const el = composerRef.current;
     if (!el) return;
     const measure = () => {
-      setComposerHeight(el.offsetHeight);
+      // Zero means this pane's rendering is skipped while it sits off screen,
+      // not that the composer collapsed. Keeping the last real height means the
+      // tail padding is already right when the pane is revealed.
+      const height = el.offsetHeight;
+      if (height === 0) return;
+      setComposerHeight(height);
       // A growing composer (multiline draft) shifts the bottom edge down, so
       // keep the viewport pinned to the tail if the user was there.
       scrollToBottom();
