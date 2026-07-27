@@ -225,7 +225,7 @@ export default function SecretsTab({ activeProfileId }: { activeProfileId: strin
   };
 
   return (
-    <div className="flex-1 min-w-0 min-h-0 overflow-y-auto p-6 space-y-4">
+    <div className="flex-1 min-w-0 min-h-0 overflow-y-auto px-6 pt-4 pb-6 space-y-4">
       <div className="max-w-2xl space-y-1">
         <h2 className="text-sm font-medium">Secrets</h2>
         <p className="text-xs text-muted-foreground">

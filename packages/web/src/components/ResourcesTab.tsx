@@ -165,11 +165,13 @@ export default function ResourcesTab() {
 
   if (error && !stats) {
     return (
-      <div className="p-6 text-sm text-destructive">Failed to load resource stats: {error}</div>
+      <div className="px-6 pt-4 pb-6 text-sm text-destructive">
+        Failed to load resource stats: {error}
+      </div>
     );
   }
   if (!stats) {
-    return <div className="p-6 text-sm text-muted-foreground">Loading…</div>;
+    return <div className="px-6 pt-4 pb-6 text-sm text-muted-foreground">Loading…</div>;
   }
 
   const workspaceVms = stats.vms.filter((v) => v.role === "workspace");
@@ -332,97 +334,109 @@ export default function ResourcesTab() {
   ];
 
   return (
-    <div className="h-full overflow-auto p-4 grid gap-4 grid-cols-1 lg:grid-cols-3">
-      <Section
-        title="Memory"
-        right={`${formatMemBytes(memoryUsed)} / ${formatMemBytes(stats.hostMemoryTotalBytes)}`}
-      >
-        <StackedBar segments={memorySegments} total={stats.hostMemoryTotalBytes} />
-        <Legend segments={memorySegments} />
-        <ul className="mt-3 space-y-1 text-xs text-muted-foreground">
-          {stats.vms.map((vm) => (
-            <li key={vm.id} className="flex justify-between border-b border-border py-1">
-              <span>
-                {vm.role === "builder"
-                  ? "BuildKit builder VM"
-                  : `Workspace VM · ${vm.id.slice(0, 8)}`}
-                <span className="ml-2 text-muted-foreground/70">
-                  limit {formatMemBytes(vm.memoryLimitBytes)} · up {formatUptime(vm.uptimeMs)}
-                </span>
-              </span>
-              <span className="font-mono tabular-nums">{formatMemBytes(vm.memoryBytes)}</span>
-            </li>
-          ))}
-          {stats.services.map((svc) => (
-            <li
-              key={`mem-${svc.name}`}
-              className="flex justify-between border-b border-border py-1"
-            >
-              <span>
-                {svc.name}
-                <span className="ml-2 text-muted-foreground/70">pid {svc.pid}</span>
-              </span>
-              <span className="font-mono tabular-nums">{formatMemBytes(svc.memoryBytes)}</span>
-            </li>
-          ))}
-        </ul>
-      </Section>
+    <div className="h-full overflow-auto px-4 pt-4 pb-4 flex flex-col gap-4">
+      <div className="max-w-2xl space-y-1">
+        <h2 className="text-sm font-medium">Resources</h2>
+        <p className="text-xs text-muted-foreground">
+          What the sandbox is using on this machine right now, per VM and per service.
+        </p>
+      </div>
 
-      <Section title="CPU" right={`${stats.hostCpuCount} cores`}>
-        <StackedBar segments={cpuSegments} total={totalCpuCapacity} />
-        <Legend segments={cpuSegments} />
-        <ul className="mt-3 space-y-1 text-xs text-muted-foreground">
-          {stats.vms.map((vm) => (
-            <li
-              key={vm.id}
-              className="flex justify-between border-b border-border py-1"
-              title="Host CPU cost of the VM process (matches Activity Monitor). 'in-VM' is the guest vCPU busy time, which excludes virtualization and I/O overhead."
-            >
-              <span>
-                {vm.role === "builder"
-                  ? "BuildKit builder VM"
-                  : `Workspace VM · ${vm.id.slice(0, 8)}`}
-                <span className="ml-2 text-muted-foreground/70">
-                  in-VM {formatPercent(vm.guestCpuPercent)}
+      {/* The cards fill the height that's left when there's room to spare, and
+          push the page into a scroll when there isn't (hence flex-1 without
+          min-h-0, which would clip them instead). */}
+      <div className="grid flex-1 gap-4 grid-cols-1 lg:grid-cols-3">
+        <Section
+          title="Memory"
+          right={`${formatMemBytes(memoryUsed)} / ${formatMemBytes(stats.hostMemoryTotalBytes)}`}
+        >
+          <StackedBar segments={memorySegments} total={stats.hostMemoryTotalBytes} />
+          <Legend segments={memorySegments} />
+          <ul className="mt-3 space-y-1 text-xs text-muted-foreground">
+            {stats.vms.map((vm) => (
+              <li key={vm.id} className="flex justify-between border-b border-border py-1">
+                <span>
+                  {vm.role === "builder"
+                    ? "BuildKit builder VM"
+                    : `Workspace VM · ${vm.id.slice(0, 8)}`}
+                  <span className="ml-2 text-muted-foreground/70">
+                    limit {formatMemBytes(vm.memoryLimitBytes)} · up {formatUptime(vm.uptimeMs)}
+                  </span>
                 </span>
-              </span>
-              <span className="font-mono tabular-nums">{formatPercent(vm.cpuPercent)}</span>
-            </li>
-          ))}
-          {stats.services.map((svc) => (
-            <li
-              key={`cpu-${svc.name}`}
-              className="flex justify-between border-b border-border py-1"
-            >
-              <span>
-                {svc.name}
-                <span className="ml-2 text-muted-foreground/70">pid {svc.pid}</span>
-              </span>
-              <span className="font-mono tabular-nums">{formatPercent(svc.cpuPercent)}</span>
-            </li>
-          ))}
-        </ul>
-      </Section>
+                <span className="font-mono tabular-nums">{formatMemBytes(vm.memoryBytes)}</span>
+              </li>
+            ))}
+            {stats.services.map((svc) => (
+              <li
+                key={`mem-${svc.name}`}
+                className="flex justify-between border-b border-border py-1"
+              >
+                <span>
+                  {svc.name}
+                  <span className="ml-2 text-muted-foreground/70">pid {svc.pid}</span>
+                </span>
+                <span className="font-mono tabular-nums">{formatMemBytes(svc.memoryBytes)}</span>
+              </li>
+            ))}
+          </ul>
+        </Section>
 
-      <Section
-        title="Disk"
-        right={`${formatBytes(hostDiskUsed)} / ${formatBytes(stats.hostDiskTotalBytes)}`}
-      >
-        <StackedBar segments={diskSegments} total={stats.hostDiskTotalBytes} />
-        <Legend segments={diskSegments} />
-        <ul className="mt-3 space-y-1 text-xs text-muted-foreground">
-          {stats.vms.map((vm) => (
-            <li key={vm.id} className="flex justify-between border-b border-border py-1">
-              <span>
-                {vm.role === "builder"
-                  ? "BuildKit builder VM"
-                  : `Workspace VM · ${vm.id.slice(0, 8)}`}
-              </span>
-              <span className="font-mono tabular-nums">{formatBytes(vm.upperDiskBytes)}</span>
-            </li>
-          ))}
-        </ul>
-      </Section>
+        <Section title="CPU" right={`${stats.hostCpuCount} cores`}>
+          <StackedBar segments={cpuSegments} total={totalCpuCapacity} />
+          <Legend segments={cpuSegments} />
+          <ul className="mt-3 space-y-1 text-xs text-muted-foreground">
+            {stats.vms.map((vm) => (
+              <li
+                key={vm.id}
+                className="flex justify-between border-b border-border py-1"
+                title="Host CPU cost of the VM process (matches Activity Monitor). 'in-VM' is the guest vCPU busy time, which excludes virtualization and I/O overhead."
+              >
+                <span>
+                  {vm.role === "builder"
+                    ? "BuildKit builder VM"
+                    : `Workspace VM · ${vm.id.slice(0, 8)}`}
+                  <span className="ml-2 text-muted-foreground/70">
+                    in-VM {formatPercent(vm.guestCpuPercent)}
+                  </span>
+                </span>
+                <span className="font-mono tabular-nums">{formatPercent(vm.cpuPercent)}</span>
+              </li>
+            ))}
+            {stats.services.map((svc) => (
+              <li
+                key={`cpu-${svc.name}`}
+                className="flex justify-between border-b border-border py-1"
+              >
+                <span>
+                  {svc.name}
+                  <span className="ml-2 text-muted-foreground/70">pid {svc.pid}</span>
+                </span>
+                <span className="font-mono tabular-nums">{formatPercent(svc.cpuPercent)}</span>
+              </li>
+            ))}
+          </ul>
+        </Section>
+
+        <Section
+          title="Disk"
+          right={`${formatBytes(hostDiskUsed)} / ${formatBytes(stats.hostDiskTotalBytes)}`}
+        >
+          <StackedBar segments={diskSegments} total={stats.hostDiskTotalBytes} />
+          <Legend segments={diskSegments} />
+          <ul className="mt-3 space-y-1 text-xs text-muted-foreground">
+            {stats.vms.map((vm) => (
+              <li key={vm.id} className="flex justify-between border-b border-border py-1">
+                <span>
+                  {vm.role === "builder"
+                    ? "BuildKit builder VM"
+                    : `Workspace VM · ${vm.id.slice(0, 8)}`}
+                </span>
+                <span className="font-mono tabular-nums">{formatBytes(vm.upperDiskBytes)}</span>
+              </li>
+            ))}
+          </ul>
+        </Section>
+      </div>
     </div>
   );
 }

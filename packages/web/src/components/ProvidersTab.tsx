@@ -122,9 +122,9 @@ export default function ProvidersTab({ activeProfileId }: { activeProfileId: str
   );
 
   return (
-    <div className="flex-1 min-h-0 overflow-y-auto p-6 space-y-4">
+    <div className="flex-1 min-h-0 overflow-y-auto px-6 pt-4 pb-6 space-y-4">
       <div className="max-w-2xl space-y-1">
-        <h2 className="text-sm font-medium">Agent providers</h2>
+        <h2 className="text-sm font-medium">Providers</h2>
         <p className="text-xs text-muted-foreground">
           Sign in to Claude and Codex once here. Credentials are stored by isolade and injected into
           every agent VM, with no need to install or log into the CLIs on this machine.

@@ -82,15 +82,15 @@ export default function ModelsTab({ activeProfileId, chatModels }: ModelsTabProp
   };
 
   return (
-    <div className="flex-1 min-w-0 min-h-0 overflow-y-auto p-6 space-y-6">
+    <div className="flex-1 min-w-0 min-h-0 overflow-y-auto px-6 pt-4 pb-6 space-y-6">
       <div className="flex items-start justify-between gap-4 max-w-2xl">
-        <div className="flex flex-col gap-0.5">
-          <span className="text-sm">Models</span>
-          <span className="text-xs text-muted-foreground">
+        <div className="space-y-1">
+          <h2 className="text-sm font-medium">Models</h2>
+          <p className="text-xs text-muted-foreground">
             Choose which models appear in the picker and where. “Shown” sits at the top level,
             “More…” tucks it behind the picker’s More… menu, and “Hidden” removes it. Changes only
             store what you customize, so new or updated models still come through.
-          </span>
+          </p>
         </div>
         <Button
           variant="outline"

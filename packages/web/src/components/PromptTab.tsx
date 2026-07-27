@@ -63,7 +63,7 @@ export default function PromptTab({ activeProfileId }: { activeProfileId: string
 
   if (!activeProfileId) {
     return (
-      <div className="flex-1 min-h-0 overflow-y-auto p-6">
+      <div className="flex-1 min-h-0 overflow-y-auto px-6 pt-4 pb-6">
         <p className="text-sm text-muted-foreground">No profile selected.</p>
       </div>
     );
@@ -71,7 +71,7 @@ export default function PromptTab({ activeProfileId }: { activeProfileId: string
 
   if (!cfg) {
     return (
-      <div className="flex-1 min-h-0 overflow-y-auto p-6">
+      <div className="flex-1 min-h-0 overflow-y-auto px-6 pt-4 pb-6">
         {loadError ? (
           <p className="text-xs text-destructive max-w-2xl">
             Couldn’t load prompt settings: {loadError}
@@ -84,7 +84,7 @@ export default function PromptTab({ activeProfileId }: { activeProfileId: string
   }
 
   return (
-    <div className="flex-1 min-h-0 overflow-y-auto p-6 space-y-4">
+    <div className="flex-1 min-h-0 overflow-y-auto px-6 pt-4 pb-6 space-y-4">
       <div className="max-w-2xl space-y-1">
         <h2 className="text-sm font-medium">Prompt</h2>
         <p className="text-xs text-muted-foreground">

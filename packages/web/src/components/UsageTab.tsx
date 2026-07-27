@@ -362,12 +362,12 @@ export default function UsageTab({ activeProfileId }: { activeProfileId: string 
   }, [load]);
 
   if (!activeProfileId) {
-    return <div className="p-6 text-sm text-muted-foreground">No profile selected.</div>;
+    return <div className="px-6 pt-4 pb-6 text-sm text-muted-foreground">No profile selected.</div>;
   }
 
   if (error && !stats) {
     return (
-      <div className="p-6 text-sm text-destructive">
+      <div className="px-6 pt-4 pb-6 text-sm text-destructive">
         Failed to load usage: {error}
         <div className="mt-3">
           <Button size="sm" variant="outline" onClick={() => void load()}>
@@ -378,17 +378,21 @@ export default function UsageTab({ activeProfileId }: { activeProfileId: string 
     );
   }
   if (!stats) {
-    return <div className="p-6 text-sm text-muted-foreground">Loading…</div>;
+    return <div className="px-6 pt-4 pb-6 text-sm text-muted-foreground">Loading…</div>;
   }
 
   const fetchedAt = new Date(stats.fetchedAtMs);
 
   return (
-    <div className="h-full overflow-auto p-4 flex flex-col gap-4">
-      <div className="flex items-center justify-between">
-        <div className="text-xs text-muted-foreground">
-          Fetched {fetchedAt.toLocaleTimeString()}
-          {loading && <span className="ml-2">refreshing…</span>}
+    <div className="h-full overflow-auto px-4 pt-4 pb-4 flex flex-col gap-4">
+      <div className="flex items-start justify-between gap-4">
+        <div className="max-w-2xl space-y-1">
+          <h2 className="text-sm font-medium">Usage</h2>
+          <p className="text-xs text-muted-foreground">
+            What this profile has spent with Claude and Codex, priced as API-equivalent cost.
+            Fetched {fetchedAt.toLocaleTimeString()}
+            {loading && <span className="ml-2">refreshing…</span>}
+          </p>
         </div>
         <Button size="sm" variant="outline" onClick={() => void load()} disabled={loading}>
           Refresh
