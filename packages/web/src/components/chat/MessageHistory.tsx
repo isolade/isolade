@@ -25,6 +25,31 @@ import { UserMessage } from "./UserMessage";
 
 const EDITABLE_USER_MESSAGE = { edit: true } as const;
 
+/** Where the reader is: a message, and its top edge relative to the viewport. */
+interface ReadingAnchor {
+  messageId: string;
+  top: number;
+}
+
+function anchorFor(row: HTMLElement | null): ReadingAnchor | null {
+  const messageId = row?.getAttribute("data-message-id");
+  return messageId ? { messageId, top: row!.getBoundingClientRect().top } : null;
+}
+
+/**
+ * How far the anchored message has moved since it was captured, or null when it
+ * cannot be located. Today that means it is not mounted, which only happens if
+ * it left the transcript. Once the transcript is windowed this is where an
+ * offset computed from the height cache belongs.
+ */
+function anchorDrift(list: HTMLElement | null, anchor: ReadingAnchor): number | null {
+  const row = list?.querySelector<HTMLElement>(
+    `[data-message-id="${CSS.escape(anchor.messageId)}"]`,
+  );
+  if (!row) return null;
+  return row.getBoundingClientRect().top - anchor.top;
+}
+
 export interface MessageHistoryPage {
   key: string;
   messages: TranscriptMessage[];
@@ -371,8 +396,14 @@ export const MessageHistory = memo(
     const listRef = useRef<HTMLDivElement>(null);
     const sentinelRef = useRef<HTMLDivElement>(null);
     const restoreAnchorRafRef = useRef<number | null>(null);
-    const prependAnchorRef = useRef<{ element: HTMLElement; top: number } | null>(null);
-    const resizeAnchorRef = useRef<{ element: HTMLElement; top: number } | null>(null);
+    // An anchor is a message and where its top sits relative to the viewport,
+    // not a live element. Holding the element only works while every message is
+    // mounted, which is exactly what windowing the transcript gives up: the
+    // message the reader is anchored to is frequently outside the rendered
+    // range. Resolving by id keeps the same behaviour today and leaves a single
+    // seam to answer from a height cache instead of the DOM later.
+    const prependAnchorRef = useRef<ReadingAnchor | null>(null);
+    const resizeAnchorRef = useRef<ReadingAnchor | null>(null);
     const rememberAnchorRafRef = useRef<number | null>(null);
 
     const shared = useMemo<SharedRowProps>(
@@ -499,9 +530,9 @@ export const MessageHistory = memo(
       const scrollElement = scrollElementRef.current;
       const listElement = listRef.current;
       if (!scrollElement || !listElement) return;
-      const element = findFirstVisibleRow(scrollElement, listElement);
-      if (!element) return;
-      prependAnchorRef.current = { element, top: element.getBoundingClientRect().top };
+      const anchor = anchorFor(findFirstVisibleRow(scrollElement, listElement));
+      if (!anchor) return;
+      prependAnchorRef.current = anchor;
       scrollElement.style.overflowAnchor = "none";
     }, [scrollElementRef]);
 
@@ -515,18 +546,16 @@ export const MessageHistory = memo(
         resizeAnchorRef.current = null;
         return;
       }
-      const element = findFirstVisibleRow(scrollElement, listElement, 120);
-      resizeAnchorRef.current = element
-        ? { element, top: element.getBoundingClientRect().top }
-        : null;
+      resizeAnchorRef.current = anchorFor(findFirstVisibleRow(scrollElement, listElement, 120));
     }, [scrollElementRef]);
 
     const restoreRetainedAnchor = useCallback(() => {
       const anchor = resizeAnchorRef.current;
       const scrollElement = scrollElementRef.current;
-      if (!scrollElement || !anchor?.element.isConnected) return;
+      if (!scrollElement || !anchor) return;
+      const delta = anchorDrift(listRef.current, anchor);
+      if (delta === null) return;
       scrollElement.style.overflowAnchor = "none";
-      const delta = anchor.element.getBoundingClientRect().top - anchor.top;
       if (Math.abs(delta) > 0.5) scrollElement.scrollTop += delta;
       if (restoreAnchorRafRef.current !== null) cancelAnimationFrame(restoreAnchorRafRef.current);
       restoreAnchorRafRef.current = requestAnimationFrame(() => {
@@ -546,9 +575,8 @@ export const MessageHistory = memo(
       if (!anchor) return;
       prependAnchorRef.current = null;
       const scrollElement = scrollElementRef.current;
-      if (scrollElement && anchor.element.isConnected) {
-        scrollElement.scrollTop += anchor.element.getBoundingClientRect().top - anchor.top;
-      }
+      const delta = anchorDrift(listRef.current, anchor);
+      if (scrollElement && delta !== null) scrollElement.scrollTop += delta;
       if (restoreAnchorRafRef.current !== null) cancelAnimationFrame(restoreAnchorRafRef.current);
       restoreAnchorRafRef.current = requestAnimationFrame(() => {
         restoreAnchorRafRef.current = null;
@@ -586,9 +614,9 @@ export const MessageHistory = memo(
       scrollElement.addEventListener("scroll", scheduleRemember, { passive: true });
       const observer = new ResizeObserver(() => {
         const anchor = resizeAnchorRef.current;
-        if (!prependAnchorRef.current && anchor?.element.isConnected) {
-          const delta = anchor.element.getBoundingClientRect().top - anchor.top;
-          if (Math.abs(delta) > 0.5) scrollElement.scrollTop += delta;
+        if (!prependAnchorRef.current && anchor) {
+          const delta = anchorDrift(listRef.current, anchor);
+          if (delta !== null && Math.abs(delta) > 0.5) scrollElement.scrollTop += delta;
         }
         rememberVisibleAnchor();
       });
