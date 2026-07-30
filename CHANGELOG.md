@@ -73,6 +73,9 @@ _Changes landed on `main` that haven't shipped in a release yet._
   change names the file it touched.
 - A Codex shell call now shows the command it ran, not the login shell around it
   (`/bin/bash -lc 'sleep 2'`).
+- Sending the first message of a new chat now lands in the full workspace, tab
+  strip and all, instead of a bare chat that grew one once the VM was up. Chat
+  and terminal tabs need the VM, so those two "+" entries wait for it.
 - The app stays responsive with many chats open. Chats you are not looking at
   are kept alive so switching back to them is instant, but they no longer cost
   anything to keep around: opening a menu, typing in a new chat, or switching

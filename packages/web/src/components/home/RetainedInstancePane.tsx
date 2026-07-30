@@ -19,6 +19,12 @@ interface RetainedInstancePaneProps {
   terminals: TerminalT[];
   active: boolean;
   pendingFirstMessage: { chatId: string; content: string; uploadIds?: string[] } | null;
+  // Set while this pane renders a just-submitted draft whose instance and chat
+  // are still being created (see HomeTab). The workspace is real from the first
+  // frame; only the resources behind it are stand-ins.
+  pending: boolean;
+  creationError: string | null;
+  resourceIdRemap: Record<string, string>;
   chatModels: ChatModelDefinition[];
   modelOverrides: ModelOverrides;
   sidebarCollapsed: boolean;
@@ -60,6 +66,9 @@ function RetainedInstancePane({
   terminals,
   active,
   pendingFirstMessage,
+  pending,
+  creationError,
+  resourceIdRemap,
   chatModels,
   modelOverrides,
   sidebarCollapsed,
@@ -118,6 +127,9 @@ function RetainedInstancePane({
         chatModels={chatModels}
         modelOverrides={modelOverrides}
         pendingFirstMessage={pendingFirstMessage}
+        pending={pending}
+        creationError={creationError}
+        resourceIdRemap={resourceIdRemap}
         visible={active}
         sidebarCollapsed={sidebarCollapsed}
         chromeInset={chromeInset}
@@ -153,6 +165,9 @@ function paneEqual(previous: RetainedInstancePaneProps, next: RetainedInstancePa
     previous.terminals === next.terminals &&
     previous.active === next.active &&
     previous.pendingFirstMessage === next.pendingFirstMessage &&
+    previous.pending === next.pending &&
+    previous.creationError === next.creationError &&
+    previous.resourceIdRemap === next.resourceIdRemap &&
     previous.chatModels === next.chatModels &&
     previous.modelOverrides === next.modelOverrides &&
     previous.sidebarCollapsed === next.sidebarCollapsed &&
