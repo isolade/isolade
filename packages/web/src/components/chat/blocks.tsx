@@ -169,17 +169,12 @@ const ThoughtBlock = memo(function ThoughtBlock({ chunk }: { chunk: ThoughtChunk
         onClick={() => canExpand && setOpen((value) => !value)}
         className="group flex max-w-full items-center gap-2 rounded-md py-0.5 text-left text-[13px] disabled:cursor-default"
       >
-        <span className="relative flex size-4 shrink-0 items-center justify-center">
-          {active && (
-            <span className="absolute inset-0 rounded-full bg-foreground/10 animate-ping motion-reduce:animate-none" />
+        <Sparkles
+          className={cn(
+            "size-3.5 shrink-0",
+            active ? "text-foreground/80" : "text-muted-foreground",
           )}
-          <Sparkles
-            className={cn(
-              "relative size-3.5 text-muted-foreground",
-              active && "thinking-spark text-foreground/80",
-            )}
-          />
-        </span>
+        />
         <span
           className={cn("shrink-0 font-medium", active ? "text-shimmer" : "text-muted-foreground")}
         >

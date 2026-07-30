@@ -20,6 +20,12 @@ _Changes landed on `main` that haven't shipped in a release yet._
   replying. Any partial reply remains on the original branch, and the
   replacement starts from the selected conversation point.
 
+### Changed
+
+- The thinking indicator no longer pulses and sways while an agent thinks. Its
+  icon now sits still like every other icon in the chat, and the sweeping
+  highlight on the "Thinking" label still marks the turn as active.
+
 ### Fixed
 
 - The app stays responsive with many chats open. Chats you are not looking at
