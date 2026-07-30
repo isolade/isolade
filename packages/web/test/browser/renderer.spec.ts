@@ -184,7 +184,7 @@ test.describe("message renderer browser gate", () => {
     );
   });
 
-  test("keeps a gap between expanded sidebar and its panel tabs", async ({ page }) => {
+  test("keeps expanded-sidebar tabs flush with the panel edge", async ({ page }) => {
     await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
       await route.fulfill({
         json: {
@@ -210,7 +210,7 @@ test.describe("message renderer browser gate", () => {
         if (!panelBounds || !tabBounds) return null;
         return tabBounds.x - panelBounds.x;
       })
-      .toBe(6);
+      .toBe(0);
   });
 
   test("keeps collapsed-sidebar tabs clear of the window controls", async ({ page }) => {
