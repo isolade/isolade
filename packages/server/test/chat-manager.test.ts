@@ -1,7 +1,17 @@
 import { beforeEach, describe, expect, it } from "bun:test";
-import { localDay } from "@isolade/shared";
+import {
+  type ChatCostBreakdown,
+  type ChatCostBucket,
+  codexPricingFor,
+  findChatModel,
+  localDay,
+  type TokenUsage,
+  tokenCostBreakdown,
+} from "@isolade/shared";
 import { randomUUID } from "crypto";
 import { eq } from "drizzle-orm";
+import type { ModelBilling } from "../src/chat/backend";
+import { pricingFor } from "../src/chat/subscription-share";
 import { ChatManager } from "../src/chats";
 import { createDb, schema } from "../src/db";
 
@@ -21,6 +31,34 @@ function makeInstanceId(db: ReturnType<typeof makeDb>, profileId: string | null 
     })
     .run();
   return id;
+}
+
+// One model's settled share of a turn, the shape a backend hands the manager.
+function billing(tokens: Partial<TokenUsage>, costUsd: number, model: string): ModelBilling {
+  const usage = {
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    outputTokens: 0,
+    reasoningOutputTokens: 0,
+    ...tokens,
+  };
+  return {
+    model,
+    cacheWrite1hTokens: 0,
+    fast: false,
+    usage: {
+      ...usage,
+      totalTokens:
+        usage.inputTokens +
+        usage.cachedInputTokens +
+        usage.cacheCreationInputTokens +
+        usage.outputTokens +
+        usage.reasoningOutputTokens,
+    },
+    webSearchRequests: 0,
+    costUsd,
+  };
 }
 
 describe("ChatManager", () => {
@@ -51,6 +89,60 @@ describe("ChatManager", () => {
 
     it("get returns undefined for unknown id", () => {
       expect(cm.get("nonexistent")).toBeUndefined();
+    });
+
+    it("snaps an effort the model no longer offers to the model's default", () => {
+      // What a chat created before an effort level was retired looks like. The
+      // clamp lives here so a turn can't keep asking for it: `ultra` was
+      // withdrawn because it switches codex into spawning its own sub-agents,
+      // and a row still carrying it would go on doing exactly that.
+      const chat = cm.create(instanceId, "gpt-5.6-sol", "openai", "medium");
+      db.update(schema.chats).set({ effort: "ultra" }).where(eq(schema.chats.id, chat.id)).run();
+      const model = findChatModel("gpt-5.6-sol");
+      if (!model) throw new Error("expected gpt-5.6-sol in the catalog");
+      expect(model.supportedEfforts).not.toContain("ultra");
+      expect(cm.get(chat.id)?.effort).toBe(model.defaultEffort);
+      // And through every other read path, not just `get`.
+      expect(cm.list(instanceId).find((c) => c.id === chat.id)?.effort).toBe(model.defaultEffort);
+    });
+
+    it("leaves the effort alone for a model the catalog doesn't carry", () => {
+      // No menu to clamp against, so nothing to snap to: passing the stored
+      // value through beats inventing a default from a model we know nothing of.
+      const chat = cm.create(instanceId, "gpt-4.1", "openai", "high");
+      expect(findChatModel("gpt-4.1")).toBeUndefined();
+      expect(cm.get(chat.id)?.effort).toBe("high");
+    });
+  });
+
+  describe("fast mode", () => {
+    it("clears the opt-in when a switch lands on a model that has no fast mode", () => {
+      const chat = cm.create(instanceId, "claude-opus-5", "anthropic", "high");
+      cm.updateFastMode(chat.id, true);
+      expect(cm.get(chat.id)?.fastMode).toBe(true);
+
+      cm.commitProviderSwitch(chat.id, {
+        provider: "anthropic",
+        model: "claude-sonnet-5",
+        effort: "high",
+      });
+      // Sonnet 5 publishes no fast rate card, so its picker offers no toggle.
+      // Carrying the opt-in over would leave it set with no way to see or clear
+      // it, and already on for the next model that does offer one.
+      expect(findChatModel("claude-sonnet-5")?.fastPricing).toBeUndefined();
+      expect(cm.get(chat.id)?.fastMode).toBe(false);
+    });
+
+    it("keeps the opt-in across a switch to a model that offers fast mode", () => {
+      const chat = cm.create(instanceId, "claude-opus-5", "anthropic", "high");
+      cm.updateFastMode(chat.id, true);
+      cm.commitProviderSwitch(chat.id, {
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        effort: "medium",
+      });
+      expect(findChatModel("gpt-5.6-sol")?.fastPricing).toBeDefined();
+      expect(cm.get(chat.id)?.fastMode).toBe(true);
     });
   });
 
@@ -289,23 +381,9 @@ describe("ChatManager", () => {
 
   describe("getAggregateTotals", () => {
     const setUsage = (id: string, inputTokens: number, outputTokens: number, costUsd: number) =>
-      cm.updateUsage(id, {
-        total: {
-          inputTokens,
-          cachedInputTokens: 0,
-          cacheCreationInputTokens: 0,
-          outputTokens,
-          reasoningOutputTokens: 0,
-        },
-        last: {
-          inputTokens,
-          cachedInputTokens: 0,
-          cacheCreationInputTokens: 0,
-          outputTokens,
-          reasoningOutputTokens: 0,
-        },
-        costUsd,
-      });
+      cm.recordTurnBilling(id, [
+        billing({ inputTokens, outputTokens }, costUsd, cm.get(id)!.model),
+      ]);
 
     it("splits totals per provider and sums tokens + cost", () => {
       const a1 = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
@@ -400,30 +478,18 @@ describe("ChatManager", () => {
   describe("getUsageHistory", () => {
     // usage events carry the *cumulative* per-chat total. The history series
     // must record only each event's delta.
-    const cumulative = (id: string, inputTokens: number, outputTokens: number, costUsd: number) =>
-      cm.updateUsage(id, {
-        total: {
-          inputTokens,
-          cachedInputTokens: 0,
-          cacheCreationInputTokens: 0,
-          outputTokens,
-          reasoningOutputTokens: 0,
-        },
-        last: {
-          inputTokens,
-          cachedInputTokens: 0,
-          cacheCreationInputTokens: 0,
-          outputTokens,
-          reasoningOutputTokens: 0,
-        },
-        costUsd,
-      });
+    // A settled turn: what it consumed and what it billed, both its own figures
+    // rather than a running total to be differenced.
+    const turn = (id: string, inputTokens: number, outputTokens: number, costUsd: number) =>
+      cm.recordTurnBilling(id, [
+        billing({ inputTokens, outputTokens }, costUsd, cm.get(id)!.model),
+      ]);
 
     it("accumulates deltas (not cumulative totals) into today's bucket", () => {
       const today = localDay(new Date());
       const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
-      cumulative(chat.id, 1000, 100, 0.5); // first event: +1000/+100/+$0.50
-      cumulative(chat.id, 2500, 250, 1.25); // running total grows: delta +1500/+150/+$0.75
+      turn(chat.id, 1000, 100, 0.5);
+      turn(chat.id, 1500, 150, 0.75);
 
       const history = cm.getUsageHistory();
       expect(history).toHaveLength(1);
@@ -439,8 +505,8 @@ describe("ChatManager", () => {
     it("splits a day's cost across providers but sums the total", () => {
       const a = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
       const o = cm.create(instanceId, "gpt-4.1", "openai", "high");
-      cumulative(a.id, 1000, 100, 2.0);
-      cumulative(o.id, 500, 50, 0.5);
+      turn(a.id, 1000, 100, 2.0);
+      turn(o.id, 500, 50, 0.5);
 
       const [day] = cm.getUsageHistory();
       expect(day!.costUsd).toBeCloseTo(2.5);
@@ -450,10 +516,9 @@ describe("ChatManager", () => {
 
     it("records nothing for a usage event that adds no tokens or cost", () => {
       const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
-      cumulative(chat.id, 1000, 100, 0.5);
-      // A later event with the same cumulative (e.g. one that only refreshes
-      // the context window) contributes a zero delta.
-      cumulative(chat.id, 1000, 100, 0.5);
+      turn(chat.id, 1000, 100, 0.5);
+      // A turn that consumed nothing and billed nothing is not activity.
+      turn(chat.id, 0, 0, 0);
 
       const [day] = cm.getUsageHistory();
       expect(day!.inputTokens).toBe(1000);
@@ -479,8 +544,8 @@ describe("ChatManager", () => {
       const p2Instance = makeInstanceId(db, p2);
       const p1Chat = cm.create(p1Instance, "claude-sonnet-4-5", "anthropic", "high");
       const p2Chat = cm.create(p2Instance, "gpt-4.1", "openai", "high");
-      cumulative(p1Chat.id, 1000, 100, 0.5);
-      cumulative(p2Chat.id, 2000, 200, 1.0);
+      turn(p1Chat.id, 1000, 100, 0.5);
+      turn(p2Chat.id, 2000, 200, 1.0);
 
       const history = cm.getUsageHistory(p1);
 
@@ -492,29 +557,13 @@ describe("ChatManager", () => {
   });
 
   describe("usage event log", () => {
-    const usageEvent = (id: string, totalInput: number, deltaInput: number, costUsd: number) =>
-      cm.updateUsage(id, {
-        total: {
-          inputTokens: totalInput,
-          cachedInputTokens: 0,
-          cacheCreationInputTokens: 0,
-          outputTokens: 0,
-          reasoningOutputTokens: 0,
-        },
-        last: {
-          inputTokens: deltaInput,
-          cachedInputTokens: 0,
-          cacheCreationInputTokens: 0,
-          outputTokens: 0,
-          reasoningOutputTokens: 0,
-        },
-        costUsd,
-      });
+    const usageEvent = (id: string, inputTokens: number, costUsd: number) =>
+      cm.recordTurnBilling(id, [billing({ inputTokens }, costUsd, cm.get(id)!.model)]);
 
-    it("appends one row per event, keeping the turn's model and a timestamp", () => {
+    it("appends one row per settled turn, keeping its model and a timestamp", () => {
       const chat = cm.create(instanceId, "claude-opus-4-8", "anthropic", "high");
-      usageEvent(chat.id, 1000, 1000, 0.5); // first turn: delta 1000
-      usageEvent(chat.id, 2500, 1500, 1.25); // running total grows: delta 1500
+      usageEvent(chat.id, 1000, 0.5);
+      usageEvent(chat.id, 1500, 0.75);
 
       const rows = db.select().from(schema.usageEvents).all();
       // One creation marker + two usage events, not one aggregated bucket.
@@ -526,16 +575,176 @@ describe("ChatManager", () => {
       expect(usage.every((r) => r.createdAt instanceof Date)).toBe(true);
     });
 
-    it("drops a zero-delta usage event (context-window-only refresh)", () => {
+    it("drops a turn that consumed nothing and billed nothing", () => {
       const chat = cm.create(instanceId, "claude-opus-4-8", "anthropic", "high");
-      usageEvent(chat.id, 1000, 1000, 0.5);
-      usageEvent(chat.id, 1000, 0, 0.5); // same cumulative → no new activity
+      usageEvent(chat.id, 1000, 0.5);
+      usageEvent(chat.id, 0, 0); // a turn that consumed and billed nothing
       const usage = db
         .select()
         .from(schema.usageEvents)
         .all()
         .filter((r) => r.kind === "usage");
       expect(usage).toHaveLength(1);
+    });
+
+    it("labels each row with its chat, so one chat's spend can be read back", () => {
+      const mine = cm.create(instanceId, "claude-opus-4-8", "anthropic", "high");
+      const other = cm.create(instanceId, "claude-opus-4-8", "anthropic", "high");
+      usageEvent(mine.id, 1000, 0.5);
+      usageEvent(other.id, 9000, 4);
+
+      const rows = db
+        .select()
+        .from(schema.usageEvents)
+        .all()
+        .filter((r) => r.kind === "usage" && r.chatId === mine.id);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.inputTokens).toBe(1000);
+    });
+  });
+
+  describe("getChatCostBreakdown", () => {
+    // Buckets are priced from the live catalog so the expectations can't drift
+    // out of sync with a rate card update.
+    const priceOf = (model: string, provider: "anthropic" | "openai", usage: TokenUsage) =>
+      tokenCostBreakdown(usage, pricingFor(provider, model));
+    const bucketOf = (breakdown: ChatCostBreakdown, bucket: ChatCostBucket["bucket"]) =>
+      breakdown.buckets.find((b) => b.bucket === bucket);
+    const settle = (id: string, tokens: Partial<TokenUsage>, costUsd: number, model?: string) => {
+      const entry = billing(tokens, costUsd, model ?? cm.get(id)!.model);
+      cm.recordTurnBilling(id, [entry]);
+      return entry.usage;
+    };
+
+    it("itemizes a chat's tokens and prices each bucket", () => {
+      const chat = cm.create(instanceId, "claude-opus-4-8", "anthropic", "high");
+      const tokens = settle(
+        chat.id,
+        {
+          inputTokens: 10_000,
+          cachedInputTokens: 40_000,
+          cacheCreationInputTokens: 5_000,
+          outputTokens: 2_000,
+        },
+        0.9,
+      );
+
+      const breakdown = cm.getChatCostBreakdown(chat.id);
+      const expected = priceOf("claude-opus-4-8", "anthropic", tokens);
+      expect(bucketOf(breakdown, "input")).toEqual({
+        bucket: "input",
+        tokens: 10_000,
+        costUsd: expected.input,
+      });
+      expect(bucketOf(breakdown, "cachedInput")?.costUsd).toBeCloseTo(expected.cachedInput, 10);
+      expect(bucketOf(breakdown, "cacheWrite")?.costUsd).toBeCloseTo(expected.cacheWrite, 10);
+      expect(bucketOf(breakdown, "output")?.costUsd).toBeCloseTo(expected.output, 10);
+      // A bucket the chat never used isn't a row of zeros.
+      expect(bucketOf(breakdown, "reasoningOutput")).toBeUndefined();
+      // What the provider actually charged, and the part list prices can't
+      // explain, kept apart rather than blended.
+      expect(breakdown.billed).toBeCloseTo(0.9, 10);
+      expect(breakdown.unattributed).toBeCloseTo(0.9 - expected.total, 10);
+    });
+
+    it("prices each agent's turns at its own rates after a switch", () => {
+      const chat = cm.create(instanceId, "claude-opus-4-8", "anthropic", "high");
+      const claudeTurn = settle(chat.id, { inputTokens: 10_000, outputTokens: 1_000 }, 0.6);
+      // The switch retires the session's token counters. Billing is unaffected:
+      // each turn already reported what it billed, at the model that billed it.
+      cm.resetActiveUsage(chat.id);
+      cm.updateModel(chat.id, "gpt-5.6-sol", "openai", "medium");
+      const codexTurn = settle(chat.id, { inputTokens: 4_000, outputTokens: 500 }, 0.2);
+
+      const breakdown = cm.getChatCostBreakdown(chat.id);
+      const expected =
+        priceOf("claude-opus-4-8", "anthropic", claudeTurn).total +
+        priceOf("gpt-5.6-sol", "openai", codexTurn).total;
+      const attributed = breakdown.buckets.reduce((sum, b) => sum + b.costUsd, 0);
+      // Costing the Claude tokens at codex rates (or the other way round) would
+      // land somewhere else entirely.
+      expect(attributed).toBeCloseTo(expected, 10);
+      expect(bucketOf(breakdown, "input")?.tokens).toBe(14_000);
+      expect(breakdown.billed).toBeCloseTo(0.8, 10);
+      expect(breakdown.models.map((m) => m.model)).toEqual(["claude-opus-4-8", "gpt-5.6-sol"]);
+      expect(breakdown.models[0]!.costUsd).toBeCloseTo(0.6, 10);
+      expect(breakdown.models[1]!.costUsd).toBeCloseTo(0.2, 10);
+    });
+
+    it("prices a one-hour cache write at its own rate, not the five-minute one", () => {
+      // The shape of a real first turn on a subscription account: the bill is
+      // almost entirely the system prompt and tools being cached for an hour.
+      // Pricing those at the catalog's 1.25x leaves ~37% of the turn unexplained,
+      // which is what the breakdown used to dump into "other".
+      const chat = cm.create(instanceId, "claude-opus-5", "anthropic", "high");
+      const writes = 11_520;
+      cm.recordTurnBilling(chat.id, [
+        {
+          ...billing(
+            { inputTokens: 20, cacheCreationInputTokens: writes, outputTokens: 28 },
+            0.1155,
+            "claude-opus-5",
+          ),
+          cacheWrite1hTokens: writes,
+        },
+      ]);
+
+      const breakdown = cm.getChatCostBreakdown(chat.id);
+      const bucket = (name: ChatCostBucket["bucket"]) =>
+        breakdown.buckets.find((b) => b.bucket === name);
+      // Opus 5 input is $5/MTok, so an hour-long write is $10 and a five-minute
+      // one $6.25. All of these are the former.
+      expect(bucket("cacheWrite")).toBeUndefined();
+      expect(bucket("cacheWrite1h")).toEqual({
+        bucket: "cacheWrite1h",
+        tokens: writes,
+        costUsd: (writes * 10) / 1e6,
+      });
+      // Which leaves the itemization reconciling with the bill to a fraction of
+      // a cent. Priced at the five-minute rate the same turn left $0.0432 of
+      // $0.1155 unexplained, a third of it.
+      expect(Math.abs(breakdown.unattributed)).toBeLessThan(0.001);
+    });
+
+    it("costs a fast-mode turn at the model's fast rates", () => {
+      const chat = cm.create(instanceId, "claude-opus-5", "anthropic", "high");
+      const tokens = { inputTokens: 1_000_000 };
+      cm.recordTurnBilling(chat.id, [{ ...billing(tokens, 10, "claude-opus-5"), fast: true }]);
+
+      const breakdown = cm.getChatCostBreakdown(chat.id);
+      const model = findChatModel("claude-opus-5")!;
+      // A million input tokens at the fast rate, which is double list. Costing
+      // this at list would leave half the bill in "other".
+      expect(breakdown.buckets.find((b) => b.bucket === "input")?.costUsd).toBeCloseTo(
+        model.fastPricing!.inputPerMTok,
+        10,
+      );
+      expect(Math.abs(breakdown.unattributed)).toBeLessThan(0.001);
+    });
+
+    it("costs a fast-mode codex turn at the priority-tier rates", () => {
+      // Codex keeps its rate cards outside the catalog entries, so the
+      // breakdown's lookup has to pick the fast one for a fast row too.
+      const chat = cm.create(instanceId, "gpt-5.6-sol", "openai", "medium");
+      const tokens = { inputTokens: 1_000_000 };
+      cm.recordTurnBilling(chat.id, [{ ...billing(tokens, 10, "gpt-5.6-sol"), fast: true }]);
+
+      const breakdown = cm.getChatCostBreakdown(chat.id);
+      expect(breakdown.buckets.find((b) => b.bucket === "input")?.costUsd).toBeCloseTo(
+        codexPricingFor("gpt-5.6-sol", true)!.inputPerMTok,
+        10,
+      );
+    });
+
+    it("reports an empty breakdown for a chat that has never spent", () => {
+      const chat = cm.create(instanceId, "claude-opus-4-8", "anthropic", "high");
+      expect(cm.getChatCostBreakdown(chat.id)).toEqual({
+        billed: 0,
+        buckets: [],
+        models: [],
+        webSearchRequests: 0,
+        unattributed: 0,
+      });
     });
   });
 

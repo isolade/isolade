@@ -20,6 +20,10 @@ interface ModelEffortPickerProps {
   currentEffort: ChatEffort;
   onModelChange: (id: string) => void;
   onEffortChange: (effort: ChatEffort) => void;
+  /** Whether this chat runs in the provider's fast mode. Omit the handler on
+   *  surfaces where the choice has nowhere to be stored (the new-chat draft). */
+  fastMode?: boolean;
+  onFastModeChange?: (fast: boolean) => void;
   disabled?: boolean;
   /** Optional content rendered at the top of the dropdown (e.g. context usage detail). */
   prepend?: ReactNode;
@@ -38,6 +42,8 @@ export function ModelEffortPicker({
   currentEffort,
   onModelChange,
   onEffortChange,
+  fastMode = false,
+  onFastModeChange,
   disabled,
   prepend,
   belowLabel,
@@ -158,9 +164,45 @@ export function ModelEffortPicker({
             </div>
           </>
         )}
+        {onFastModeChange && currentModel?.fastPricing && (
+          <>
+            <DropdownMenuSeparator />
+            <button
+              type="button"
+              role="switch"
+              aria-checked={fastMode}
+              onClick={(ev) => {
+                ev.preventDefault();
+                onFastModeChange(!fastMode);
+                setOpen(false);
+              }}
+              className="flex w-full items-center justify-between gap-4 rounded-sm px-2 py-1.5 text-left text-sm outline-none hover:bg-accent hover:text-accent-foreground"
+            >
+              <span className="flex flex-col">
+                <span>Fast mode</span>
+                {/* The multiplier, not the raw rate: what it costs relative to
+                    what this model already costs is the decision being made. */}
+                <span className="text-[10px] text-muted-foreground">
+                  {fastRateLabel(currentModel)} the usual rate
+                </span>
+              </span>
+              {fastMode && <CheckIcon className="size-3.5 opacity-80" />}
+            </button>
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );
+}
+
+// How much dearer fast mode is for this model, from the two rate cards rather
+// than a hardcoded number, so it tracks the catalog.
+function fastRateLabel(model: ChatModelDefinition): string {
+  const base = model.pricing?.inputPerMTok;
+  const fast = model.fastPricing?.inputPerMTok;
+  if (!base || !fast) return "a premium on";
+  const ratio = fast / base;
+  return `${Number.isInteger(ratio) ? ratio : ratio.toFixed(1)}×`;
 }
 
 function ModelRow({

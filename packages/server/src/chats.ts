@@ -1,9 +1,12 @@
 import { randomUUID } from "crypto";
 import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { type ModelBilling, type TokenUsage, usageTokenCount } from "./chat/backend";
 import { effectiveInputTokens, pricingFor } from "./chat/subscription-share";
 import type {
   AggregateTotals,
   AggregateTotalsBucket,
+  ChatCostBreakdown,
+  ChatCostBucket,
   ChatEffort,
   ChatProvider,
   ChatRenderChunk,
@@ -13,9 +16,12 @@ import type {
 } from "./contracts";
 import {
   boundChatRenderChunks,
+  clampEffortToModel,
   compactChatRenderEvents,
+  findChatModel,
   localDay,
   resolveEffort,
+  tokenCostBreakdown,
 } from "./contracts";
 import type { Db } from "./db";
 import { schema } from "./db";
@@ -44,7 +50,17 @@ export interface MessageMeta {
 export type Chat = Omit<ChatRow, "effort"> & { effort: ChatEffort };
 
 function hydrate(row: ChatRow): Chat {
-  return { ...row, effort: resolveEffort(row.effort as ChatEffort | null) };
+  const model = findChatModel(row.model);
+  // An effort the model no longer offers snaps to its default here, at the one
+  // place every reader goes through, rather than being left for whichever of
+  // them happens to notice. Retiring an effort level is what makes this real:
+  // chats persisted with `ultra` would otherwise keep asking codex for it (and
+  // with it the proactive sub-agent mode that retiring it was meant to stop),
+  // since a turn reads the row's effort verbatim and nothing rewrites the row
+  // until the user next touches the picker. A model the catalog doesn't carry
+  // has no menu to clamp against, so its effort passes through untouched.
+  const effort = resolveEffort(row.effort as ChatEffort | null);
+  return { ...row, effort: model ? clampEffortToModel(effort, model) : effort };
 }
 
 export class ChatManager {
@@ -56,7 +72,7 @@ export class ChatManager {
     // Log a chat-creation event now so the "across N chats" figure (a count of
     // these markers in the usage log) survives the chat (or its instance) being
     // deleted later.
-    this.recordChatCreated(this.profileIdForInstance(instanceId), provider, model);
+    this.recordChatCreated(this.profileIdForInstance(instanceId), id, provider, model);
     return this.get(id)!;
   }
 
@@ -1157,6 +1173,13 @@ export class ChatManager {
     this.db.update(schema.chats).set(updates).where(eq(schema.chats.id, chatId)).run();
   }
 
+  // Opt a chat in or out of the provider's fast mode. Takes effect when the
+  // backend next configures the chat's process (see ClaudeSession.reconfigure),
+  // which is before its next turn.
+  updateFastMode(chatId: string, fastMode: boolean) {
+    this.db.update(schema.chats).set({ fastMode }).where(eq(schema.chats.id, chatId)).run();
+  }
+
   updateEffort(chatId: string, effort: ChatEffort) {
     this.db.update(schema.chats).set({ effort }).where(eq(schema.chats.id, chatId)).run();
   }
@@ -1175,7 +1198,16 @@ export class ChatManager {
     this.db.transaction(() => {
       this.db
         .update(schema.chats)
-        .set({ provider: next.provider, model: next.model, effort: next.effort })
+        .set({
+          provider: next.provider,
+          model: next.model,
+          effort: next.effort,
+          // A target with no fast rate card has no fast mode to inherit, and its
+          // picker offers no toggle, so carrying the opt-in across would leave it
+          // set out of sight — and already on for the next model that does offer
+          // one. Same reasoning as the PATCH route, applied where a switch lands.
+          ...(findChatModel(next.model)?.fastPricing == null ? { fastMode: false } : {}),
+        })
         .where(eq(schema.chats.id, chatId))
         .run();
       this.resetActiveUsage(chatId);
@@ -1192,6 +1224,8 @@ export class ChatManager {
   // Nulling (rather than zeroing) mirrors a brand-new chat, so the UI shows no
   // usage until the first target event lands. `compacted` and the
   // provider-reported context window belong to the retired session too.
+  // `costUsd` is untouched, and needs no special handling to be: it is a sum of
+  // per-event increments, so there is nothing session-shaped in it to reset.
   resetActiveUsage(chatId: string) {
     this.db
       .update(schema.chats)
@@ -1208,43 +1242,25 @@ export class ChatManager {
         lastReasoningOutputTokens: null,
         modelContextWindow: null,
         compacted: null,
-        costUsd: null,
       })
       .where(eq(schema.chats.id, chatId))
       .run();
   }
 
-  // Snapshot the running per-chat totals + the latest turn's breakdown +
-  // the provider-reported context window onto the row. Called from the SSE
-  // `usage` handler on every event so a page reload mid-chat can rehydrate
-  // the context-pressure bar and cost panel without waiting for a new turn.
+  // Snapshot the live gauge onto the row: the session's running token totals,
+  // the latest turn's breakdown, and the provider-reported context window.
+  // Called on every usage event so a reload mid-chat can rehydrate the
+  // context-pressure bar without waiting for a new turn. Deliberately touches
+  // no money and writes no history: what a turn cost is a separate, settled
+  // fact that arrives once (see recordTurnBilling).
   updateUsage(
     chatId: string,
     usage: {
-      total: {
-        inputTokens: number;
-        cachedInputTokens: number;
-        cacheCreationInputTokens: number;
-        outputTokens: number;
-        reasoningOutputTokens: number;
-      };
-      last: {
-        inputTokens: number;
-        cachedInputTokens: number;
-        cacheCreationInputTokens: number;
-        outputTokens: number;
-        reasoningOutputTokens: number;
-      };
+      total: TokenUsage;
+      last: TokenUsage;
       modelContextWindow?: number;
-      costUsd?: number;
     },
   ) {
-    // Read the prior cumulative *before* overwriting it: the difference is this
-    // event's incremental usage, which feeds the daily time series. The chat
-    // columns store running totals, so without the diff we couldn't tell a
-    // 10k-token turn from the 500k total it pushed the chat to.
-    const prev = this.get(chatId);
-
     this.db
       .update(schema.chats)
       .set({
@@ -1261,53 +1277,42 @@ export class ChatManager {
         ...(usage.modelContextWindow != null
           ? { modelContextWindow: usage.modelContextWindow }
           : {}),
-        ...(usage.costUsd != null ? { costUsd: usage.costUsd } : {}),
       })
       .where(eq(schema.chats.id, chatId))
       .run();
+  }
 
-    if (prev) {
-      // Deltas are clamped to ≥0: cumulative totals are monotonic within a
-      // chat, but a model/provider swap can re-seat the running cost, and we
-      // never want a daily bucket to go backwards from a transient dip.
-      const delta = {
-        inputTokens: Math.max(0, usage.total.inputTokens - (prev.inputTokens ?? 0)),
-        cachedInputTokens: Math.max(
-          0,
-          usage.total.cachedInputTokens - (prev.cachedInputTokens ?? 0),
-        ),
-        cacheCreationInputTokens: Math.max(
-          0,
-          usage.total.cacheCreationInputTokens - (prev.cacheCreationInputTokens ?? 0),
-        ),
-        outputTokens: Math.max(0, usage.total.outputTokens - (prev.outputTokens ?? 0)),
-        reasoningOutputTokens: Math.max(
-          0,
-          usage.total.reasoningOutputTokens - (prev.reasoningOutputTokens ?? 0),
-        ),
-        costUsd: usage.costUsd != null ? Math.max(0, usage.costUsd - (prev.costUsd ?? 0)) : 0,
-      };
-      const profileId = this.profileIdForInstance(prev.instanceId);
-      const provider = prev.provider as ChatProvider;
-      // Pricing-weighted input-equivalent for THIS turn, at the model in effect
-      // for it, summed into the lifetime rollup so the subscription-share %
-      // stays correct across a mid-chat model swap (unlike weighting the final
-      // cumulative by whatever model the chat happens to end on).
-      const pricing = pricingFor(provider, prev.model);
-      const effectiveDelta = pricing
-        ? effectiveInputTokens(
-            {
-              inputTokens: delta.inputTokens,
-              cachedInputTokens: delta.cachedInputTokens,
-              cacheCreationInputTokens: delta.cacheCreationInputTokens,
-              outputTokens: delta.outputTokens,
-              reasoningOutputTokens: delta.reasoningOutputTokens,
-              totalTokens: 0, // unused by effectiveInputTokens
-            },
-            pricing,
-          )
-        : 0;
-      this.recordUsageEvent(profileId, provider, prev.model, delta, effectiveDelta);
+  // Record what a settled turn billed: one usage-log row per model that did
+  // work in it, and the same money added to the chat's running total. This is
+  // the only place spend is written down.
+  //
+  // Per turn rather than per usage event, and per model rather than per chat,
+  // because that is the granularity at which the numbers are actually true: a
+  // provider can only say what a turn cost once it is over, and a turn's models
+  // are billed at their own rates. It also means nothing here has to diff a
+  // running total against a stored one, so no restart, retired session, or
+  // out-of-order report can drop or double a turn's spend.
+  recordTurnBilling(chatId: string, models: ModelBilling[]) {
+    const chat = this.get(chatId);
+    if (!chat || models.length === 0) return;
+    const profileId = this.profileIdForInstance(chat.instanceId);
+    const provider = chat.provider as ChatProvider;
+    let billed = 0;
+    for (const entry of models) {
+      // Pricing-weighted input-equivalent for this model's share of the turn,
+      // at its own rates, so the subscription-share % stays right across a
+      // mid-chat model swap and across a turn that ran a sub-agent elsewhere.
+      const pricing = pricingFor(provider, entry.model, entry.fast);
+      const effective = pricing ? effectiveInputTokens(entry.usage, pricing) : 0;
+      this.recordUsageEvent(profileId, chatId, provider, entry.model, entry, effective);
+      billed += entry.costUsd;
+    }
+    if (billed > 0) {
+      this.db
+        .update(schema.chats)
+        .set({ costUsd: (chat.costUsd ?? 0) + billed })
+        .where(eq(schema.chats.id, chatId))
+        .run();
     }
   }
 
@@ -1325,44 +1330,39 @@ export class ChatManager {
     return profileId;
   }
 
-  // Append one usage event to the log, the source of truth for the whole Usage
-  // page. A no-op delta (every field zero, common for usage events that only
-  // refresh the context window) is dropped so the log holds only real activity.
-  // `effectiveDelta` is the pricing-weighted input-equivalent for this turn, at
-  // the model in effect for it.
+  // Append one model's share of a settled turn to the usage log, the source of
+  // truth for the whole Usage page. A turn that consumed nothing and cost
+  // nothing is dropped, so the log holds only real activity. `effective` is the
+  // pricing-weighted input-equivalent for this model's tokens at its own rates.
   private recordUsageEvent(
     profileId: string,
+    chatId: string,
     provider: ChatProvider,
     model: string,
-    delta: {
-      inputTokens: number;
-      cachedInputTokens: number;
-      cacheCreationInputTokens: number;
-      outputTokens: number;
-      reasoningOutputTokens: number;
-      costUsd: number;
-    },
-    effectiveDelta: number,
+    billing: ModelBilling,
+    effective: number,
   ) {
-    const empty =
-      delta.inputTokens === 0 &&
-      delta.cachedInputTokens === 0 &&
-      delta.cacheCreationInputTokens === 0 &&
-      delta.outputTokens === 0 &&
-      delta.reasoningOutputTokens === 0 &&
-      delta.costUsd === 0;
-    if (empty) return;
+    if (usageTokenCount(billing.usage) === 0 && billing.costUsd === 0) return;
 
     this.db
       .insert(schema.usageEvents)
       .values({
         id: randomUUID(),
         profileId,
+        chatId,
         provider,
         model,
         kind: "usage",
-        ...delta,
-        effectiveInputTokens: effectiveDelta,
+        inputTokens: billing.usage.inputTokens,
+        cachedInputTokens: billing.usage.cachedInputTokens,
+        cacheCreationInputTokens: billing.usage.cacheCreationInputTokens,
+        outputTokens: billing.usage.outputTokens,
+        reasoningOutputTokens: billing.usage.reasoningOutputTokens,
+        fast: billing.fast,
+        cacheWrite1hTokens: billing.cacheWrite1hTokens,
+        webSearchRequests: billing.webSearchRequests,
+        costUsd: billing.costUsd,
+        effectiveInputTokens: effective,
       })
       .run();
   }
@@ -1371,17 +1371,102 @@ export class ChatManager {
   // so the count reflects chats created, independent of whether they ever
   // produced usage, matching the "across N chats" figure's meaning. The log is
   // append-only, so the count survives the chat's later deletion.
-  private recordChatCreated(profileId: string, provider: ChatProvider, model: string) {
+  private recordChatCreated(
+    profileId: string,
+    chatId: string,
+    provider: ChatProvider,
+    model: string,
+  ) {
     this.db
       .insert(schema.usageEvents)
       .values({
         id: randomUUID(),
         profileId,
+        chatId,
         provider,
         model,
         kind: "chat_created",
       })
       .run();
+  }
+
+  // Where one chat's money went: its settled turns summed per token bucket, each
+  // priced at the model that turn was billed at, so a chat that switched agents
+  // (or ran a sub-agent on another model) adds up instead of costing everything
+  // out at whatever it happens to be running now.
+  //
+  // `billed` is what the providers actually charged and is the figure to trust.
+  // The buckets are a list-price split of it: exact for codex, whose cost IS the
+  // price of these tokens, and close for Claude, which hands us a figure of its
+  // own. What that split cannot account for stays visible as `unattributed`
+  // rather than being smeared across the buckets, since it is real spend with a
+  // real cause: searches billed per request, cache written at a longer TTL than
+  // the catalog rate assumes, a model the catalog has no price for.
+  //
+  // Only settled turns are here. A turn in flight has no bill yet, so this never
+  // races a running turn or has to guess at one.
+  getChatCostBreakdown(chatId: string): ChatCostBreakdown {
+    const rows = this.db
+      .select()
+      .from(schema.usageEvents)
+      .where(and(eq(schema.usageEvents.chatId, chatId), eq(schema.usageEvents.kind, "usage")))
+      .all();
+
+    const buckets: ChatCostBucket[] = [
+      { bucket: "input", tokens: 0, costUsd: 0 },
+      { bucket: "cachedInput", tokens: 0, costUsd: 0 },
+      { bucket: "cacheWrite", tokens: 0, costUsd: 0 },
+      { bucket: "cacheWrite1h", tokens: 0, costUsd: 0 },
+      { bucket: "output", tokens: 0, costUsd: 0 },
+      { bucket: "reasoningOutput", tokens: 0, costUsd: 0 },
+    ];
+    const models = new Map<string, { model: string; provider: ChatProvider; costUsd: number }>();
+    let webSearchRequests = 0;
+    for (const row of rows) {
+      const provider = row.provider as ChatProvider;
+      const usage: TokenUsage = {
+        inputTokens: row.inputTokens,
+        cachedInputTokens: row.cachedInputTokens,
+        cacheCreationInputTokens: row.cacheCreationInputTokens,
+        outputTokens: row.outputTokens,
+        reasoningOutputTokens: row.reasoningOutputTokens,
+        totalTokens: 0, // unused when pricing
+      };
+      const priced = tokenCostBreakdown(
+        usage,
+        pricingFor(provider, row.model, row.fast),
+        row.cacheWrite1hTokens,
+      );
+      buckets[0]!.tokens += usage.inputTokens;
+      buckets[0]!.costUsd += priced.input;
+      buckets[1]!.tokens += usage.cachedInputTokens;
+      buckets[1]!.costUsd += priced.cachedInput;
+      const writes1h = Math.min(row.cacheWrite1hTokens, usage.cacheCreationInputTokens);
+      buckets[2]!.tokens += usage.cacheCreationInputTokens - writes1h;
+      buckets[2]!.costUsd += priced.cacheWrite;
+      buckets[3]!.tokens += writes1h;
+      buckets[3]!.costUsd += priced.cacheWrite1h;
+      buckets[4]!.tokens += usage.outputTokens;
+      buckets[4]!.costUsd += priced.output;
+      buckets[5]!.tokens += usage.reasoningOutputTokens;
+      buckets[5]!.costUsd += priced.reasoningOutput;
+      webSearchRequests += row.webSearchRequests;
+
+      const key = `${provider}:${row.model}`;
+      const entry = models.get(key) ?? { model: row.model, provider, costUsd: 0 };
+      entry.costUsd += row.costUsd;
+      models.set(key, entry);
+    }
+
+    const billed = this.get(chatId)?.costUsd ?? 0;
+    const attributed = buckets.reduce((sum, b) => sum + b.costUsd, 0);
+    return {
+      billed,
+      buckets: buckets.filter((b) => b.tokens > 0),
+      models: [...models.values()].toSorted((a, b) => b.costUsd - a.costUsd),
+      webSearchRequests,
+      unattributed: billed - attributed,
+    };
   }
 
   // The usage series for the contribution heatmap: every event bucketed into its

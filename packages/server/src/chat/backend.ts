@@ -26,6 +26,30 @@ export interface TokenUsage {
   totalTokens: number;
 }
 
+// What one model consumed and cost over a single turn. A turn can involve more
+// than one: a sub-agent may run on a different model than the main loop, and its
+// work is the user's spend just the same.
+export interface ModelBilling {
+  model: string;
+  usage: TokenUsage;
+  // How many of `usage.cacheCreationInputTokens` were written with a one-hour
+  // TTL rather than the default five minutes. A subset, not a bucket of its own,
+  // because the provider reports it that way: the two are billed at different
+  // rates (see CACHE_WRITE_1H_INPUT_MULTIPLIER) but are the same tokens.
+  cacheWrite1hTokens: number;
+  // Whether the provider billed this at its fast-mode rates, which are a
+  // multiple of list (2× on Opus 5, 6× on Opus 4.6). Recorded per turn because
+  // the mode can be toggled between them.
+  fast: boolean;
+  // Server-side searches the provider ran and bills per request rather than per
+  // token, so they explain spend that no token bucket accounts for. Zero where a
+  // provider doesn't offer them or doesn't report them.
+  webSearchRequests: number;
+  // The provider's own figure where it gives one (Claude reports dollars
+  // directly), otherwise catalog pricing × the tokens above (codex).
+  costUsd: number;
+}
+
 // Structured events emitted by both backends on top of the plain text stream.
 // Each variant gets its own SSE event name and its own UI treatment, so we
 // avoid lumping unrelated provider events into a single "debug" bucket.
@@ -55,19 +79,29 @@ export type ChatEvent =
     }
   // Legacy debug-only reasoning payload retained for old persisted turns.
   | { type: "thinking"; text: string }
+  // The live gauge, emitted as often as the provider will tell us anything.
   | {
       type: "usage";
       // `last` is this turn's usage. `total` is cumulative across the whole
-      // session. The UI typically uses last.input+cachedInput as the
-      // "context packed in" number and `total` for cost/total tracking.
+      // session. The UI uses last.input+cachedInput as the "context packed in"
+      // number and `total` for the session totals.
       last: TokenUsage;
       total: TokenUsage;
       // Window for the active model. Codex sends this. For Claude we look it
       // up from the catalog. Undefined when neither source knows.
       modelContextWindow?: number;
-      // API-equivalent dollar cost for this chat (cumulative). Claude
-      // reports `total_cost_usd` directly. codex is derived from the
-      // catalog pricing × tokens.
+      // What the turn IN PROGRESS has run up so far. Provisional: each report
+      // replaces the last rather than adding to it, and it is never recorded,
+      // because a turn's real bill arrives on `onBilling` when it settles.
+      // Codex can price its running token count as the turn goes; Claude says
+      // nothing about money until the turn is over, and leaves this unset.
+      // Consumed by the turn service, which folds it into `costUsd` below and
+      // drops it: it never reaches the client on its own.
+      turnCostUsd?: number;
+      // What the chat has cost so far, including any turn in progress. The
+      // figure the composer shows, and the only money field that reaches the
+      // client. Filled in by the turn service, which is the only party that
+      // knows the settled total, since a backend sees just its own session.
       costUsd?: number;
       // Approximate subscription consumption derived from cumulative
       // tokens × catalog rate-plan budgets. Optional: omitted when we
@@ -147,12 +181,21 @@ export interface ChatBackend {
     // point". (Editing before any anchored turn just omits `sessionId`,
     // which is a fresh session and needs no fork.)
     fork?: { anchorId: string };
+    // Run this turn in the provider's fast mode: quicker, at a premium rate.
+    // Off unless the chat opted in. Claude applies it to the live process, codex
+    // ignores it for now.
+    fast?: boolean;
     signal?: AbortSignal;
     onDelta: (text: string) => void;
     onEvent?: (event: ChatEvent) => void;
     // Fired whenever a TurnMeta field becomes known, possibly several times
     // per turn (later values supersede earlier ones). See TurnMeta.
     onMeta?: (meta: TurnMeta) => void;
+    // Fired once, when a turn has settled and the provider can say what it
+    // billed. Separate from `onEvent` on purpose: this is accounting, and
+    // `ChatEvent` is the stream that gets published and replayed. Keeping it off
+    // that union means a bill cannot end up in a chat's event log by accident.
+    onBilling?: (models: ModelBilling[]) => void;
     onUserMessageAcknowledged?: (receipt?: UserMessageReceipt) => void;
   }): Promise<{ content: string; sessionId?: string }>;
 
@@ -211,5 +254,45 @@ export function emptyUsage(): TokenUsage {
     outputTokens: 0,
     reasoningOutputTokens: 0,
     totalTokens: 0,
+  };
+}
+
+// How many tokens a usage actually accounts for, summed from the disjoint
+// buckets rather than read off `totalTokens`, so a provider that omits or
+// redefines that field cannot make real usage look like none.
+export function usageTokenCount(usage: TokenUsage): number {
+  return (
+    usage.inputTokens +
+    usage.cachedInputTokens +
+    usage.cacheCreationInputTokens +
+    usage.outputTokens +
+    usage.reasoningOutputTokens
+  );
+}
+
+export function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    cachedInputTokens: a.cachedInputTokens + b.cachedInputTokens,
+    cacheCreationInputTokens: a.cacheCreationInputTokens + b.cacheCreationInputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    reasoningOutputTokens: a.reasoningOutputTokens + b.reasoningOutputTokens,
+    totalTokens: a.totalTokens + b.totalTokens,
+  };
+}
+
+// `a` minus `b`, floored at zero per bucket. Used to turn a provider's running
+// tally into what the latest turn added. The floor is a guard against a provider
+// restating a counter downwards, which would otherwise credit tokens back.
+export function subtractUsage(a: TokenUsage, b: TokenUsage | undefined): TokenUsage {
+  if (!b) return { ...a };
+  const bucket = (x: number, y: number) => Math.max(0, x - y);
+  return {
+    inputTokens: bucket(a.inputTokens, b.inputTokens),
+    cachedInputTokens: bucket(a.cachedInputTokens, b.cachedInputTokens),
+    cacheCreationInputTokens: bucket(a.cacheCreationInputTokens, b.cacheCreationInputTokens),
+    outputTokens: bucket(a.outputTokens, b.outputTokens),
+    reasoningOutputTokens: bucket(a.reasoningOutputTokens, b.reasoningOutputTokens),
+    totalTokens: bucket(a.totalTokens, b.totalTokens),
   };
 }

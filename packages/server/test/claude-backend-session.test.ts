@@ -1,11 +1,15 @@
 import { describe, expect, it } from "bun:test";
+import type { ModelBilling } from "../src/chat/backend";
 import { ClaudeBackend } from "../src/chat/claude-backend";
 import type { ChatManager } from "../src/chats";
 import type { SandboxClient } from "../src/sandbox-client";
 import { FakeProc, tick } from "./fake-proc";
 
+// `get` is consulted when a turn resumes a session with no running totals in
+// memory (see ClaudeBackend.seedTotalsFromChat). These lifecycle tests never
+// stream usage, so an absent row is the honest answer.
 function fakeChatManager(): ChatManager {
-  return { updateSessionId: () => {} } as unknown as ChatManager;
+  return { updateSessionId: () => {}, get: () => undefined } as unknown as ChatManager;
 }
 
 // A sandbox client that mints a fresh FakeProc per execStream call, so the test
@@ -29,6 +33,219 @@ const baseTurn = {
   onDelta: () => {},
   onEvent: () => {},
 };
+
+// A `result` envelope whose modelUsage reads the way the CLI's does: cumulative
+// for the life of the process, so `costUSD` here is everything the process has
+// spent, not what this turn spent.
+function resultWith(costSoFar: number, tokensSoFar: number, model = "claude-sonnet-4-6") {
+  return {
+    type: "result",
+    result: "ok",
+    total_cost_usd: costSoFar,
+    usage: { input_tokens: tokensSoFar, output_tokens: 0 },
+    modelUsage: {
+      [model]: {
+        inputTokens: tokensSoFar,
+        outputTokens: 0,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        webSearchRequests: 0,
+        costUSD: costSoFar,
+      },
+    },
+  };
+}
+
+describe("ClaudeBackend billing across a process's turns", () => {
+  it("bills each turn the rise since the last, not the running total", async () => {
+    // The CLI counts cost for the life of the process (STATE.totalCostUSD), and
+    // one process serves every turn in a chat. Reading its figure as a per-turn
+    // cost would bill turn 2 for turn 1 as well, and a chat's total would grow
+    // quadratically in its turn count.
+    const { client, procs } = liveClient();
+    const backend = new ClaudeBackend(client, fakeChatManager(), { idleMs: 60_000 });
+    const billed: number[] = [];
+    const turn = async (index: number, costSoFar: number, tokensSoFar: number) => {
+      const pending = backend.sendMessage({
+        ...baseTurn,
+        message: `turn ${index}`,
+        model: "claude-sonnet-4-6",
+        ...(index === 0 ? {} : { sessionId: "s" }),
+        onBilling: (models) => billed.push(models[0]!.costUsd),
+      });
+      if (index === 0) proc(procs, 0).emit({ type: "system", subtype: "init", session_id: "s" });
+      proc(procs, 0).emit(resultWith(costSoFar, tokensSoFar));
+      await pending;
+    };
+
+    await turn(0, 0.1, 1_000);
+    await turn(1, 0.35, 3_000);
+    await turn(2, 0.6, 5_000);
+
+    expect(procs.length).toBe(1); // one process, so one running counter
+    expect(billed).toHaveLength(3);
+    expect(billed[0]).toBeCloseTo(0.1, 10);
+    expect(billed[1]).toBeCloseTo(0.25, 10);
+    expect(billed[2]).toBeCloseTo(0.25, 10);
+    // What the chat is charged is the last figure the CLI reported, not the sum
+    // of the three reports ($1.05).
+    expect(billed.reduce((sum, n) => sum + n, 0)).toBeCloseTo(0.6, 10);
+
+    for (const p of procs) p.exit(0);
+    await tick();
+  });
+
+  it("starts a new process's baseline at zero", async () => {
+    // A restarted process counts from zero again, so the previous process's
+    // figures must not be differenced against it: that would bill nothing until
+    // the new process passed the old one's total.
+    const { client, procs } = liveClient();
+    const backend = new ClaudeBackend(client, fakeChatManager(), { idleMs: 60_000 });
+    const billed: number[] = [];
+    const turn = async (index: number, costSoFar: number) => {
+      const pending = backend.sendMessage({
+        ...baseTurn,
+        message: `turn ${index}`,
+        model: "claude-sonnet-4-6",
+        ...(index === 0 ? {} : { sessionId: "s" }),
+        onBilling: (models) => billed.push(models[0]!.costUsd),
+      });
+      if (index === 0)
+        proc(procs, index).emit({ type: "system", subtype: "init", session_id: "s" });
+      proc(procs, procs.length - 1).emit(resultWith(costSoFar, 1_000));
+      await pending;
+    };
+
+    await turn(0, 0.4);
+    // The process goes away (a crash, an idle reap, a server restart), and the
+    // next turn resumes the session on a fresh one.
+    proc(procs, 0).exit(0);
+    await tick();
+    await turn(1, 0.15);
+
+    expect(procs.length).toBe(2);
+    expect(billed[0]).toBeCloseTo(0.4, 10);
+    expect(billed[1]).toBeCloseTo(0.15, 10);
+
+    for (const p of procs) p.exit(0);
+    await tick();
+  });
+});
+
+describe("ClaudeBackend fast mode", () => {
+  it("switches a fresh process over before the turn, and bills what the CLI reports", async () => {
+    const { client, procs } = liveClient();
+    const backend = new ClaudeBackend(client, fakeChatManager(), { idleMs: 60_000 });
+    const billed: ModelBilling[] = [];
+
+    const pending = backend.sendMessage({
+      ...baseTurn,
+      message: "hi",
+      model: "claude-opus-4-6",
+      fast: true,
+      onBilling: (models) => billed.push(...models),
+    });
+    await tick();
+    // A fresh CLI starts standard, so the mode is applied through the same
+    // in-memory flag-settings control that carries effort.
+    const control = proc(procs, 0).controls("apply_flag_settings")[0];
+    expect(control.request.settings).toEqual({ fastMode: true });
+    proc(procs, 0).succeedControl(control);
+    await tick();
+
+    proc(procs, 0).emit({ type: "system", subtype: "init", session_id: "s" });
+    proc(procs, 0).emit({
+      type: "result",
+      result: "ok",
+      fast_mode_state: "on",
+      usage: { input_tokens: 100, output_tokens: 10, speed: "fast" },
+      modelUsage: {
+        "claude-opus-4-6": {
+          inputTokens: 100,
+          outputTokens: 10,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          webSearchRequests: 0,
+          costUSD: 0.2,
+        },
+      },
+    });
+    await pending;
+
+    expect(billed[0]!.fast).toBe(true);
+    for (const p of procs) p.exit(0);
+    await tick();
+  });
+
+  it("bills standard when the CLI declines the mode", async () => {
+    // The CLI gates fast mode on things the host cannot see: the plan, a
+    // cooldown after a rate limit, and which models the installed build
+    // supports at all. Asking is not evidence of getting, so the turn's own
+    // report is what decides the rate.
+    const { client, procs } = liveClient();
+    const backend = new ClaudeBackend(client, fakeChatManager(), { idleMs: 60_000 });
+    const billed: ModelBilling[] = [];
+
+    const pending = backend.sendMessage({
+      ...baseTurn,
+      message: "hi",
+      model: "claude-sonnet-4-6",
+      fast: true,
+      onBilling: (models) => billed.push(...models),
+    });
+    await tick();
+    proc(procs, 0).succeedControl(proc(procs, 0).controls("apply_flag_settings")[0]);
+    await tick();
+    proc(procs, 0).emit({ type: "system", subtype: "init", session_id: "s" });
+    proc(procs, 0).emit({
+      type: "result",
+      result: "ok",
+      fast_mode_state: "off",
+      usage: { input_tokens: 100, output_tokens: 10, speed: "standard" },
+      modelUsage: {
+        "claude-sonnet-4-6": {
+          inputTokens: 100,
+          outputTokens: 10,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          webSearchRequests: 0,
+          costUSD: 0.02,
+        },
+      },
+    });
+    await pending;
+
+    expect(billed[0]!.fast).toBe(false);
+    for (const p of procs) p.exit(0);
+    await tick();
+  });
+
+  it("still runs the turn when the mode cannot be applied", async () => {
+    // An older build may reject the control outright. That should cost a
+    // standard turn, not the turn.
+    const { client, procs } = liveClient();
+    const backend = new ClaudeBackend(client, fakeChatManager(), { idleMs: 60_000 });
+
+    const pending = backend.sendMessage({
+      ...baseTurn,
+      message: "hi",
+      model: "claude-opus-4-6",
+      fast: true,
+    });
+    await tick();
+    proc(procs, 0).failControl(
+      proc(procs, 0).controls("apply_flag_settings")[0],
+      "unsupported control",
+    );
+    await tick();
+    proc(procs, 0).emit({ type: "system", subtype: "init", session_id: "s" });
+    proc(procs, 0).emit({ type: "result", result: "answered anyway" });
+
+    expect((await pending).content).toBe("answered anyway");
+    for (const p of procs) p.exit(0);
+    await tick();
+  });
+});
 
 describe("ClaudeBackend session lifecycle", () => {
   it("reuses one process across turns and changes model and effort live", async () => {

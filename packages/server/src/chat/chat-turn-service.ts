@@ -580,6 +580,12 @@ export class ChatTurnService {
             message: outgoingMessage,
             model: turnModel,
             effort: turnEffort,
+            // Gated on the TURN's model, not the row's flag alone: fast mode only
+            // exists where the provider offers a fast rate card, and a turn that
+            // asked for it without one would be costed at a premium the provider
+            // never charged. The flag is cleared wherever a model change strands
+            // it, so this is the belt to that braces.
+            fast: chat.fastMode && findChatModel(turnModel)?.fastPricing != null,
             sessionId,
             userMessageId: userMessage.id,
             fork,
@@ -595,6 +601,13 @@ export class ChatTurnService {
               if (meta.anchorId !== undefined) turnMeta.anchorId = meta.anchorId;
             },
             onUserMessageAcknowledged: confirmUserMessage,
+            // A settled turn's bill. Never published: it is accounting, and the
+            // event log is a transcript. The figure reaches the client on the
+            // next `usage` frame, as part of the chat's running total.
+            onBilling: (models) => {
+              commitSwitchIfAccepted();
+              chatManager.recordTurnBilling(chatId, models);
+            },
             onEvent: (event) => {
               // Any event proves the target accepted the request, so commit a
               // pending switch before touching usage: updateUsage below reads
@@ -605,22 +618,36 @@ export class ChatTurnService {
               // the next mount of the chat UI can rehydrate UsageState
               // without waiting for a new turn.
               if (event.type === "usage") {
+                // What the client sees as one number is two facts: what the chat
+                // has been billed for its finished turns, which only the chat row
+                // knows, plus whatever the turn in flight has run up so far,
+                // which only the backend knows and which nothing records. Adding
+                // them here is the one place both are in hand, and it keeps the
+                // published frame to a single figure the UI can just display.
+                const settled = chatManager.get(chatId)?.costUsd ?? 0;
+                const costUsd = settled + (event.turnCostUsd ?? 0);
+                const usageEvent = {
+                  type: "usage" as const,
+                  last: event.last,
+                  total: event.total,
+                  modelContextWindow: event.modelContextWindow,
+                  costUsd,
+                };
                 // Publish before mutating any other durable or compact state.
                 // If the event log write fails, the turn aborts without
                 // finalizing data that no live client or reconnect could see.
-                api.publish(event.type, event);
+                api.publish(usageEvent.type, usageEvent);
                 chatManager.updateUsage(chatId, {
                   total: event.total,
                   last: event.last,
                   modelContextWindow: event.modelContextWindow,
-                  costUsd: event.costUsd,
                 });
                 // Publish the durable base snapshot synchronously. Backends
                 // intentionally expose a synchronous callback and do not await
                 // it, so awaiting enrichment here would let `done` overtake the
                 // final usage update.
                 if (instance.profileId) {
-                  const baseEvent = { ...event };
+                  const baseEvent = { ...usageEvent };
                   const work = (async () => {
                     try {
                       const subscriptionShare = await computeSubscriptionShare({

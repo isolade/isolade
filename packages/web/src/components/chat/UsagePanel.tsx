@@ -1,10 +1,17 @@
-// The composer bar's usage surfaces: the context-pressure bar under the
-// model picker, and the token/cost/subscription breakdowns shown in the
-// picker dropdown. Data comes from Chat.tsx's UsageState (persisted-row
-// seed + live SSE usage events).
+// The composer bar's usage surfaces: the running chat cost in the composer's
+// bottom row, the context-pressure bar under the model picker, and the
+// token/cost/subscription breakdowns shown in the picker dropdown. Data comes
+// from Chat.tsx's UsageState (persisted-row seed + live SSE usage events).
+import { useEffect, useRef, useState } from "react";
+import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { formatTokens } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import type { ContextBreakdown } from "../../lib/contracts";
+import {
+  type ChatCostBreakdown,
+  type ChatCostBucket,
+  type ContextBreakdown,
+  findChatModel,
+} from "../../lib/contracts";
 import type { SubscriptionShare, UsageState } from "./chunks";
 
 // Rich token-usage breakdown shown both in the composer-bar tooltip and inside
@@ -55,6 +62,9 @@ export function ContextDetail({
         Total
       </div>
       <UsageRow label="all turns" n={usage.total.totalTokens} />
+      {/* The token rows are the live session's, but cost spans the whole chat,
+          agent switches included. It is the same figure the composer shows, to
+          more decimal places. */}
       {usage.costUsd != null && (
         <UsageRow label="cost" n={usage.costUsd} suffix="$" precision={4} />
       )}
@@ -188,6 +198,223 @@ export function ContextBar({
         style={{ width: `${pct ?? 0}%` }}
       />
     </div>
+  );
+}
+
+// How long the cost ticker takes to travel to a new total. Long enough to read
+// as a count-up, short enough to have settled well before the next usage event.
+const COST_TWEEN_MS = 700;
+
+// Animate a number toward `target`, returning the figure to paint right now.
+// Mounting does not animate (a reloaded chat shows its total straight away);
+// only a change while mounted counts up. A target that lands mid-count-up is
+// picked up from wherever the animation had got to.
+function useCountUp(target: number): number {
+  const [value, setValue] = useState(target);
+  const shownRef = useRef(target);
+  useEffect(() => {
+    if (shownRef.current === target) return;
+    if (globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      shownRef.current = target;
+      setValue(target);
+      return;
+    }
+    const from = shownRef.current;
+    const start = performance.now();
+    let frame = 0;
+    const step = (now: number) => {
+      const progress = Math.min(1, (now - start) / COST_TWEEN_MS);
+      // Ease out: quick off the mark, then settling into the new total.
+      const eased = 1 - (1 - progress) ** 3;
+      shownRef.current = progress < 1 ? from + (target - from) * eased : target;
+      setValue(shownRef.current);
+      if (progress < 1) frame = requestAnimationFrame(step);
+    };
+    frame = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(frame);
+  }, [target]);
+  return value;
+}
+
+const BUCKET_LABELS: Record<ChatCostBucket["bucket"], string> = {
+  input: "input",
+  cachedInput: "cache read",
+  cacheWrite: "cache write",
+  cacheWrite1h: "cache write 1h",
+  output: "output",
+  reasoningOutput: "reasoning",
+};
+
+// A residual worth showing: half a cent and at least 1% of the bill. Below that
+// it is rounding, and a row of noise explains nothing.
+function materialResidual(breakdown: ChatCostBreakdown): boolean {
+  const size = Math.abs(breakdown.unattributed);
+  return size >= 0.005 && size >= breakdown.billed * 0.01;
+}
+
+// Every figure in this card is shown to the same four decimals, rather than the
+// magnitude-dependent precision used elsewhere: this is the view you open to
+// reconcile numbers, and a column whose precision changed row by row would not
+// visibly add up even when the data does. Signed, because the residual can be
+// negative when list prices overstate the bill.
+function detailCost(n: number): string {
+  return `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(4)}`;
+}
+
+// Where the chat's money went, itemized. Tokens are exact and each part is
+// priced at the model it was billed at, so a chat that switched agents still
+// adds up. The total is what the providers actually charged: for codex it is
+// these very buckets, but Claude reports a turn's cost as a figure of its own,
+// so anything list prices can't explain (searches billed per request, cache
+// written at a longer TTL than the rate card assumes) lands in "other" rather
+// than being smeared across the rows. Those rows are left to speak for
+// themselves: the card is numbers, not explanations.
+//
+// `inFlight` is what the turn currently running has added to the composer's
+// figure but not yet to any bill. Shown so the card and the figure above it
+// agree while a turn streams, instead of appearing to disagree by exactly the
+// amount nobody has been charged for yet.
+export function CostBreakdownDetail({
+  breakdown,
+  inFlightUsd = 0,
+}: {
+  breakdown: ChatCostBreakdown;
+  inFlightUsd?: number;
+}) {
+  const showResidual = materialResidual(breakdown);
+  const showInFlight = inFlightUsd >= 0.00005;
+  return (
+    <div className="space-y-1 font-mono text-xs">
+      <div className="font-sans text-[10px] uppercase tracking-wider text-muted-foreground">
+        Cost
+      </div>
+      {breakdown.buckets.map((bucket) => (
+        <div key={bucket.bucket} className="flex justify-between gap-4">
+          <span className="text-muted-foreground">{BUCKET_LABELS[bucket.bucket]}</span>
+          <span className="tabular-nums">
+            <span className="text-muted-foreground">{formatTokens(bucket.tokens)}</span>{" "}
+            {detailCost(bucket.costUsd)}
+          </span>
+        </div>
+      ))}
+      {breakdown.webSearchRequests > 0 && (
+        <div className="flex justify-between gap-4">
+          <span className="text-muted-foreground">web search</span>
+          <span className="tabular-nums text-muted-foreground">
+            {breakdown.webSearchRequests}
+            {breakdown.webSearchRequests === 1 ? " request" : " requests"}
+          </span>
+        </div>
+      )}
+      {showResidual && (
+        <div className="flex justify-between gap-4">
+          <span className="text-muted-foreground">other</span>
+          <span className="tabular-nums">{detailCost(breakdown.unattributed)}</span>
+        </div>
+      )}
+      {showInFlight && (
+        <div className="flex justify-between gap-4">
+          <span className="text-muted-foreground">in progress</span>
+          <span className="tabular-nums">{detailCost(inFlightUsd)}</span>
+        </div>
+      )}
+      <div className="flex justify-between gap-4 border-t border-border/60 pt-1">
+        <span className="text-muted-foreground">total</span>
+        <span className="tabular-nums">{detailCost(breakdown.billed + inFlightUsd)}</span>
+      </div>
+      {/* Every model that cost money, not every agent the user picked: the CLI
+          bills its own auxiliary calls (a small model summarizing a tool result,
+          say) to the same chat, and those are spend like any other. */}
+      {breakdown.models.length > 1 && (
+        <>
+          <div className="font-sans text-[10px] uppercase tracking-wider text-muted-foreground pt-1">
+            Models
+          </div>
+          {breakdown.models.map((entry) => (
+            <div key={`${entry.provider}:${entry.model}`} className="flex justify-between gap-4">
+              <span className="text-muted-foreground">
+                {findChatModel(entry.model)?.name ?? entry.model}
+              </span>
+              <span className="tabular-nums">{detailCost(entry.costUsd)}</span>
+            </div>
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+// The chat's running total cost, sitting in the composer's bottom row. Each
+// usage event nudges it up and it counts its way there rather than jumping, so
+// spend reads as something accruing while the agent works. A chat that has yet
+// to spend anything reads "$0.00", so the figure is part of the composer from
+// the first message rather than appearing partway through.
+// Always cents, never more: this is an ambient figure, and a digit count that
+// changed with the magnitude would make the text jitter as it counts. Sub-cent
+// spend therefore rounds, and hovering gives the itemized version.
+export function ChatCost({
+  costUsd,
+  loadBreakdown,
+}: {
+  costUsd?: number;
+  loadBreakdown?: () => Promise<ChatCostBreakdown>;
+}) {
+  const shown = useCountUp(costUsd ?? 0);
+  const [detail, setDetail] = useState<ChatCostBreakdown | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // Read on open rather than pushed with every usage frame: the split is
+  // derived data, and putting it on the stream would persist a copy of it into
+  // the chat's event log on every token update for something nobody is looking
+  // at most of the time. Re-read on each open so it is current when read.
+  const request = useRef(0);
+  const onOpenChange = (open: boolean) => {
+    if (!open || !loadBreakdown) return;
+    const generation = ++request.current;
+    setError(null);
+    void (async () => {
+      try {
+        const next = await loadBreakdown();
+        // A card closed and reopened while a read was in flight must not be
+        // filled in by the read it no longer wants.
+        if (request.current === generation) setDetail(next);
+      } catch (err) {
+        if (request.current !== generation) return;
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    })();
+  };
+
+  const total = (
+    <span className="select-none font-mono text-xs tabular-nums">{`$${shown.toFixed(2)}`}</span>
+  );
+  if (!loadBreakdown) return <span className="px-1 text-muted-foreground">{total}</span>;
+  return (
+    <HoverCard openDelay={150} closeDelay={80} onOpenChange={onOpenChange}>
+      <HoverCardTrigger asChild>
+        <button
+          type="button"
+          className="cursor-default rounded px-1 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
+          aria-label="What this chat has cost so far, across every agent it has run on"
+        >
+          {total}
+        </button>
+      </HoverCardTrigger>
+      <HoverCardContent align="end">
+        {detail ? (
+          // Whatever the composer is showing beyond the settled bill belongs to
+          // the turn in flight. Derived here rather than plumbed through,
+          // because these are the two numbers that have to agree.
+          <CostBreakdownDetail
+            breakdown={detail}
+            inFlightUsd={Math.max(0, (costUsd ?? 0) - detail.billed)}
+          />
+        ) : (
+          <div className="font-mono text-[10px] text-muted-foreground">
+            {error ? `Cost breakdown: ${error}` : "Loading cost breakdown…"}
+          </div>
+        )}
+      </HoverCardContent>
+    </HoverCard>
   );
 }
 

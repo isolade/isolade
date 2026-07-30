@@ -1,24 +1,61 @@
 import { z } from "zod";
 import type { ChatEffort } from "./base";
-import { type ChatModelDefinition, chatModelSchema, type RatePlan } from "./domain";
+import type { TokenUsage } from "./chat-render";
+import {
+  type ChatModelDefinition,
+  chatModelSchema,
+  type ModelPricing,
+  type RatePlan,
+} from "./domain";
 
-// Static catalog for both providers. Both halves are generated at maintenance
-// time by `bun run refresh-catalog` (see scripts/refresh-catalog.ts) from
-// models.dev — first-party rate cards and, for Claude, a per-model
-// reasoning-effort matrix — so the picker is instant, uniform, and works
-// offline before any build exists. The old dynamic discovery is gone: Codex no
-// longer boots a one-shot VM to call the app-server's `model/list`, and Claude
-// no longer assumes every 4.x model accepts all five efforts (models.dev
-// publishes the real per-model menu; the earlier assumption over-offered
-// `xhigh` on models that don't take it). All models are always offered;
+// Static catalog for both providers, generated at maintenance time by
+// `bun run refresh-catalog` (see scripts/refresh-catalog.ts) from models.dev:
+// first-party rate cards plus a per-model reasoning-effort matrix, for Claude
+// and OpenAI alike. Static because the picker has to render before any VM boots
+// or any CLI process exists (a new-chat draft has nothing to ask), and one
+// source because neither CLI publishes prices. All models are always offered;
 // per-profile visibility/tier is layered on top via ModelOverrides (see below).
 //
-// What stays hand-managed (the script never touches it): which Anthropic ids to
-// offer (ANTHROPIC_ALLOWLIST — models.dev has no per-subscription view and the
-// `claude` CLI has no model-list command), the default frontier/"More…"
-// placement (MORE_BY_DEFAULT_MODEL_IDS), and the fallback effort menu the script
-// uses for a Claude model models.dev doesn't publish efforts for. See the
-// script header for the full source-of-truth split.
+// What stays hand-managed (the script never touches it): which ids to offer
+// (ANTHROPIC_ALLOWLIST / OPENAI_ALLOWLIST), which effort levels to decline
+// (EXCLUDED_EFFORTS), the default frontier/"More…" placement
+// (MORE_BY_DEFAULT_MODEL_IDS), and the fallback effort menu the script uses for
+// a model models.dev publishes no efforts for. See the script header for the
+// full source-of-truth split.
+
+// Which OpenAI models to offer, in picker order. Curated for the same reason as
+// the Anthropic list below: models.dev carries every model OpenAI has ever
+// published, with no notion of which ones make sense as a coding agent, so the
+// set is ours to choose and the script fills in the details.
+//
+// This used to come from `codex app-server model/list` instead, on the theory
+// that the logged-in account was the authority on which models exist. It wasn't
+// worth it: the list is generated once at maintenance time from one maintainer's
+// account and committed, so no user ever saw their own entitlements, and the
+// dependency meant refreshing the catalog needed codex installed and logged in.
+export const OPENAI_ALLOWLIST = [
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+  "gpt-5.5",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+] as const;
+
+// Effort levels we decline to offer even where a model advertises them.
+//
+// `ultra` is not a reasoning level at all on the wire: codex maps it to `max`
+// before the request goes out (core/src/client.rs, reasoning_effort_for_request)
+// and uses it locally as the switch for proactive multi-agent mode, where codex
+// spawns sub-agents on its own initiative. Isolade orchestrates agents itself, so
+// offering it would hand that decision to the CLI while looking like nothing more
+// than a slider position; `max` buys the same reasoning at the same price without
+// the behaviour change.
+//
+// `none` disables reasoning outright. No agentic loop here wants that, and
+// codex's own account-scoped model list never offered it either — models.dev
+// reports the raw API capability, which is a superset of what the CLIs menu.
+export const EXCLUDED_EFFORTS: readonly string[] = ["ultra", "none"];
 
 // Codex-side pricing by model id, in USD per million tokens. Neither codex's
 // `model/list` nor its usage stream carries pricing, so we vendor a snapshot.
@@ -41,6 +78,23 @@ const CODEX_PRICING: Record<string, z.input<typeof chatModelSchema>["pricing"]> 
   // <codex-pricing:end>
 };
 
+// The same, for turns that ask for OpenAI's priority service tier — codex's
+// "fast mode" (see ServiceTier::Fast, which goes out as `service_tier:
+// "priority"`). models.dev publishes these as a separate rate card per model,
+// tagged with that exact request body, so the split is upstream's, not ours.
+// Roughly 2× list across the board; the picker computes the multiplier it shows
+// from these two records rather than stating one.
+const CODEX_FAST_PRICING: Record<string, z.input<typeof chatModelSchema>["pricing"]> = {
+  // <codex-fast-pricing:start>
+  "gpt-5.6-sol": { inputPerMTok: 10, cachedInputPerMTok: 1, outputPerMTok: 60 },
+  "gpt-5.6-terra": { inputPerMTok: 5, cachedInputPerMTok: 0.5, outputPerMTok: 30 },
+  "gpt-5.6-luna": { inputPerMTok: 2, cachedInputPerMTok: 0.2, outputPerMTok: 12 },
+  "gpt-5.5": { inputPerMTok: 12.5, cachedInputPerMTok: 1.25, outputPerMTok: 75 },
+  "gpt-5.4": { inputPerMTok: 5, cachedInputPerMTok: 0.5, outputPerMTok: 30 },
+  "gpt-5.4-mini": { inputPerMTok: 1.5, cachedInputPerMTok: 0.15, outputPerMTok: 9 },
+  // <codex-fast-pricing:end>
+};
+
 // Pricing for delisted codex ids models.dev no longer carries, kept by hand so
 // historical chats on these ids can still cost out on a live recompute.
 // (Persisted usage is unaffected regardless; see the note above.)
@@ -49,17 +103,20 @@ const CODEX_PRICING_HISTORICAL: Record<string, z.input<typeof chatModelSchema>["
   "gpt-5.2": { inputPerMTok: 1.25, cachedInputPerMTok: 0.125, outputPerMTok: 10 },
 };
 
-export function codexPricingFor(modelId: string) {
-  return CODEX_PRICING[modelId] ?? CODEX_PRICING_HISTORICAL[modelId];
+// `fast` asks for the priority-tier card. It falls back to the standard rates
+// for an id with no fast card (delisted ids, or a model OpenAI doesn't offer the
+// tier on) rather than returning nothing: a turn still has to be costed, and
+// understating a premium beats reporting no price at all.
+export function codexPricingFor(modelId: string, fast = false) {
+  const standard = CODEX_PRICING[modelId] ?? CODEX_PRICING_HISTORICAL[modelId];
+  if (!fast) return standard;
+  return CODEX_FAST_PRICING[modelId] ?? standard;
 }
 
-// Which Anthropic models to offer, in picker order. Unlike the Codex half —
-// whose list comes from the user's logged-in `codex app-server` — there is no
-// per-subscription source for Claude: models.dev lists every historical Claude
-// model with no notion of what a given plan can reach, and the `claude` CLI has
-// no model-list command. So the Anthropic list is a curated allowlist.
-// `bun run refresh-catalog` fills each id's name, context window, effort menu,
-// and pricing from models.dev into the <anthropic:…> block below — add or
+// Which Anthropic models to offer, in picker order. Curated because models.dev
+// lists every historical Claude model with no notion of what a given plan can
+// reach. `bun run refresh-catalog` fills each id's name, context window, effort
+// menu, and pricing from models.dev into the <anthropic:…> block below — add or
 // remove an id here and re-run the script. Tier placement is separate
 // (MORE_BY_DEFAULT_MODEL_IDS); keep the two in sync.
 export const ANTHROPIC_ALLOWLIST = [
@@ -109,6 +166,12 @@ export const CHAT_MODELS = [
       cacheWritePerMTok: 6.25,
       outputPerMTok: 25,
     },
+    fastPricing: {
+      inputPerMTok: 10,
+      cachedInputPerMTok: 1,
+      cacheWritePerMTok: 12.5,
+      outputPerMTok: 50,
+    },
   },
   {
     id: "claude-sonnet-5",
@@ -137,6 +200,12 @@ export const CHAT_MODELS = [
       cacheWritePerMTok: 6.25,
       outputPerMTok: 25,
     },
+    fastPricing: {
+      inputPerMTok: 10,
+      cachedInputPerMTok: 1,
+      cacheWritePerMTok: 12.5,
+      outputPerMTok: 50,
+    },
   },
   {
     id: "claude-opus-4-7",
@@ -151,6 +220,12 @@ export const CHAT_MODELS = [
       cacheWritePerMTok: 6.25,
       outputPerMTok: 25,
     },
+    fastPricing: {
+      inputPerMTok: 30,
+      cachedInputPerMTok: 3,
+      cacheWritePerMTok: 37.5,
+      outputPerMTok: 150,
+    },
   },
   {
     id: "claude-opus-4-6",
@@ -164,6 +239,12 @@ export const CHAT_MODELS = [
       cachedInputPerMTok: 0.5,
       cacheWritePerMTok: 6.25,
       outputPerMTok: 25,
+    },
+    fastPricing: {
+      inputPerMTok: 30,
+      cachedInputPerMTok: 3,
+      cacheWritePerMTok: 37.5,
+      outputPerMTok: 150,
     },
   },
   {
@@ -195,46 +276,50 @@ export const CHAT_MODELS = [
     },
   },
   // <anthropic:end>
-  // Codex (OpenAI) models. The block below is generated from `codex app-server`
-  // `model/list` by `bun run refresh-catalog` (hidden entries dropped,
-  // efforts copied through verbatim, contextWindow omitted since codex reports
-  // `modelContextWindow` per usage update). Pricing is attached by
-  // id from CODEX_PRICING, and each model's default tier (frontier vs "More…")
-  // is curated separately in MORE_BY_DEFAULT_MODEL_IDS — both are hand-managed,
-  // so keep them in sync when this list changes. Don't edit between the markers
-  // by hand; re-run the script instead.
+  // Codex (OpenAI) models. The block below is generated by
+  // `bun run refresh-catalog` for the ids in OPENAI_ALLOWLIST (name and effort
+  // menu from models.dev; contextWindow omitted since codex reports
+  // `modelContextWindow` per usage update, and defaultEffort fixed to "medium").
+  // Both rate cards are attached by id from the records above. Each model's
+  // default tier (frontier vs "More…") is curated separately in
+  // MORE_BY_DEFAULT_MODEL_IDS — keep it in sync when this list changes. Don't
+  // edit between the markers by hand; re-run the script instead.
   // <codex:start>
   {
     id: "gpt-5.6-sol",
-    name: "GPT-5.6-Sol",
+    name: "GPT-5.6 Sol",
     provider: "openai",
-    supportedEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
     defaultEffort: "medium",
     pricing: CODEX_PRICING["gpt-5.6-sol"],
+    fastPricing: CODEX_FAST_PRICING["gpt-5.6-sol"],
   },
   {
     id: "gpt-5.6-terra",
-    name: "GPT-5.6-Terra",
+    name: "GPT-5.6 Terra",
     provider: "openai",
-    supportedEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
     defaultEffort: "medium",
     pricing: CODEX_PRICING["gpt-5.6-terra"],
+    fastPricing: CODEX_FAST_PRICING["gpt-5.6-terra"],
   },
   {
     id: "gpt-5.6-luna",
-    name: "GPT-5.6-Luna",
+    name: "GPT-5.6 Luna",
     provider: "openai",
     supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
     defaultEffort: "medium",
     pricing: CODEX_PRICING["gpt-5.6-luna"],
+    fastPricing: CODEX_FAST_PRICING["gpt-5.6-luna"],
   },
   {
     id: "gpt-5.5",
     name: "GPT-5.5",
     provider: "openai",
     supportedEfforts: ["low", "medium", "high", "xhigh"],
-    defaultEffort: "xhigh",
+    defaultEffort: "medium",
     pricing: CODEX_PRICING["gpt-5.5"],
+    fastPricing: CODEX_FAST_PRICING["gpt-5.5"],
   },
   {
     id: "gpt-5.4",
@@ -243,14 +328,16 @@ export const CHAT_MODELS = [
     supportedEfforts: ["low", "medium", "high", "xhigh"],
     defaultEffort: "medium",
     pricing: CODEX_PRICING["gpt-5.4"],
+    fastPricing: CODEX_FAST_PRICING["gpt-5.4"],
   },
   {
     id: "gpt-5.4-mini",
-    name: "GPT-5.4-Mini",
+    name: "GPT-5.4 mini",
     provider: "openai",
     supportedEfforts: ["low", "medium", "high", "xhigh"],
     defaultEffort: "medium",
     pricing: CODEX_PRICING["gpt-5.4-mini"],
+    fastPricing: CODEX_FAST_PRICING["gpt-5.4-mini"],
   },
   // <codex:end>
 ] as const satisfies readonly z.input<typeof chatModelSchema>[];
@@ -334,6 +421,68 @@ export const RATE_PLANS: Record<string, RatePlan> = {
     sevenDayTokens: 1_200_000_000,
   },
 };
+
+// Anthropic bills a cache write by how long the entry lives: the catalog's
+// `cacheWritePerMTok` is the five-minute rate (1.25× input), and a one-hour
+// write costs twice the input rate instead. Claude Code asks for one-hour
+// entries for subscription users who are not in overage, so on those accounts
+// most of a chat's cache writes are at this rate, not the catalog's.
+export const CACHE_WRITE_1H_INPUT_MULTIPLIER = 2;
+
+// What each token bucket of `usage` costs at a model's list prices. The buckets
+// in TokenUsage are disjoint, so these add up to the whole (see `total`).
+// Reasoning tokens bill at the output rate, which is how both providers price
+// them. A rate the catalog doesn't publish (codex has no cache-write rate, and a
+// model may have no pricing entry at all) contributes nothing rather than a
+// guess, so a missing rate understates rather than invents.
+//
+// `cacheWrite1hTokens` splits the cache-write bucket by TTL: that many of its
+// tokens are priced at the one-hour rate and the rest at the catalog's
+// five-minute one. Left out, everything is five-minute, which is what the
+// provider means when it reports no split.
+export interface TokenCostBreakdown {
+  input: number;
+  cachedInput: number;
+  cacheWrite: number;
+  cacheWrite1h: number;
+  output: number;
+  reasoningOutput: number;
+  total: number;
+}
+
+export function tokenCostBreakdown(
+  usage: TokenUsage,
+  pricing: ModelPricing | undefined,
+  cacheWrite1hTokens = 0,
+): TokenCostBreakdown {
+  const perMTok = (tokens: number, rate: number | undefined) =>
+    rate == null ? 0 : (tokens * rate) / 1_000_000;
+  // Never more than were written, however the two figures reached us.
+  const writes1h = Math.min(Math.max(0, cacheWrite1hTokens), usage.cacheCreationInputTokens);
+  const parts = {
+    input: perMTok(usage.inputTokens, pricing?.inputPerMTok),
+    cachedInput: perMTok(usage.cachedInputTokens, pricing?.cachedInputPerMTok),
+    cacheWrite: perMTok(usage.cacheCreationInputTokens - writes1h, pricing?.cacheWritePerMTok),
+    cacheWrite1h: perMTok(
+      writes1h,
+      pricing?.inputPerMTok == null
+        ? undefined
+        : pricing.inputPerMTok * CACHE_WRITE_1H_INPUT_MULTIPLIER,
+    ),
+    output: perMTok(usage.outputTokens, pricing?.outputPerMTok),
+    reasoningOutput: perMTok(usage.reasoningOutputTokens, pricing?.outputPerMTok),
+  };
+  return {
+    ...parts,
+    total:
+      parts.input +
+      parts.cachedInput +
+      parts.cacheWrite +
+      parts.cacheWrite1h +
+      parts.output +
+      parts.reasoningOutput,
+  };
+}
 
 // Best-effort mapping from upstream `rateLimitTier` / `planType` strings to
 // our internal plan ids. We accept several spellings because Anthropic and

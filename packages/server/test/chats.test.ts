@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
-import { DEFAULT_ANTHROPIC_MODEL_ID } from "../src/contracts";
+import { chatCostBreakdownSchema, DEFAULT_ANTHROPIC_MODEL_ID } from "../src/contracts";
 import { schema } from "../src/db";
 import { createTestServer } from "./helpers";
 
@@ -129,6 +129,132 @@ describe("chat API", () => {
     it("returns 404 for nonexistent instance", async () => {
       const res = await fetch(`${baseUrl}/api/instances/nonexistent/chats`);
       expect(res.status).toBe(404);
+    });
+  });
+
+  describe("GET /api/instances/:id/chats/:chatId/cost", () => {
+    it("itemizes what the chat has spent", async () => {
+      const instanceId = seedInstance();
+      const created = await fetch(`${baseUrl}/api/instances/${instanceId}/chats`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: DEFAULT_ANTHROPIC_MODEL_ID }),
+      });
+      const chat = (await created.json()) as { id: string };
+      const tokens = {
+        inputTokens: 10_000,
+        cachedInputTokens: 2_000,
+        cacheCreationInputTokens: 0,
+        outputTokens: 500,
+        reasoningOutputTokens: 0,
+        totalTokens: 12_500,
+      };
+      chatManager.recordTurnBilling(chat.id, [
+        {
+          model: DEFAULT_ANTHROPIC_MODEL_ID,
+          usage: tokens,
+          cacheWrite1hTokens: 0,
+          fast: false,
+          webSearchRequests: 3,
+          costUsd: 0.42,
+        },
+      ]);
+
+      const res = await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chat.id}/cost`);
+      expect(res.status).toBe(200);
+      const breakdown = chatCostBreakdownSchema.parse(await res.json());
+      expect(breakdown.billed).toBeCloseTo(0.42, 10);
+      expect(breakdown.buckets.map((b) => b.bucket)).toEqual(["input", "cachedInput", "output"]);
+      expect(breakdown.buckets.find((b) => b.bucket === "input")?.tokens).toBe(10_000);
+      expect(breakdown.webSearchRequests).toBe(3);
+      expect(breakdown.models).toHaveLength(1);
+    });
+
+    it("returns 404 for a chat that isn't in the instance", async () => {
+      const instanceId = seedInstance();
+      const res = await fetch(`${baseUrl}/api/instances/${instanceId}/chats/nonexistent/cost`);
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe("PATCH .../chats/:chatId with fastMode", () => {
+    it("stores the opt-in without disturbing model or effort", async () => {
+      const instanceId = seedInstance();
+      const created = await fetch(`${baseUrl}/api/instances/${instanceId}/chats`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: DEFAULT_ANTHROPIC_MODEL_ID }),
+      });
+      const chat = (await created.json()) as {
+        id: string;
+        model: string;
+        effort: string;
+        fastMode: boolean;
+      };
+      // A new chat is never fast: a premium rate is opted into, never inherited.
+      expect(chat.fastMode).toBe(false);
+
+      const patch = async (body: unknown) =>
+        (await (
+          await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chat.id}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          })
+        ).json()) as { fastMode: boolean; model: string; effort: string };
+
+      const on = await patch({ fastMode: true });
+      expect(on.fastMode).toBe(true);
+      expect(on.model).toBe(chat.model);
+      expect(on.effort).toBe(chat.effort);
+
+      expect((await patch({ fastMode: false })).fastMode).toBe(false);
+    });
+
+    it("drops the opt-in when the chat moves to a model with no fast mode", async () => {
+      // The picker hides the toggle for a model with no fast rate card, so an
+      // opt-in that survived the move would be set with nothing showing it —
+      // and back on, unasked, as soon as the user returns to a model that has
+      // one. DEFAULT_ANTHROPIC_MODEL_ID (Opus 5) offers fast mode; Sonnet 5
+      // does not.
+      const instanceId = seedInstance();
+      const created = await fetch(`${baseUrl}/api/instances/${instanceId}/chats`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: DEFAULT_ANTHROPIC_MODEL_ID }),
+      });
+      const chat = (await created.json()) as { id: string };
+      const patch = async (body: unknown) =>
+        (await (
+          await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chat.id}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          })
+        ).json()) as { fastMode: boolean; model: string };
+
+      expect((await patch({ fastMode: true })).fastMode).toBe(true);
+      const moved = await patch({ model: "claude-sonnet-5" });
+      expect(moved.model).toBe("claude-sonnet-5");
+      expect(moved.fastMode).toBe(false);
+      // And it stays off on the way back: opting into a premium is per model.
+      expect((await patch({ model: DEFAULT_ANTHROPIC_MODEL_ID })).fastMode).toBe(false);
+    });
+
+    it("rejects a body that asks for nothing", async () => {
+      const instanceId = seedInstance();
+      const created = await fetch(`${baseUrl}/api/instances/${instanceId}/chats`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: DEFAULT_ANTHROPIC_MODEL_ID }),
+      });
+      const chat = (await created.json()) as { id: string };
+      const res = await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chat.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(400);
     });
   });
 

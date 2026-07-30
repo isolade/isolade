@@ -23,6 +23,10 @@ function makeHooks() {
   return { hooks, events };
 }
 
+// Fast mode is applied through the same in-memory flag-settings layer as
+// effort, so the CLI picks it up without a restart and without touching the
+// user's settings file. Asserted at the control-protocol level rather than by
+// running a fast turn, which would bill at a premium rate for no information.
 function sessionFor(proc: FakeProc, onExit: () => void = () => {}) {
   return new ClaudeSession({
     sandboxClient: proc,
@@ -30,6 +34,7 @@ function sessionFor(proc: FakeProc, onExit: () => void = () => {}) {
     command: "claude -p --input-format stream-json",
     model: "claude-sonnet-4-6",
     effort: "high",
+    fast: false,
     onExit,
     // Large enough that the safety-net timers never fire mid-test.
     interruptGraceMs: 60_000,
@@ -354,7 +359,7 @@ describe("ClaudeSession", () => {
     const proc = new FakeProc();
     const session = sessionFor(proc);
 
-    const changed = session.reconfigure("claude-opus-4-8", "max");
+    const changed = session.reconfigure("claude-opus-4-8", "max", false);
     await tick();
     const modelControl = proc.controls("set_model")[0];
     expect(modelControl.request).toEqual({
@@ -385,7 +390,7 @@ describe("ClaudeSession", () => {
     const proc = new FakeProc();
     const session = sessionFor(proc);
 
-    const changed = session.reconfigure("claude-opus-4-8", "high");
+    const changed = session.reconfigure("claude-opus-4-8", "high", false);
     await tick();
     proc.failControl(proc.controls("set_model")[0], "unsupported control");
 
@@ -442,5 +447,38 @@ describe("ClaudeSession", () => {
       expect(message).not.toContain("discard-me");
       expect(message).toContain("tail-marker");
     }
+  });
+});
+
+describe("ClaudeSession fast mode", () => {
+  it("switches the live process over through flag settings", async () => {
+    const proc = new FakeProc();
+    const session = sessionFor(proc);
+
+    const enabling = session.reconfigure("claude-sonnet-4-6", "high", true);
+    await tick();
+    const control = proc.controls("apply_flag_settings")[0];
+    expect(control).toBeDefined();
+    expect(control.request.settings).toEqual({ fastMode: true });
+    proc.succeedControl(control);
+    await enabling;
+    expect(session.fast).toBe(true);
+
+    // Turning it off clears the key rather than writing false: the CLI reads a
+    // null as a deletion, which drops back to whatever the settings files say.
+    const disabling = session.reconfigure("claude-sonnet-4-6", "high", false);
+    await tick();
+    const off = proc.controls("apply_flag_settings")[1];
+    expect(off.request.settings).toEqual({ fastMode: null });
+    proc.succeedControl(off);
+    await disabling;
+    expect(session.fast).toBe(false);
+  });
+
+  it("says nothing when the mode has not changed", async () => {
+    const proc = new FakeProc();
+    const session = sessionFor(proc);
+    await session.reconfigure("claude-sonnet-4-6", "high", false);
+    expect(proc.controls("apply_flag_settings")).toHaveLength(0);
   });
 });

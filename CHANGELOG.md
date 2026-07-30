@@ -15,6 +15,31 @@ _Changes landed on `main` that haven't shipped in a release yet._
 - Messages can now be queued while an agent is working. By default, they are
   sent when the current turn ends. They can also be sent after the current tool
   call or immediately.
+- The composer now shows what the chat has cost so far, counting up as the agent
+  works. The figure covers the whole conversation, including every agent it was
+  switched between, so it no longer restarts at zero after a switch, and
+  including turns you stopped part-way or that failed on their way through, since
+  those were charged for too. The model picker moves to the left of the composer
+  to make room for it, in both the new-chat box and open chats.
+- Hovering that figure itemizes where the money went: tokens and dollars per
+  bucket, each priced at the model that was billed for it, plus what a running
+  turn has added and any searches billed per request. Cache writes are split by
+  how long the entry lives, because an hour-long one costs Anthropic's input rate
+  twice over where a five-minute one costs 1.25×, and on a first turn that is most
+  of the bill. Claude reports a turn's cost as a single figure rather than a sum
+  of token rates, so whatever the itemization still cannot account for is shown as
+  its own line rather than hidden.
+- Chats can now run in fast mode, from the model picker, on the models that
+  offer it — Claude's fast mode and Codex's priority service tier. It is per
+  chat, off by default, and the picker shows what the premium is (2× the usual
+  rate on Opus 5 and on the GPT-5.6 models, 6× on Opus 4.6) because the speed is
+  not free. Moving a chat to a model that doesn't offer it turns it back off
+  rather than leaving it set where nothing shows it, so returning to a model that
+  does never resumes paying a premium you didn't ask for again. Turns run this way
+  are costed at those rates in the breakdown. Codex never reports which tier a
+  turn actually ran on, so if a plan doesn't include priority service the turn
+  quietly runs at standard speed; the server logs a warning when the account's
+  model list says so.
 - User messages now warn when delivery could not be confirmed.
 - You can now edit a message or switch between its versions while the model is
   replying. Any partial reply remains on the original branch, and the
@@ -28,6 +53,13 @@ _Changes landed on `main` that haven't shipped in a release yet._
 - While an agent is working, the composer has one button instead of two. With an
   empty composer it is the stop button, which interrupts the turn. As soon as
   you type something it becomes the send button, which queues the message.
+- Codex effort menus no longer offer `ultra`. Despite its position at the top of
+  the slider it is not more reasoning than `max` — it asks for the same thing and
+  additionally lets Codex spawn sub-agents on its own initiative, which is
+  isolade's job. Chats already set to it fall back to the model's default effort.
+  The Codex model list, its display names, and its effort levels now come from
+  the same source as Claude's rather than from a `codex` process, so refreshing
+  the catalog no longer needs Codex installed and logged in.
 
 ### Fixed
 
@@ -44,6 +76,14 @@ _Changes landed on `main` that haven't shipped in a release yet._
 - Codex chats now show reconnect progress while Codex retries an interrupted
   OpenAI response stream, and terminal app-server errors settle immediately
   instead of leaving the chat waiting for a second failure notification.
+- Restarting the app mid-conversation no longer drops the next Claude turn from
+  the usage charts, or makes a chat's token totals dip before climbing again.
+- Claude chats no longer overstate what they have cost. The figure the CLI
+  reports covers everything its process has spent, not just the turn that
+  finished, so counting each one as a turn's cost inflated a chat's total the
+  longer it ran: a fourth turn roughly doubled it. Costs are now the difference
+  between reports, and they count the sub-agents a turn spawned, whose tokens
+  were previously missing from the usage charts entirely.
 
 ## [0.3.2] - 2026-07-26
 

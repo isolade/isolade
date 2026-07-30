@@ -135,10 +135,15 @@ export const updateChatBodySchema = z
   .object({
     model: z.string().min(1).optional(),
     effort: chatEffortSchema.optional(),
+    // Opt this chat into the provider's fast mode, which is billed at a premium
+    // rate. Applied to the live process, so it takes effect on the next turn
+    // without restarting anything.
+    fastMode: z.boolean().optional(),
   })
-  .refine((body) => body.model !== undefined || body.effort !== undefined, {
-    message: "model or effort is required",
-  });
+  .refine(
+    (body) => body.model !== undefined || body.effort !== undefined || body.fastMode !== undefined,
+    { message: "model, effort, or fastMode is required" },
+  );
 
 // `content` may be empty when the message carries only attachments (e.g. the
 // user pastes a screenshot and hits send with no text). `uploadIds` reference

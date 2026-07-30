@@ -175,7 +175,7 @@ function seedV3Db(path: string): { chatId: string; newestOrphanId: string } {
   return { chatId, newestOrphanId };
 }
 
-describe("db migrations 3-10 (tree, attachments, rendering, layout, queue, provider identity)", () => {
+describe("db migrations 3-15 (tree, attachments, rendering, layout, queue, provider identity, chat costs)", () => {
   it("backfills linear parent chains, the active leaf, and the parent index", () => {
     const path = join(tmpdir(), `isolade-mig3-${randomUUID()}.db`);
     try {
@@ -206,7 +206,7 @@ describe("db migrations 3-10 (tree, attachments, rendering, layout, queue, provi
       const raw = new Database(path);
       const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(10);
+      expect(version).toBe(15);
       const messageColumns = raw
         .query("SELECT name FROM pragma_table_info('chat_messages')")
         .all() as Array<{ name: string }>;
@@ -388,7 +388,7 @@ describe("db migration 7 (panel layout)", () => {
       const version = (
         new Database(path).query("PRAGMA user_version").get() as { user_version: number }
       ).user_version;
-      expect(version).toBe(10);
+      expect(version).toBe(15);
     } finally {
       rmSync(path, { force: true });
       rmSync(`${path}-wal`, { force: true });
@@ -502,7 +502,7 @@ describe("db migration 10 (per-message provider identity)", () => {
       const raw = new Database(path);
       const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(10);
+      expect(version).toBe(15);
       const switchesTable = raw
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'provider_switches'")
         .get() as { name: string } | null;
@@ -513,6 +513,80 @@ describe("db migration 10 (per-message provider identity)", () => {
         .query("SELECT name FROM pragma_table_info('chat_messages') WHERE name = 'model'")
         .get() as { name: string } | null;
       expect(modelColumn?.name).toBe("model");
+      raw.close();
+    } finally {
+      rmSync(path, { force: true });
+      rmSync(`${path}-wal`, { force: true });
+      rmSync(`${path}-shm`, { force: true });
+    }
+  });
+});
+
+// A v10 database for the one column migration 11 touches: usage_events without
+// chat_id. Every other table is installed at the current shape by createSchema.
+function seedV10Db(path: string): { eventId: string } {
+  const sqlite = new Database(path);
+  sqlite.run(`
+    CREATE TABLE usage_events (
+      id TEXT PRIMARY KEY,
+      profile_id TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      model TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+      cost_usd REAL NOT NULL DEFAULT 0,
+      effective_input_tokens REAL NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER))
+    )
+  `);
+  const eventId = randomUUID();
+  sqlite.run(
+    `INSERT INTO usage_events (id, profile_id, provider, model, kind, input_tokens, cost_usd)
+     VALUES (?, 'default', 'anthropic', 'claude-opus-4-8', 'usage', 1000, 0.5)`,
+    [eventId],
+  );
+  sqlite.run(`PRAGMA user_version = 10`);
+  sqlite.close();
+  return { eventId };
+}
+
+describe("db migration 12 (per-chat usage attribution)", () => {
+  it("labels new usage rows with their chat and leaves old ones unattributed", () => {
+    const path = join(tmpdir(), `isolade-mig11-${randomUUID()}.db`);
+    try {
+      const { eventId } = seedV10Db(path);
+      const db = createDb(path);
+
+      // Nothing can say which chat an existing row came from, so it stays null
+      // and simply never appears in a per-chat breakdown.
+      const existing = db
+        .select()
+        .from(schema.usageEvents)
+        .where(eq(schema.usageEvents.id, eventId))
+        .get();
+      expect(existing?.chatId).toBeNull();
+      expect(existing?.costUsd).toBeCloseTo(0.5, 10);
+      // The columns migrations 13 and 14 add arrive with defaults rather than
+      // backfills: nothing in an old row says how many searches it paid for, or
+      // how long its cache entries were meant to live.
+      expect(existing?.webSearchRequests).toBe(0);
+      expect(existing?.cacheWrite1hTokens).toBe(0);
+      // Nor does an old row say whether it was billed at premium rates, and
+      // assuming it was would re-cost history at up to 6× what it charged.
+      expect(existing?.fast).toBe(false);
+
+      const raw = new Database(path);
+      const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
+        .user_version;
+      expect(version).toBe(15);
+      const index = raw
+        .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get("idx_usage_events_chat") as { name: string } | null;
+      expect(index?.name).toBe("idx_usage_events_chat");
       raw.close();
     } finally {
       rmSync(path, { force: true });

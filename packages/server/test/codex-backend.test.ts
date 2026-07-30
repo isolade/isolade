@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { ChatEvent } from "../src/chat/backend";
+import type { ChatEvent, ModelBilling } from "../src/chat/backend";
 import { CodexBackend } from "../src/chat/codex-backend";
 import type { CodexConnection, CodexManager } from "../src/chat/codex-manager";
 import type { ChatManager } from "../src/chats";
@@ -26,6 +26,9 @@ class FakeCodexConn {
   // When set, holds the turn/interrupt response so tests can verify the
   // backend does not release the caller before Codex acknowledges teardown.
   interruptGate: Promise<void> | null = null;
+  // What `model/list` reports for this account, in the app-server's shape. Left
+  // null it fails, like an app-server too old to know the method.
+  modelList: { data: unknown[] } | null = null;
 
   on(method: string, h: (p: unknown) => void) {
     const a = this.handlers.get(method) ?? [];
@@ -67,6 +70,10 @@ class FakeCodexConn {
     if (method === "turn/interrupt" && this.interruptGate) {
       await this.interruptGate;
     }
+    if (method === "model/list") {
+      if (!this.modelList) throw new Error("Method not found: model/list");
+      return this.modelList;
+    }
     return {};
   }
   private fire(method: string, params: unknown) {
@@ -102,21 +109,35 @@ function backendWith(script: Array<[string, unknown]>) {
   return { backend, mgr };
 }
 
-async function run(script: Array<[string, unknown]>, model = "gpt-5-codex") {
+async function run(
+  script: Array<[string, unknown]>,
+  model = "gpt-5-codex",
+  opts: { fast?: boolean } = {},
+) {
   const deltas: string[] = [];
   const events: ChatEvent[] = [];
-  const { backend } = backendWith(script);
+  const billed: ModelBilling[][] = [];
+  const { backend, mgr } = backendWith(script);
   const result = await backend.sendMessage({
     vmId: "vm",
     chatId: "chat",
     message: "hi",
     model,
     effort: "medium",
+    ...(opts.fast === undefined ? {} : { fast: opts.fast }),
     sessionId: "thread-1", // skip thread/start
     onDelta: (t) => deltas.push(t),
     onEvent: (e) => events.push(e),
+    onBilling: (models) => billed.push(models),
   });
-  return { result, deltas, events };
+  return { result, deltas, events, billed, mgr };
+}
+
+// The params of the turn/start this run issued.
+function turnStartParams(mgr: FakeCodexManager): Record<string, unknown> {
+  const sent = mgr.conn.sent.find((s) => s.method === "turn/start");
+  if (!sent) throw new Error("expected a turn/start");
+  return sent.params as Record<string, unknown>;
 }
 
 describe("CodexBackend notification parsing", () => {
@@ -645,7 +666,243 @@ describe("CodexBackend notification parsing", () => {
     if (!pricing) throw new Error("expected gpt-5.6-sol to be priced");
     const expected =
       (100 * pricing.inputPerMTok) / 1_000_000 + (80 * pricing.outputPerMTok) / 1_000_000;
-    expect(u?.costUsd).toBeCloseTo(expected, 10);
+    expect(u?.turnCostUsd).toBeCloseTo(expected, 10);
+  });
+
+  it("tracks the turn's running price live, then bills it once", async () => {
+    // codex restates the turn's usage as it goes, which is what lets the
+    // composer climb during a turn. Each frame therefore carries the turn's
+    // price SO FAR, replacing the last rather than adding to it, and the bill
+    // that lands when the turn settles is that same figure once.
+    const usageAt = (outputTokens: number) => [
+      "thread/tokenUsage/updated",
+      {
+        tokenUsage: {
+          last: { inputTokens: 1000, outputTokens, reasoningOutputTokens: 0 },
+          total: { inputTokens: 9000, outputTokens, reasoningOutputTokens: 0 },
+          modelContextWindow: 400000,
+        },
+      },
+    ];
+    const { events, billed } = await run(
+      [
+        usageAt(100) as [string, unknown],
+        usageAt(400) as [string, unknown],
+        ["turn/completed", { turn: { status: "completed" } }],
+      ],
+      "gpt-5.6-sol",
+    );
+    const pricing = codexPricingFor("gpt-5.6-sol");
+    if (!pricing) throw new Error("expected gpt-5.6-sol to be priced");
+    const priceOf = (outputTokens: number) =>
+      (1000 * pricing.inputPerMTok) / 1_000_000 +
+      (outputTokens * pricing.outputPerMTok) / 1_000_000;
+
+    const provisional = events
+      .filter((e): e is Extract<ChatEvent, { type: "usage" }> => e.type === "usage")
+      .map((e) => e.turnCostUsd ?? 0);
+    expect(provisional).toHaveLength(2);
+    expect(provisional[0]).toBeCloseTo(priceOf(100), 10);
+    expect(provisional[1]).toBeCloseTo(priceOf(400), 10);
+
+    // One bill for the turn, equal to where the provisional figure ended up, so
+    // the composer's number does not move when the turn settles.
+    expect(billed).toHaveLength(1);
+    expect(billed[0]).toHaveLength(1);
+    expect(billed[0]![0]!.costUsd).toBeCloseTo(priceOf(400), 10);
+    expect(billed[0]![0]!.usage.outputTokens).toBe(400);
+    expect(billed[0]![0]!.model).toBe("gpt-5.6-sol");
+  });
+
+  it("runs a fast turn on the priority tier and prices it at the premium card", async () => {
+    const script: Array<[string, unknown]> = [
+      [
+        "thread/tokenUsage/updated",
+        {
+          tokenUsage: {
+            last: { inputTokens: 1000, outputTokens: 400, reasoningOutputTokens: 0 },
+            total: { inputTokens: 1000, outputTokens: 400, reasoningOutputTokens: 0 },
+          },
+        },
+      ],
+      ["turn/completed", { turn: { status: "completed" } }],
+    ];
+    const standard = await run(script, "gpt-5.6-sol");
+    const fast = await run(script, "gpt-5.6-sol", { fast: true });
+
+    expect(turnStartParams(standard.mgr).serviceTier).toBe("default");
+    expect(turnStartParams(fast.mgr).serviceTier).toBe("priority");
+
+    // Same tokens, the premium card: fast mode is 2× list on this model, and the
+    // provisional figure the composer showed matches the settled bill.
+    const bill = (r: { billed: ModelBilling[][] }) => r.billed[0]?.[0];
+    expect(bill(standard)?.fast).toBe(false);
+    expect(bill(fast)?.fast).toBe(true);
+    const expected = (bill(standard)?.costUsd ?? 0) * 2;
+    expect(bill(fast)?.costUsd).toBeCloseTo(expected, 10);
+    const lastProvisional = (r: { events: ChatEvent[] }) =>
+      r.events.filter((e): e is Extract<ChatEvent, { type: "usage" }> => e.type === "usage").at(-1)
+        ?.turnCostUsd;
+    expect(lastProvisional(fast)).toBeCloseTo(expected, 10);
+  });
+
+  it("warns when the account cannot actually run the model on the fast tier", async () => {
+    // codex drops a service tier the account's model list doesn't carry and
+    // never says it did, so this warning is the only way the discrepancy — a
+    // turn billed as priority that ran standard — becomes visible.
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+    try {
+      const { backend, mgr } = backendWith([["turn/completed", { turn: { status: "completed" } }]]);
+      mgr.conn.modelList = {
+        data: [
+          { id: "gpt-5.6-sol", model: "gpt-5.6-sol", serviceTiers: [{ id: "flex" }] },
+          { id: "gpt-5.4", model: "gpt-5.4", additionalSpeedTiers: ["fast"] },
+        ],
+      };
+      const send = (model: string) =>
+        backend.sendMessage({
+          vmId: "vm",
+          chatId: "chat",
+          message: "hi",
+          model,
+          effort: "medium",
+          fast: true,
+          sessionId: "thread-1",
+          onDelta: () => {},
+        });
+      await send("gpt-5.6-sol");
+      // The probe is per connection, so the second turn reuses the first's list.
+      await send("gpt-5.4");
+      await Promise.resolve();
+      expect(mgr.conn.sent.filter((s) => s.method === "model/list")).toHaveLength(1);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("gpt-5.6-sol");
+      expect(warnings[0]).toContain("priority");
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  it("keeps a fast turn running when the account's model list can't be read", async () => {
+    // An app-server that rejects model/list tells us nothing either way, so the
+    // turn proceeds and stays silent rather than warning on a failed probe.
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+    try {
+      const { result, mgr } = await run(
+        [
+          ["item/agentMessage/delta", { itemId: "i1", delta: "ok" }],
+          ["turn/completed", { turn: { status: "completed" } }],
+        ],
+        "gpt-5.6-sol",
+        { fast: true },
+      );
+      await Promise.resolve();
+      expect(result.content).toBe("ok");
+      expect(turnStartParams(mgr).serviceTier).toBe("priority");
+      expect(warnings).toHaveLength(0);
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  it("bills nothing for a turn that reported no usage", async () => {
+    const { billed } = await run([["turn/completed", { turn: { status: "completed" } }]]);
+    expect(billed).toHaveLength(0);
+  });
+
+  // A turn that didn't finish still consumed tokens, and OpenAI charges for
+  // them. Billing therefore hangs off teardown rather than off the success
+  // branch: pressing Stop is the most common way a turn ends, and dropping its
+  // spend would quietly understate both the chat's cost and the usage page.
+  const partialUsage: [string, unknown] = [
+    "thread/tokenUsage/updated",
+    {
+      tokenUsage: {
+        last: { inputTokens: 1000, outputTokens: 400, reasoningOutputTokens: 0 },
+        total: { inputTokens: 1000, outputTokens: 400, reasoningOutputTokens: 0 },
+      },
+    },
+  ];
+  const expectedPartialCost = () => {
+    const pricing = codexPricingFor("gpt-5.6-sol");
+    if (!pricing) throw new Error("expected gpt-5.6-sol to be priced");
+    return (1000 * pricing.inputPerMTok) / 1_000_000 + (400 * pricing.outputPerMTok) / 1_000_000;
+  };
+
+  it("bills what an interrupted turn had already run up", async () => {
+    const { backend, mgr } = backendWith([partialUsage]);
+    const billed: ModelBilling[][] = [];
+    const ac = new AbortController();
+    const sending = backend.sendMessage({
+      vmId: "vm",
+      chatId: "chat",
+      message: "hi",
+      model: "gpt-5.6-sol",
+      effort: "medium",
+      sessionId: "thread-1",
+      signal: ac.signal,
+      onDelta: () => {},
+      onBilling: (models) => billed.push(models),
+    });
+
+    // Let the turn start and report its usage, then Stop it.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    ac.abort();
+    await expect(sending).rejects.toThrow("aborted");
+    expect(mgr.conn.sent.some((s) => s.method === "turn/interrupt")).toBe(true);
+
+    // Exactly one bill: an abort can reach teardown twice (the interrupt
+    // rejects, and so does the turn-start promise behind it).
+    expect(billed).toHaveLength(1);
+    expect(billed[0]![0]!.usage.outputTokens).toBe(400);
+    expect(billed[0]![0]!.costUsd).toBeCloseTo(expectedPartialCost(), 10);
+  });
+
+  it("bills a turn that failed after producing tokens", async () => {
+    const billed: ModelBilling[][] = [];
+    const { backend } = backendWith([
+      partialUsage,
+      ["turn/completed", { turn: { status: "failed", error: { message: "rate limited" } } }],
+    ]);
+    await expect(
+      backend.sendMessage({
+        vmId: "vm",
+        chatId: "chat",
+        message: "hi",
+        model: "gpt-5.6-sol",
+        effort: "medium",
+        sessionId: "thread-1",
+        onDelta: () => {},
+        onBilling: (models) => billed.push(models),
+      }),
+    ).rejects.toThrow("rate limited");
+    expect(billed).toHaveLength(1);
+    expect(billed[0]![0]!.costUsd).toBeCloseTo(expectedPartialCost(), 10);
+  });
+
+  it("bills once for a turn a terminal error ends", async () => {
+    const billed: ModelBilling[][] = [];
+    const { backend } = backendWith([
+      partialUsage,
+      ["error", { error: { message: "invalid request" }, willRetry: false }],
+    ]);
+    await expect(
+      backend.sendMessage({
+        vmId: "vm",
+        chatId: "chat",
+        message: "hi",
+        model: "gpt-5.6-sol",
+        effort: "medium",
+        sessionId: "thread-1",
+        onDelta: () => {},
+        onBilling: (models) => billed.push(models),
+      }),
+    ).rejects.toThrow("invalid request");
+    expect(billed).toHaveLength(1);
   });
 
   it("surfaces an unrecognized notification as a raw event", async () => {

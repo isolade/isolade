@@ -216,7 +216,9 @@ export default function NewInstancePane({
           onPaste={handlePaste}
           hasAttachments={attachments.items.length > 0}
           attachments={<AttachmentStrip items={attachments.items} onRemove={attachments.remove} />}
-          leftToolbar={
+          // No `status`: a draft has no chat behind it, so there is no spend to
+          // report. The slot stays empty rather than reading zero.
+          modelPicker={
             <ModelEffortPicker
               models={chatModels}
               overrides={modelOverrides}

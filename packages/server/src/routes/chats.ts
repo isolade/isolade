@@ -317,7 +317,7 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     const chatId = c.req.param("chatId");
     const existing = chatForInstance(instanceId, chatId);
     if (!existing) return c.json({ error: "not found" }, 404);
-    const { model, effort } = updateChatBodySchema.parse(await c.req.json());
+    const { model, effort, fastMode } = updateChatBodySchema.parse(await c.req.json());
     // Resolve the post-update (model, effort) pair. When the caller swaps
     // to a model whose effort menu doesn't include the current value, snap
     // to that model's declared default rather than 400ing.
@@ -368,9 +368,21 @@ export function createChatsRouter(ctx: RouteContext): Hono {
       const existingSwitch = providerSwitchStore.get(chatId);
       if (existingSwitch) providerSwitchStore.clear(chatId);
       chatManager.updateModel(chatId, model, modelDef.provider, nextEffort);
-    } else {
+    } else if (effort !== undefined) {
       chatManager.updateEffort(chatId, nextEffort);
     }
+    // Stored, not pushed: the backend reads it when it next configures the
+    // chat's process, so a turn already running keeps the mode it started in
+    // rather than changing rate halfway through.
+    //
+    // A model with no fast rate card has no fast mode to be in, and the picker
+    // hides the toggle for it. Clearing the opt-in rather than leaving it set
+    // keeps the stored state and the offered state the same thing: otherwise it
+    // survives out of sight and reappears already on when the user picks a model
+    // that does offer it, having never opted in for that one.
+    const fastOffered = modelDef.fastPricing != null;
+    if (fastMode !== undefined && fastOffered) chatManager.updateFastMode(chatId, fastMode);
+    else if (!fastOffered && existing.fastMode) chatManager.updateFastMode(chatId, false);
     const updated = chatManager.get(chatId);
     return c.json(updated ? await enrichChat(updated) : updated);
   });
@@ -387,6 +399,17 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     uploadStore.removeForChat(chatId);
     chatManager.remove(chatId);
     return c.json({ ok: true });
+  });
+
+  // Where this chat's money went, read out of the usage log. Deliberately a
+  // pull: the composer's running total rides the live stream, but this split is
+  // derived data that nobody needs on every frame and that has no business being
+  // persisted into the chat's event log. Fetched when the detail card opens.
+  app.get("/api/instances/:id/chats/:chatId/cost", (c) => {
+    const instanceId = c.req.param("id");
+    const chatId = c.req.param("chatId");
+    if (!chatForInstance(instanceId, chatId)) return c.json({ error: "chat not found" }, 404);
+    return c.json(chatManager.getChatCostBreakdown(chatId));
   });
 
   // Probe live context composition through the provider session. Claude uses
