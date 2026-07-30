@@ -148,7 +148,13 @@ function thoughtDisplayText(chunk: ThoughtChunk): string {
   return chunk.text.replace(/\*\*(.*?)\*\*/gs, "$1").replace(/__(.*?)__/gs, "$1");
 }
 
-const ThoughtBlock = memo(function ThoughtBlock({ chunk }: { chunk: ThoughtChunk }) {
+const ThoughtBlock = memo(function ThoughtBlock({
+  chunk,
+  cacheKey,
+}: {
+  chunk: ThoughtChunk;
+  cacheKey?: string;
+}) {
   const active = chunk.status === "thinking";
   const [open, setOpen] = useState(chunk.provider === "claude");
   const tokens = useAnimatedInteger(chunk.tokens);
@@ -205,7 +211,7 @@ const ThoughtBlock = memo(function ThoughtBlock({ chunk }: { chunk: ThoughtChunk
       >
         <div className="overflow-hidden">
           <div className="ml-2 mt-1 border-l border-border/70 pl-4 text-sm text-muted-foreground">
-            <StreamingMarkdown content={displayText} streaming={active} />
+            <StreamingMarkdown content={displayText} streaming={active} cacheKey={cacheKey} />
           </div>
         </div>
       </div>
@@ -440,6 +446,7 @@ export const ProviderSwitchDivider = memo(function ProviderSwitchDivider({
 // because its `chunks` array is rebuilt each frame.
 export const StreamView = memo(function StreamView({
   chunks,
+  cacheScope,
   showDebug,
   streaming = false,
   instanceId,
@@ -452,6 +459,12 @@ export const StreamView = memo(function StreamView({
   onRequestToolDetails,
 }: {
   chunks: StreamChunk[];
+  /**
+   * Stable identity for the message these chunks belong to. Each piece keys its
+   * parser off it, so the parse outlives the row's mount. Absent for a turn
+   * that has not committed yet, which has no id to key by.
+   */
+  cacheScope?: string;
   showDebug: boolean;
   streaming?: boolean;
   instanceId: string;
@@ -472,6 +485,7 @@ export const StreamView = memo(function StreamView({
               key={i}
               content={chunk.text}
               streaming={streaming && i === chunks.length - 1}
+              cacheKey={cacheScope === undefined ? undefined : `${cacheScope}:text:${i}`}
             />
           );
         }
@@ -499,7 +513,15 @@ export const StreamView = memo(function StreamView({
           return <InterruptionMarker key={chunk.id} id={chunk.id} />;
         }
         if (chunk.kind === "api_retry") return <RetryBlock key={i} chunk={chunk} />;
-        if (chunk.kind === "thought") return <ThoughtBlock key={chunk.id} chunk={chunk} />;
+        if (chunk.kind === "thought") {
+          return (
+            <ThoughtBlock
+              key={chunk.id}
+              chunk={chunk}
+              cacheKey={cacheScope === undefined ? undefined : `${cacheScope}:thought:${chunk.id}`}
+            />
+          );
+        }
         // The provider-switch divider renders above the triggering user message
         // (see MessageRow.switchAbove), not inside the assistant bubble.
         if (chunk.kind === "provider_switch") return null;

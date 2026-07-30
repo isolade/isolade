@@ -27,13 +27,15 @@ export interface WorkspaceHarnessApi {
    * Markdown was re-parsed and no historical row was re-rendered.
    */
   renderMetrics: () => MetricSnapshot;
+  /** Unmount the whole workspace and mount it again. */
+  remountWorkspace: () => Promise<void>;
   /** Dirty one instance row, then let one poll cycle deliver it. */
   pollWithChange: () => Promise<CommitProfile>;
   /** Press an element and report the wall clock until the frame after it lands. */
   pressAndTime: (selector: string, index?: number) => Promise<number>;
   /**
    * Force off-screen panes back into the rendering path, reproducing the
-   * behaviour before they were skipped. Lets a test compare the two on one
+   * behaviour before they were taken out of the box tree. Lets a test compare the two on one
    * page, which is the actual invariant, rather than assert a millisecond
    * budget that depends on the machine. React owns this inline style, so any
    * pane re-render restores the real value: re-apply before each measurement.
@@ -50,6 +52,13 @@ export interface WorkspaceHarnessApi {
    */
   activeReadingAnchor: () => { id: string | null; top: number };
   activeTranscriptDistanceFromBottom: () => number;
+  /**
+   * Resolve once the active pane is actually on screen. Revealing a pane
+   * rebuilds its layout, and it is deliberately not painted until that settles,
+   * so anything asserting what the reader sees has to wait for that rather than
+   * a fixed number of frames.
+   */
+  waitForActivePaneShown: (maxFrames?: number) => Promise<boolean>;
 }
 
 let profileState = { commits: 0, totalDuration: 0 };
@@ -74,6 +83,10 @@ function activeScroller(): HTMLElement {
 }
 
 export function WorkspaceHarness() {
+  // Lets a test tear the whole workspace out of the tree and put it back, which
+  // is the only way to state that the parse survives a row's mount rather than
+  // merely never being asked to repeat while the row is retained.
+  const [mounted, setMounted] = useState(true);
   const parameters = useMemo(() => new URLSearchParams(window.location.search), []);
   const [mock] = useState<WorkspaceApiMock>(() =>
     installWorkspaceApiMock({
@@ -103,6 +116,14 @@ export function WorkspaceHarness() {
       },
       profile: snapshot,
       renderMetrics: () => getRenderMetrics().snapshot(),
+      async remountWorkspace() {
+        setMounted(false);
+        await frame();
+        await frame();
+        setMounted(true);
+        await frame();
+        await frame();
+      },
       async pollWithChange() {
         await api.resetProfile();
         mock.touchInstance(0);
@@ -116,7 +137,7 @@ export function WorkspaceHarness() {
         const panes = document.querySelectorAll<HTMLElement>(
           '[data-retained-instance][aria-hidden="true"]',
         );
-        for (const pane of panes) pane.style.contentVisibility = on ? "hidden" : "visible";
+        for (const pane of panes) pane.style.display = on ? "none" : "flex";
         document.body.getBoundingClientRect();
         for (let index = 0; index < 3; index++) await frame();
       },
@@ -149,6 +170,16 @@ export function WorkspaceHarness() {
         }
         return { id: null, top: 0 };
       },
+      async waitForActivePaneShown(maxFrames = 40) {
+        for (let index = 0; index < maxFrames; index++) {
+          const pane = document.querySelector<HTMLElement>(
+            '[data-retained-instance][aria-hidden="false"]',
+          );
+          if (pane && getComputedStyle(pane).visibility === "visible") return true;
+          await frame();
+        }
+        return false;
+      },
       activeTranscriptDistanceFromBottom() {
         const scroller = activeScroller();
         return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
@@ -161,7 +192,7 @@ export function WorkspaceHarness() {
   return (
     <Profiler id="workspace" onRender={onRender}>
       <div className="flex h-screen flex-col bg-background text-foreground">
-        <HomeTab isTauri={false} />
+        {mounted && <HomeTab isTauri={false} />}
       </div>
     </Profiler>
   );

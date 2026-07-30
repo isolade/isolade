@@ -42,10 +42,17 @@ interface RetainedInstancePaneProps {
  * painted on every frame. With a dozen long chats open that turns unrelated
  * interactions (opening a menu, typing in a new chat) into visibly slow ones.
  *
- * So an off-screen pane has its rendering skipped instead. `content-visibility`
- * is the right tool rather than `display: none`, because it preserves the
- * subtree's rendering state, including the scroll offsets retention exists to
- * keep. Browsers without it simply fall back to today's behaviour.
+ * So an off-screen pane is taken out of the box tree with `display: none`.
+ * `content-visibility: hidden` reads better on paper, because it is specified to
+ * preserve the skipped subtree's rendering state, but measured against WebKit
+ * (which is what the macOS app runs on) it barely helps: opening a menu over a
+ * 245k node document cost 2198ms with it versus 118ms with `display: none`.
+ * Chromium contains both well, so the stricter option is the one to take.
+ *
+ * `display: none` does discard the subtree's scroll offsets, but Chat does not
+ * rely on the browser for those: it captures a reading anchor when it is hidden
+ * and restores it when revealed, which is the behaviour the retention tests
+ * pin down.
  */
 function RetainedInstancePane({
   instance,
@@ -65,11 +72,11 @@ function RetainedInstancePane({
   onTerminalCreated,
   onTerminalDeleted,
 }: RetainedInstancePaneProps) {
-  // Skipping is deferred by a frame on the way out, because the commit that
-  // hides a pane is also the commit where Chat captures its reading anchor in a
-  // layout effect, and a skipped subtree measures as zero. It is NOT deferred on
-  // the way in: `skipped` is only ever consulted while inactive, so a reveal
-  // un-skips during the same render, before any layout effect looks at the DOM.
+  // Hiding is deferred by a frame, because the commit that hides a pane is also
+  // the commit where Chat captures its reading anchor, and a pane with no boxes
+  // measures as zero. Revealing is not deferred: the boxes come back during the
+  // same render, before any layout effect reads them, and Chat absorbs the
+  // transcript's rebuild before each paint rather than a frame later.
   const [skipped, setSkipped] = useState(!active);
   useEffect(() => {
     if (active) {
@@ -97,7 +104,7 @@ function RetainedInstancePane({
         // size containment, which can make an absolutely positioned panel body's
         // nested scroller inert in macOS WebKit.
         contain: "layout style",
-        contentVisibility: !active && skipped ? "hidden" : "visible",
+        display: !active && skipped ? "none" : "flex",
         opacity: active ? 1 : 0,
         pointerEvents: active ? "auto" : "none",
       }}

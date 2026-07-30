@@ -134,8 +134,13 @@ test.describe("retained workspace", () => {
   test("skipping an off-screen pane preserves its reading position @stress", async ({ page }) => {
     await openWorkspace(page);
 
-    // A freshly revealed pane lands on its tail, not at scrollTop 0.
+    // A freshly revealed pane lands on its tail, not at scrollTop 0. Wait for it
+    // to actually be shown: it is held unpainted while its layout rebuilds, so
+    // measuring on a fixed frame count would sample a pane the reader cannot see.
     await pressRow(page, 0);
+    expect(
+      await page.evaluate(() => window.__isoladeWorkspaceHarness?.waitForActivePaneShown()),
+    ).toBe(true);
     expect(
       await page.evaluate(() =>
         window.__isoladeWorkspaceHarness?.activeTranscriptDistanceFromBottom(),
@@ -157,7 +162,9 @@ test.describe("retained workspace", () => {
     ).toBeGreaterThan(100);
 
     await pressRow(page, 1);
+    await page.evaluate(() => window.__isoladeWorkspaceHarness?.waitForActivePaneShown());
     await pressRow(page, 0);
+    await page.evaluate(() => window.__isoladeWorkspaceHarness?.waitForActivePaneShown());
     const restored = await page.evaluate(() =>
       window.__isoladeWorkspaceHarness?.activeReadingAnchor(),
     );
@@ -216,6 +223,29 @@ test.describe("retained workspace", () => {
     expect(metrics?.parserInputBytes).toBe(0);
     expect(metrics?.historyMappings).toBe(0);
     expect(metrics?.historicalRowRenders).toBe(0);
+  });
+
+  // The point of caching the parse outside the component tree: a row can be
+  // unmounted and mounted again without redoing it. Retention tests only show
+  // that a retained row is never asked to repeat, which a cache that dies with
+  // the row would also satisfy.
+  test("re-parses nothing after the whole workspace remounts @stress", async ({ page }) => {
+    await openWorkspace(page);
+    await pressRow(page, 0);
+    await page.evaluate(() => window.__isoladeWorkspaceHarness?.waitForActivePaneShown());
+
+    const warmed = await page.evaluate(() => window.__isoladeWorkspaceHarness?.renderMetrics());
+    expect(warmed?.parserInputBytes ?? 0).toBeGreaterThan(0);
+
+    await page.evaluate(() => window.__isoladeWorkspaceHarness?.resetProfile());
+    await page.evaluate(() => window.__isoladeWorkspaceHarness?.remountWorkspace());
+    await expect(page.locator("[data-message-id]")).toHaveCount(
+      MOUNTED_BODIES * MESSAGES_PER_CHAT,
+      { timeout: 120_000 },
+    );
+
+    const after = await page.evaluate(() => window.__isoladeWorkspaceHarness?.renderMetrics());
+    expect(after?.parserInputBytes).toBe(0);
   });
 });
 

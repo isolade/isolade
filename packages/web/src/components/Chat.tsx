@@ -369,6 +369,9 @@ function Chat({
   // callback, a ref (not state) so streaming scrolls never depend on a
   // re-render to see the latest value.
   const isPinnedRef = useRef(true);
+  // Last observed offset, so a scroll event can tell an actual upward movement
+  // from the tail drifting away as content grows.
+  const previousScrollTopRef = useRef(0);
   // Visibility changes can produce native scroll events while the retained
   // pane reflows. Preserve the user's logical state at hide time so a stale
   // event cannot turn a reader into a pinned viewport during reveal.
@@ -562,6 +565,24 @@ function Chat({
     });
   }, []);
 
+  // Content that grows while the viewport is pinned has to be absorbed before
+  // the frame paints. The coalesced rAF path lands a frame late, which shows as
+  // the tail jumping away and back: harmless while streaming a few characters,
+  // very visible when a revealed pane rebuilds a whole transcript's layout.
+  // ResizeObserver callbacks run after layout and before paint, so correcting
+  // there is seamless. Writing scrollTop cannot resize the observed element, so
+  // this can't feed back into the observer.
+  const handleContentResize = useCallback(() => {
+    if (!visibleRef.current || !isPinnedRef.current) {
+      scrollToBottom();
+      return;
+    }
+    const element = scrollContainerRef.current;
+    if (!element) return;
+    const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+    if (distance > SCROLL_PIN_THRESHOLD_PX) element.scrollTop = element.scrollHeight;
+  }, [scrollToBottom]);
+
   const handleScroll = useCallback((event: ReactUIEvent<HTMLDivElement>) => {
     // Hidden layout and warm-up writes are not user intent. In particular, a
     // delayed scroll event from a stale offset must not turn a pinned pane
@@ -588,8 +609,21 @@ function Chat({
       }
     }
     if (hasRecentUserIntent) userScrollIntentUntilRef.current = 0;
-    isPinnedRef.current = pinned;
-    setShowJump(!pinned);
+    // Pinning is about intent, not geometry. Content growing under a pinned
+    // viewport moves the tail away without the reader having done anything, and
+    // reading that as "they scrolled up" is what used to strand a revealed pane
+    // at the top of its transcript. Only a real upward movement, or input we
+    // have already recognised as the reader's, releases the pin.
+    const previousTop = previousScrollTopRef.current;
+    previousScrollTopRef.current = el.scrollTop;
+    if (pinned) {
+      isPinnedRef.current = true;
+      setShowJump(false);
+      return;
+    }
+    if (!hasRecentUserIntent && el.scrollTop >= previousTop - 1) return;
+    isPinnedRef.current = false;
+    setShowJump(true);
   }, []);
   const handleUserScrollIntent = useCallback(() => {
     if (scrollForceRef.current) return;
@@ -2713,7 +2747,7 @@ function Chat({
             onNavigateVersion={handleNavigateVersion}
             onRequestToolDetails={loadToolDetails}
             onLoadOlder={loadOlderMessages}
-            onLayoutChange={scrollToBottom}
+            onLayoutChange={handleContentResize}
           />
           <div ref={bottomRef} />
         </div>
