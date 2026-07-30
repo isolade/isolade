@@ -27,7 +27,13 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { SIDEBAR_TABS_TRIGGER_CLASS, useResizableSidebarWidth } from "@/lib/sidebar";
+import {
+  SIDEBAR_COLUMN_INSET,
+  SIDEBAR_TABS_TRIGGER_CLASS,
+  SidebarTitleBarInset,
+  useResizableSidebarWidth,
+  type WindowDragHandlers,
+} from "@/lib/sidebar";
 import { cn } from "@/lib/utils";
 import { setProfileAppearance } from "../lib/api";
 import type { ChatModelDefinition } from "../lib/contracts";
@@ -118,10 +124,7 @@ interface SettingsPaneProps {
   // whole row. Keep that top padding smaller than the side and bottom padding
   // when adding a section, so every section still starts at the same y.
   topInset?: number;
-  topDrag?: {
-    onMouseDown: (e: React.MouseEvent) => void;
-    onDoubleClick: (e: React.MouseEvent) => void;
-  };
+  topDrag?: WindowDragHandlers;
 }
 
 // Picks a typeface for one text role. Three generic defaults are always
@@ -295,18 +298,11 @@ export default function SettingsPane({
             floating window controls, then starts its rows below them. */}
         {!sidebarCollapsed && (
           <aside className="relative flex-shrink-0 flex flex-col" style={{ width }}>
-            {topInset > 0 && (
-              // eslint-disable-next-line jsx-a11y/no-static-element-interactions
-              <div
-                className="flex-shrink-0 select-none"
-                style={{ height: topInset }}
-                {...topDrag}
-              />
-            )}
-            {/* pt-px matches the instances sidebar's New-chat row so the first
-              nav row sits just below the title bar at the same y; pl-[7px] pr-2
-              matches the chat-list insets so the rows align pixel-for-pixel. */}
-            <TabsList variant="sidebar" className="pl-[7px] pr-2 pt-px pb-2">
+            <SidebarTitleBarInset height={topInset} drag={topDrag} />
+            {/* Same spacer and same column inset as the instances sidebar, in
+              the same order, so the About row lands exactly where the New-chat
+              row it replaces was. */}
+            <TabsList variant="sidebar" className={cn(SIDEBAR_COLUMN_INSET, "pb-2")}>
               <TabsTrigger value="about" className={SIDEBAR_TABS_TRIGGER_CLASS}>
                 <Info />
                 About
@@ -397,10 +393,7 @@ export default function SettingsPane({
               a collapsed nav, when those controls float over this pane instead,
               so the blank drag row comes back to hold content out from under
               them. */}
-          {sidebarCollapsed && topInset > 0 && (
-            // eslint-disable-next-line jsx-a11y/no-static-element-interactions
-            <div className="flex-shrink-0 select-none" style={{ height: topInset }} {...topDrag} />
-          )}
+          {sidebarCollapsed && <SidebarTitleBarInset height={topInset} drag={topDrag} />}
           <TabsContent value="about" className="flex-1 min-w-0 min-h-0">
             <AboutTab />
           </TabsContent>

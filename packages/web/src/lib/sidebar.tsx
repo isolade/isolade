@@ -2,7 +2,7 @@ import { type MouseEvent as ReactMouseEvent, useCallback, useRef, useState } fro
 import { cn } from "./utils";
 
 // ---------------------------------------------------------------------------
-// Sidebar nav row look: single source of truth
+// Sidebar nav row look and column geometry: single source of truth
 //
 // The instances/chat list (InstancesSidebar) and the settings section nav
 // (SettingsPane) render the same kind of row and must look identical. The
@@ -49,6 +49,45 @@ export const SIDEBAR_TABS_TRIGGER_CLASS = cn(
   "data-[state=active]:bg-accent data-[state=active]:text-accent-foreground",
   "dark:data-[state=active]:bg-accent dark:data-[state=active]:text-accent-foreground",
 );
+
+// ---------------------------------------------------------------------------
+// Column geometry
+//
+// The row look above only makes two rows the same size; where the row sits is
+// decided by the container around it. Both surfaces stack the same two things
+// in the same order (the title-bar spacer, then a row container), so the inset
+// and the spacer live here too and neither side spells them out itself. A
+// literal copied into one file is how the settings nav ended up a pixel below
+// the New-chat row: it carried a `pt-px` its counterpart never had.
+//
+// Horizontal only, and no top padding: the first row sits flush against the
+// spacer, and vertical space between rows belongs to the rows (`space-y`/`gap`).
+// `pl-[7px]` is 1px tighter than `pr-2` so the rows' 8px text inset lands level
+// with the section headings outside the sidebar.
+export const SIDEBAR_COLUMN_INSET = "pl-[7px] pr-2";
+
+// The floating window-chrome cluster (traffic lights + sidebar toggle + gear)
+// is positioned over the sidebar's top-left corner rather than laid out in it,
+// so every column that starts under it has to reserve its row. Doubles as an OS
+// window-drag surface, which is why it takes the drag handlers.
+export interface WindowDragHandlers {
+  onMouseDown: (e: ReactMouseEvent) => void;
+  onDoubleClick: (e: ReactMouseEvent) => void;
+}
+
+export function SidebarTitleBarInset({
+  height,
+  drag,
+}: {
+  height: number;
+  drag?: WindowDragHandlers;
+}) {
+  if (height <= 0) return null;
+  return (
+    // eslint-disable-next-line jsx-a11y/no-static-element-interactions
+    <div className="flex-shrink-0 select-none" style={{ height }} {...drag} />
+  );
+}
 
 // Geometry for the left sidebar, shared so the instances list and the settings
 // pane render at the same width and resize in lockstep.

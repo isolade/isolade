@@ -21,7 +21,13 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import type { Instance } from "../../lib/contracts";
 import { formatAbsoluteTime, formatRelativeTime, useMinuteClock } from "../../lib/relative-time";
-import { sidebarRowClass, useResizableSidebarWidth } from "../../lib/sidebar";
+import {
+  SIDEBAR_COLUMN_INSET,
+  SidebarTitleBarInset,
+  sidebarRowClass,
+  useResizableSidebarWidth,
+  type WindowDragHandlers,
+} from "../../lib/sidebar";
 import SidebarResizeHandle from "../SidebarResizeHandle";
 
 interface InstancesSidebarProps {
@@ -40,10 +46,7 @@ interface InstancesSidebarProps {
   // over the sidebar's top-left corner when the sidebar is extended. The strip
   // it reserves doubles as an OS window-drag surface via `topDrag`.
   topInset?: number;
-  topDrag?: {
-    onMouseDown: (e: React.MouseEvent) => void;
-    onDoubleClick: (e: React.MouseEvent) => void;
-  };
+  topDrag?: WindowDragHandlers;
   onNew: () => void;
   onSelect: (id: string) => void;
   onRename: (id: string) => void;
@@ -280,17 +283,11 @@ export default function InstancesSidebar({
 
   return (
     <aside className="relative flex-shrink-0 flex flex-col min-h-0" style={{ width }}>
-      {/* Reserves the title-bar row that the floating window-chrome cluster
-          (traffic lights + toggle + gear) sits over at the sidebar's top-left,
-          and doubles as an OS window-drag surface. */}
-      {topInset > 0 && (
-        // eslint-disable-next-line jsx-a11y/no-static-element-interactions
-        <div className="flex-shrink-0 select-none" style={{ height: topInset }} {...topDrag} />
-      )}
-      {/* The New-chat row, on the shared sidebar-row style, with pl-[7px]
-          mirroring the list inset below so its text lines up with the chat
-          titles. */}
-      <div className="pl-[7px] pr-2 pb-0.5">
+      <SidebarTitleBarInset height={topInset} drag={topDrag} />
+      {/* The New-chat row, on the shared sidebar-row style and column inset, so
+          its text lines up with the chat titles below and with the settings
+          nav's first row, which is what it turns into. */}
+      <div className={cn(SIDEBAR_COLUMN_INSET, "pb-0.5")}>
         {/* A plain <button> on the shared row style, not a shadcn <Button>: the
             Button base leaks rounded-md (6px) and has-[>svg]:px-2.5 that don't
             match the chat rows' rounded (4px) / px-2. sidebarRowClass makes it
@@ -315,7 +312,7 @@ export default function InstancesSidebar({
           the clipped right edge. Force it to block so rows are bounded by
           the viewport width (`!` because it's an inline style). */}
       <ScrollArea className="flex-1 min-h-0 [&_[data-radix-scroll-area-viewport]>div]:block!">
-        <ul className="pl-[7px] pr-2 pb-2 space-y-0.5">
+        <ul className={cn(SIDEBAR_COLUMN_INSET, "pb-2 space-y-0.5")}>
           {/* Pinned disclosure, only present when something is pinned. Sits
               above the active list; the header toggles the pinned rows. The
               rows are live chats, so they carry the same activity treatment and
