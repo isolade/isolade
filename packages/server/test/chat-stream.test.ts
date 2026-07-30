@@ -536,6 +536,44 @@ describe("chat streaming resilience", () => {
     expect(debugTool.detailsAvailable).toBe(true);
   });
 
+  // A codex shell call as it arrives live: the command wrapped in a login
+  // shell, with codex's own parse of the script alongside it. The row a reader
+  // watches comes from this frame, so the wrapper has to be gone by here and
+  // not only on a later re-read from the projection.
+  it("streams a codex shell call summarized without its login shell", async () => {
+    const { instanceId, chatId } = await makeChat();
+    const input = {
+      type: "commandExecution",
+      id: "call_rG62uAvw52cEbvA6Ops8UOKk",
+      command: "/bin/bash -lc 'sleep 2'",
+      cwd: "/workspace",
+      status: "inProgress",
+      commandActions: [{ type: "unknown", command: "sleep 2" }],
+    };
+    backend.setScript([
+      { kind: "event", event: { type: "tool_call_start", id: "shell-tool", name: "Shell" } },
+      { kind: "event", event: { type: "tool_call_input", id: "shell-tool", input } },
+      { kind: "delta", text: "done" },
+    ]);
+
+    const response = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "Run sleep 2" }),
+      },
+    );
+    const { events } = await readAllSse(response);
+    const snapshot = JSON.parse(events.find((event) => event.event === "snapshot")!.data) as {
+      chunks: Array<{ kind: string; summary?: string; input?: unknown }>;
+    };
+    const tool = snapshot.chunks.find((chunk) => chunk.kind === "tool")!;
+    expect(tool.summary).toBe("sleep 2");
+    // The expanded row still shows what actually ran, wrapper and all.
+    expect((tool.input as { command?: string }).command).toBe("/bin/bash -lc 'sleep 2'");
+  });
+
   it("publishes usage before done when the backend does not await onEvent", async () => {
     const { instanceId, chatId } = await makeChat();
     const usage = {

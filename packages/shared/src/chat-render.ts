@@ -245,7 +245,13 @@ export function boundChatRenderChunks(chunks: ChatRenderChunk[]): ChatRenderChun
     const detailsAvailable = chunk.detailsAvailable === true || input.truncated || output.truncated;
     return {
       ...chunk,
-      summary: chunk.summary ?? summarizeChatToolInput(chunk.input),
+      // Summarize afresh rather than keeping what a stored chunk already
+      // carries. Both projections in chatMessageRenders bake the summary in at
+      // write time, so a change in how a call is summarized would otherwise
+      // never reach a message that had been rendered once, no matter how many
+      // restarts. A chunk whose input was already flattened to a truncated
+      // string has nothing left to summarize and keeps what it came with.
+      summary: summarizeChatToolInput(chunk.input) || chunk.summary || "",
       input: input.value,
       output: output.value,
       ...(detailsAvailable ? { detailsAvailable: true } : {}),

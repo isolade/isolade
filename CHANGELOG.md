@@ -84,7 +84,8 @@ _Changes landed on `main` that haven't shipped in a release yet._
 - A Codex shell call now shows the command it ran. Codex runs everything through
   a login shell, so the row used to read `/bin/bash -lc 'sleep 2'`, spending its
   first and most readable characters on a wrapper that is the same on every
-  single call.
+  single call. Calls that were already on screen are relabelled too, the next
+  time their chat is opened, rather than keeping the text they were stored with.
 - The app stays responsive with many chats open. Chats you are not looking at
   are kept alive so switching back to them is instant, but they no longer cost
   anything to keep around: opening a menu, typing in a new chat, or switching
