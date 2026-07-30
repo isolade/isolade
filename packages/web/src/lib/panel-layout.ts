@@ -96,19 +96,6 @@ export function topEdgePanelIds(node: LayoutNode, into: Set<string> = new Set())
   return into;
 }
 
-// Panels whose tab strip touches the left edge of the workspace. A column
-// split spans the full width so both children reach the left edge; a row split
-// places its second child to the right, so only the first child does.
-export function leftEdgePanelIds(node: LayoutNode, into: Set<string> = new Set()): Set<string> {
-  if (node.type === "panel") {
-    into.add(node.id);
-    return into;
-  }
-  leftEdgePanelIds(node.children[0], into);
-  if (node.direction === "column") leftEdgePanelIds(node.children[1], into);
-  return into;
-}
-
 // ---- structural edits ----
 
 // Replace the node with the given id (panel or split) by the result of `fn`.
