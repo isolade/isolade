@@ -68,7 +68,10 @@ _Changes landed on `main` that haven't shipped in a release yet._
   anything to keep around: opening a menu, typing in a new chat, or switching
   chats used to get slower with every long conversation left open, and now takes
   the same time whether one chat is open or twenty. Reading positions, drafts,
-  terminals, and browser previews are still preserved exactly as before.
+  terminals, and browser previews are still preserved exactly as before. On the
+  macOS app, where the first version of this only helped a little, opening a
+  menu over two dozen open chats went from around two seconds to a tenth of
+  one.
 - Settings sections now start at the top of the window, with no empty strip
   above them, and the About section no longer shifts as it loads.
 - The chat composer now grows when its panel gets narrower and always leaves
