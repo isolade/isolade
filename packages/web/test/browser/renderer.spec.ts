@@ -1675,6 +1675,16 @@ test.describe("message renderer browser gate", () => {
         ?.historyMappings,
     ).toBe(0);
 
+    // The composer keeps a single button through the turn: Stop while there is
+    // nothing to send, Send (which queues) as soon as a draft is typed.
+    const composer = page.getByPlaceholder("Message... (Enter to send, Shift+Enter for newline)");
+    await composer.fill("a draft typed mid-turn");
+    await expect(page.getByRole("button", { name: "Queue message" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Stop" })).toHaveCount(0);
+    await composer.fill("");
+    await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Queue message" })).toHaveCount(0);
+
     releaseTurn();
     await expect(page.getByText("Lifecycle complete")).toBeVisible();
     await expect(page.getByRole("button", { name: "Send" })).toBeVisible();

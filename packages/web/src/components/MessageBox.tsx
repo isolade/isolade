@@ -127,10 +127,11 @@ export function MessageBox({
     };
   }, []);
 
-  // While a turn is active, Send adds to the durable queue. Stop remains a
-  // separate control beside it.
+  // The bottom-right corner only ever holds one button. While a turn is active
+  // it stops the turn, unless there is something to send: then it turns into
+  // Send again, which adds the draft to the durable queue.
   const canSubmit = !disabled && (value.trim().length > 0 || !!hasAttachments);
-  const showStop = loading && !!onStop;
+  const showStop = loading && !!onStop && !canSubmit;
 
   const handleSubmit = () => {
     if (!canSubmit) return;
@@ -184,7 +185,7 @@ export function MessageBox({
         <div className="ml-auto flex items-center gap-1">
           {leftToolbar}
           {rightToolbar}
-          {showStop && (
+          {showStop ? (
             <Button
               type="button"
               size="icon"
@@ -195,18 +196,19 @@ export function MessageBox({
             >
               <Square className="size-3 fill-current" />
             </Button>
+          ) : (
+            <Button
+              type="button"
+              size="icon"
+              variant="default"
+              className="size-8 rounded-full"
+              disabled={!canSubmit}
+              onClick={handleSubmit}
+              aria-label={loading ? "Queue message" : "Send"}
+            >
+              <ArrowUp className="size-4" />
+            </Button>
           )}
-          <Button
-            type="button"
-            size="icon"
-            variant="default"
-            className="size-8 rounded-full"
-            disabled={!canSubmit}
-            onClick={handleSubmit}
-            aria-label={loading ? "Queue message" : "Send"}
-          >
-            <ArrowUp className="size-4" />
-          </Button>
         </div>
       </div>
     </div>
