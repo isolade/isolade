@@ -64,6 +64,7 @@ import {
   type DropZone,
   defaultLayout,
   findTopLeftPanelId,
+  findTopRightPanelId,
   makeChatTab,
   makeTab,
   makeTerminalTab,
@@ -75,8 +76,8 @@ import {
   topEdgePanelIds,
 } from "../../lib/panel-layout";
 import Chat from "../Chat";
+import PrBadge from "../PrBadge";
 import Terminal from "../Terminal";
-import TitleBarPrs from "../TitleBarPrs";
 import BrowserPreview from "./BrowserPreview";
 import FileTree from "./FileTree";
 import PortsPanel from "./PortsPanel";
@@ -124,6 +125,12 @@ export interface DragState {
 interface WorkspaceCtx {
   topEdge: Set<string>;
   topLeftPanelId: string;
+  // The panel that carries the attached-PR badge at the trailing end of its tab
+  // strip: exactly one, because the PRs belong to the instance rather than to a
+  // tab.
+  topRightPanelId: string;
+  prs: AttachedPr[];
+  onDetachPr: (pr: AttachedPr) => void;
   focusedPanelId: string;
   chromeInset: number;
   sidebarCollapsed: boolean;
@@ -185,9 +192,9 @@ interface PanelWorkspaceProps {
   chats: ChatT[];
   terminals: TerminalT[];
   ports: PortForward[];
-  // Pull requests attached to this instance, plus the detach handler. Rendered
-  // as a slim bar inside each chat tab's body (they have no home in the panel
-  // chrome, and shouldn't push on the layout).
+  // Pull requests attached to this instance, plus the detach handler. Collapsed
+  // into one badge at the trailing end of the top-right panel's tab strip, so
+  // they cost no vertical space and appear once for the instance.
   prs: AttachedPr[];
   onDetachPr: (pr: AttachedPr) => void;
   chatModels: ChatModelDefinition[];
@@ -411,30 +418,21 @@ export default function PanelWorkspace({
               ? pendingFirstMessage.uploadIds
               : undefined;
           return (
-            <div className="flex h-full flex-col">
-              {prs.length > 0 && (
-                <div className="flex-shrink-0 flex items-center justify-center gap-1 border-b border-border px-2 py-1">
-                  <TitleBarPrs prs={prs} onDetach={onDetachPr} />
-                </div>
-              )}
-              <div className="flex-1 min-h-0">
-                <Chat
-                  instanceId={instanceId}
-                  chatId={chat.id}
-                  model={chat.model}
-                  effort={chat.effort}
-                  chat={chat}
-                  chatModels={chatModels}
-                  modelOverrides={modelOverrides}
-                  visible={visible && active}
-                  initialMessage={initialMessage}
-                  initialUploadIds={initialUploadIds}
-                  pending={false}
-                  creationError={null}
-                  onTitle={handleTitle}
-                />
-              </div>
-            </div>
+            <Chat
+              instanceId={instanceId}
+              chatId={chat.id}
+              model={chat.model}
+              effort={chat.effort}
+              chat={chat}
+              chatModels={chatModels}
+              modelOverrides={modelOverrides}
+              visible={visible && active}
+              initialMessage={initialMessage}
+              initialUploadIds={initialUploadIds}
+              pending={false}
+              creationError={null}
+              onTitle={handleTitle}
+            />
           );
         }
         case "terminal": {
@@ -470,8 +468,6 @@ export default function PanelWorkspace({
       chats,
       terminals,
       ports,
-      prs,
-      onDetachPr,
       instanceId,
       chatModels,
       modelOverrides,
@@ -595,6 +591,7 @@ export default function PanelWorkspace({
 
   const topEdge = useMemo(() => (layout ? topEdgePanelIds(layout) : new Set<string>()), [layout]);
   const topLeftPanelId = useMemo(() => (layout ? findTopLeftPanelId(layout) : ""), [layout]);
+  const topRightPanelId = useMemo(() => (layout ? findTopRightPanelId(layout) : ""), [layout]);
   const effectiveFocusedPanelId =
     layout && focusedPanelId && containsPanel(layout, focusedPanelId)
       ? focusedPanelId
@@ -730,6 +727,9 @@ export default function PanelWorkspace({
     () => ({
       topEdge,
       topLeftPanelId,
+      topRightPanelId,
+      prs,
+      onDetachPr,
       focusedPanelId: effectiveFocusedPanelId,
       chromeInset,
       sidebarCollapsed,
@@ -745,6 +745,9 @@ export default function PanelWorkspace({
     [
       topEdge,
       topLeftPanelId,
+      topRightPanelId,
+      prs,
+      onDetachPr,
       effectiveFocusedPanelId,
       chromeInset,
       sidebarCollapsed,
@@ -1135,6 +1138,10 @@ function PanelView({ panel }: { panel: PanelNode }) {
           ))}
           <AddTabMenu panelId={panel.id} align={isTopEdge ? "start" : "end"} />
         </ScrollableTabList>
+        {/* Instance-wide status, pinned past the scrolling tabs at the strip's
+            trailing end. Only the top-right panel carries it, so it reads as
+            window chrome rather than as something belonging to these tabs. */}
+        {panel.id === ctx.topRightPanelId && <PrBadge prs={ctx.prs} onDetach={ctx.onDetachPr} />}
       </div>
 
       {/* Empty slot: the panel's active body is rendered in the keep-alive

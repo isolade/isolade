@@ -6,6 +6,7 @@ import {
   collectTabs,
   defaultLayout,
   findTopLeftPanelId,
+  findTopRightPanelId,
   makeChatTab,
   makeTab,
   moveTab,
@@ -160,6 +161,18 @@ describe("workspace edge panels", () => {
     const start = asPanel(defaultLayout(["c1", "c2"]));
     const split = asSplit(moveTab(start, start.tabs[1]!.id, start.id, "right"));
     expect(findTopLeftPanelId(split)).toBe(asPanel(split.children[0]).id);
+  });
+
+  it("takes the right child of a row split and the top child of a column split for the top-right panel", () => {
+    const start = asPanel(defaultLayout(["c1", "c2"]));
+    const rowSplit = asSplit(moveTab(start, start.tabs[1]!.id, start.id, "right"));
+    expect(findTopRightPanelId(rowSplit)).toBe(asPanel(rowSplit.children[1]).id);
+
+    const colStart = asPanel(defaultLayout(["c1", "c2"]));
+    const colSplit = asSplit(moveTab(colStart, colStart.tabs[1]!.id, colStart.id, "bottom"));
+    expect(findTopRightPanelId(colSplit)).toBe(asPanel(colSplit.children[0]).id);
+    // Always a panel on the top edge, whatever the tree looks like.
+    expect(topEdgePanelIds(colSplit).has(findTopRightPanelId(colSplit))).toBe(true);
   });
 
   it("counts both children of a row split but only the top of a column split", () => {
