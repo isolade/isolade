@@ -47,6 +47,14 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Changed
 
+- Tool calls in a chat no longer name what they did. A call reads as its icon
+  followed by the file, command, or query it was given, since "Ran" in front of
+  a shell command was a word doing no work, and the argument now has the full
+  width of the row before it truncates. The sweeping highlight moved onto that
+  argument, so a call still shows while it is in flight. Words remain where they
+  are the only thing carrying the meaning: a failed call still says so, a tool
+  with no icon of its own still shows its name, and a call with no argument to
+  show keeps a short noun instead of standing as a bare icon.
 - Each chat in the sidebar now shows when it last did something ("just now",
   "46m ago", a date for older chats) under its title, next to the unpushed diff
   counts, which moved off the title line. Both read in a small, quiet type so a
