@@ -25,6 +25,9 @@ _Changes landed on `main` that haven't shipped in a release yet._
 - The thinking indicator no longer pulses and sways while an agent thinks. Its
   icon now sits still like every other icon in the chat, and the sweeping
   highlight on the "Thinking" label still marks the turn as active.
+- While an agent is working, the composer has one button instead of two. With an
+  empty composer it is the stop button, which interrupts the turn. As soon as
+  you type something it becomes the send button, which queues the message.
 
 ### Fixed
 
