@@ -181,6 +181,7 @@ export function installWorkspaceApiMock(options: WorkspaceFixtureOptions): Works
       model: "claude-sonnet-5",
       provider: "anthropic" as const,
       effort: "high" as const,
+      fastMode: false,
       claudeSessionId: null,
       codexThreadId: null,
       inputTokens: null,

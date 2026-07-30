@@ -517,6 +517,7 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
       model: modelId,
       provider: modelDef?.provider ?? "anthropic",
       effort,
+      fastMode: false,
       claudeSessionId: null,
       codexThreadId: null,
       inputTokens: null,

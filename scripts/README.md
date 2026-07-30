@@ -16,7 +16,7 @@ other scripts call or `source` — you don't invoke those directly.
 | `build.sh` | `build` | Production build: typecheck → compile the sidecar → assemble the msb runtime → `tauri build` (+ macOS signing). |
 | `bootstrap-microsandbox.sh` | `bootstrap:microsandbox` | Build & assemble the pinned microsandbox runtime into `app/binaries/msb-runtime`. Run once after cloning. |
 | `seed-usage.ts` | `seed-usage` | Fill the DB with a year of fake usage so the Usage page has something to show. |
-| `refresh-catalog.ts` | `refresh-catalog` | Regenerate the static model catalog from [models.dev](https://models.dev): the Claude half (name, context, effort menu, pricing for the `ANTHROPIC_ALLOWLIST` ids) and the Codex half (model list from `codex app-server`, pricing from models.dev). Pass `anthropic` or `codex` to do one half; `--check` reports drift and exits non-zero. The Codex half needs `codex` installed + network; the Claude half needs network only. |
+| `refresh-catalog.ts` | `refresh-catalog` | Regenerate the static model catalog from [models.dev](https://models.dev): name, effort menu, pricing (plus context window and fast-mode rates for Claude) for every id in `ANTHROPIC_ALLOWLIST` / `OPENAI_ALLOWLIST`. Pass `anthropic` or `codex` to do one half; `--check` reports drift and exits non-zero. Needs network only. |
 | `ci-macos.sh` / `ci-linux.sh` | — | Full release pipeline for one OS (build → package a tarball / `.deb`). Run by CI and locally. |
 | `prepare-release.py` | — | Open a `release/vX.Y.Z` PR: branch, bump the version, rotate the changelog, commit, push. |
 | `check-release-metadata.sh` | — | CI gate: verify the release branch, `tauri.conf.json`, and `CHANGELOG.md` agree; emit the release notes. |

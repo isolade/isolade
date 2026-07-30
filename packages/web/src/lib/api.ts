@@ -6,12 +6,14 @@ import {
   authStatusSchema,
   type Chat,
   type ChatBranchSwitch,
+  type ChatCostBreakdown,
   type ChatModelsResponse,
   type ContextBreakdown,
   type CreateChatBody,
   type CreateInstanceBody,
   chatArraySchema,
   chatBranchSwitchSchema,
+  chatCostBreakdownSchema,
   chatModelsResponseSchema,
   chatRenderBatchSchema,
   chatSchema,
@@ -1112,6 +1114,16 @@ export async function getInFlightChatRender(
       { signal },
     ),
     inFlightChatRenderSchema,
+  );
+}
+
+export async function getChatCostBreakdown(
+  instanceId: string,
+  chatId: string,
+): Promise<ChatCostBreakdown> {
+  return parseResponse(
+    await apiFetch(`${API_BASE}/api/instances/${instanceId}/chats/${chatId}/cost`),
+    chatCostBreakdownSchema,
   );
 }
 

@@ -226,7 +226,7 @@ export const subscriptionShareSchema = z.object({
 export const pendingSwitchSchema = z.object({
   // Where the chat is switching FROM: the provider/model recorded when the
   // switch was selected. Lets the composer and the transcript divider label the
-  // switch ("from Opus 4.8 to GPT-5.6-Sol") before the target turn commits.
+  // switch ("from Opus 4.8 to GPT-5.6 Sol") before the target turn commits.
   sourceProvider: chatProviderSchema,
   sourceModel: z.string(),
   targetProvider: chatProviderSchema,
@@ -244,6 +244,9 @@ export const chatSchema = z.object({
   model: z.string(),
   provider: chatProviderSchema,
   effort: chatEffortSchema,
+  // Whether this chat runs in the provider's fast mode: faster, and billed at a
+  // premium rate (2× list on Opus 5, 6× on Opus 4.6). Off by default.
+  fastMode: z.boolean(),
   claudeSessionId: z.string().nullable(),
   codexThreadId: z.string().nullable(),
   // Cumulative per-chat totals, populated by the server after every turn.
@@ -254,6 +257,9 @@ export const chatSchema = z.object({
   cacheCreationInputTokens: z.number().int().nonnegative().nullable(),
   outputTokens: z.number().int().nonnegative().nullable(),
   reasoningOutputTokens: z.number().int().nonnegative().nullable(),
+  // What the chat has cost, across every agent it has run on. Unlike the token
+  // counts above it is not scoped to the active native session, so a switch does
+  // not restart it. Null until the first usage event that carries a cost.
   costUsd: z.number().nonnegative().nullable(),
   // Most recent turn's breakdown. Null on chats that have never streamed a
   // usage event. Used to rebuild the context-pressure bar after a reload.
@@ -282,6 +288,45 @@ export const chatSchema = z.object({
   createdAt: dateLikeSchema,
 });
 export const chatArraySchema = z.array(chatSchema);
+
+// Where one chat's money went, from the usage log (see
+// ChatManager.getChatCostBreakdown). `billed` is authoritative and the buckets
+// are a list-price split of it, with whatever the split cannot explain left in
+// `unattributed` rather than smeared across them. Buckets with no tokens are
+// omitted, so a chat on a model with no cache pricing simply has fewer rows.
+export const chatCostBucketSchema = z.object({
+  bucket: z.enum([
+    "input",
+    "cachedInput",
+    "cacheWrite",
+    "cacheWrite1h",
+    "output",
+    "reasoningOutput",
+  ]),
+  tokens: z.number().int().nonnegative(),
+  costUsd: z.number().nonnegative(),
+});
+export const chatCostBreakdownSchema = z.object({
+  billed: z.number().nonnegative(),
+  buckets: z.array(chatCostBucketSchema),
+  // Each model the chat has spent money on, most expensive first. More than one
+  // without any agent switch is normal: the CLI bills its own auxiliary calls
+  // (summarizing a tool result, naming a session) to a smaller model.
+  models: z.array(
+    z.object({
+      model: z.string(),
+      provider: chatProviderSchema,
+      costUsd: z.number(),
+    }),
+  ),
+  // Server-side searches across the chat, billed per request rather than per
+  // token, so they are part of what the buckets cannot explain.
+  webSearchRequests: z.number().int().nonnegative(),
+  // Can be negative when list prices overstate what was actually billed.
+  unattributed: z.number(),
+});
+export type ChatCostBucket = z.infer<typeof chatCostBucketSchema>;
+export type ChatCostBreakdown = z.infer<typeof chatCostBreakdownSchema>;
 
 // Structured snapshot of Claude's `get_context_usage` control response.
 // Codex has no equivalent. `available: false` for codex chats and for Claude
@@ -449,6 +494,11 @@ export const chatModelSchema = z.object({
   // skip the API-$ chip. subscription-share falls back to treating all
   // tokens equally.
   pricing: modelPricingSchema.optional(),
+  // The same buckets at the provider's fast-mode rates, where it offers one
+  // (models.dev publishes these under `experimental.modes.fast`). Its presence
+  // is what makes the fast toggle available for a model, and it is what a
+  // fast-mode turn is costed at. Absent for models with no fast mode.
+  fastPricing: modelPricingSchema.optional(),
 });
 export const chatModelArraySchema = z.array(chatModelSchema);
 

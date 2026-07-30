@@ -8,7 +8,15 @@ import {
 } from "../contracts";
 import { KeyedQueue } from "../keyed-queue";
 import type { SandboxApi } from "../sandbox-client";
-import type { ChatBackend, ChatEvent, TokenUsage, TurnMeta } from "./backend";
+import {
+  type ChatBackend,
+  type ChatEvent,
+  emptyUsage,
+  type ModelBilling,
+  type TokenUsage,
+  type TurnMeta,
+  usageTokenCount,
+} from "./backend";
 import { type CodexConnection, CodexManager } from "./codex-manager";
 import { buildTitlePrompt, CODEX_TITLE_MODEL, cleanTitle } from "./title-generator";
 
@@ -16,6 +24,19 @@ import { buildTitlePrompt, CODEX_TITLE_MODEL, cleanTitle } from "./title-generat
 // fall back to a truncated title. Mirrors the claude title timeout.
 const CODEX_TITLE_TIMEOUT_MS = 20_000;
 const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60_000;
+// What codex calls fast mode on the wire: OpenAI's priority service tier
+// (ServiceTier::Fast serializes to this in a turn's request body).
+const FAST_SERVICE_TIER = "priority";
+
+// The slice of a `model/list` entry that says whether fast mode is on offer.
+// `additionalSpeedTiers` is codex's deprecated spelling of the same thing, still
+// populated, so both are consulted.
+interface CodexModelListEntry {
+  id?: string;
+  model?: string;
+  serviceTiers?: { id: string }[];
+  additionalSpeedTiers?: string[];
+}
 
 export class CodexBackend implements ChatBackend {
   private manager: CodexManager;
@@ -33,6 +54,10 @@ export class CodexBackend implements ChatBackend {
   // resets to "nothing loaded" and forces a resume. WeakMap so a dropped
   // connection's entry is collected with it.
   private threadLiveness = new WeakMap<CodexConnection, Map<string, Promise<void>>>();
+  // Per-connection `model/list` probe: which model ids this account may run on
+  // the fast service tier (null if the list couldn't be read). Only ever used to
+  // warn — see warnIfFastTierUnavailable.
+  private fastTierModels = new WeakMap<CodexConnection, Promise<Set<string> | null>>();
   private activeTurns = new Map<
     string,
     {
@@ -148,12 +173,55 @@ export class CodexBackend implements ChatBackend {
     return map;
   }
 
+  // Warn when a fast turn asks for a tier this account doesn't have. codex
+  // silently drops a service tier the model's catalog entry doesn't list
+  // (ModelInfo::service_tier_for_request) and nothing in the app-server protocol
+  // echoes the tier a turn actually ran at, so such a turn runs standard while
+  // the breakdown prices it as priority. The account's own `model/list` is the
+  // only thing that can tell, so consult it — for the log only, never to refuse
+  // the turn: probed once per connection, and a failed probe stays quiet.
+  private warnIfFastTierUnavailable(conn: CodexConnection, model: string): void {
+    let probe = this.fastTierModels.get(conn);
+    if (!probe) {
+      probe = conn
+        .send("model/list", {})
+        .then((res) => {
+          const data = (res as { data?: unknown } | null)?.data;
+          const ids = new Set<string>();
+          if (!Array.isArray(data)) return ids;
+          for (const entry of data as CodexModelListEntry[]) {
+            const tiers = entry.serviceTiers?.map((t) => t.id) ?? [];
+            const supportsFast =
+              tiers.includes(FAST_SERVICE_TIER) ||
+              (entry.additionalSpeedTiers?.includes("fast") ?? false);
+            if (!supportsFast) continue;
+            // Match either identifier: our catalog ids are model slugs, but a
+            // preset id is what `model/list` keys on for some entries, and
+            // turn/start accepts both.
+            for (const id of [entry.id, entry.model]) if (id) ids.add(id);
+          }
+          return ids;
+        })
+        .catch(() => null);
+      this.fastTierModels.set(conn, probe);
+    }
+    void probe.then((ids) => {
+      if (!ids || ids.has(model)) return;
+      console.warn(
+        `[codex] fast mode requested for ${model}, but this account's model list does not offer the ` +
+          `${FAST_SERVICE_TIER} service tier; the turn will run at standard speed and its cost will be overstated`,
+      );
+    });
+  }
+
   async sendMessage(opts: {
     vmId: string;
     chatId: string;
     message: string;
     model: string;
     effort: ChatEffort;
+    // Run this turn on the fast (priority) service tier, at its premium rates.
+    fast?: boolean;
     sessionId?: string; // codexThreadId
     userMessageId?: string;
     fork?: { anchorId: string }; // anchorId = the turn id to fork through
@@ -161,6 +229,7 @@ export class CodexBackend implements ChatBackend {
     onDelta: (text: string) => void;
     onEvent?: (event: ChatEvent) => void;
     onMeta?: (meta: TurnMeta) => void;
+    onBilling?: (models: ModelBilling[]) => void;
     onUserMessageAcknowledged?: () => void;
   }): Promise<{ content: string; sessionId?: string }> {
     const conn = await this.manager.getOrCreate(opts.vmId);
@@ -508,9 +577,16 @@ export class CodexBackend implements ChatBackend {
       // throughout a turn with pre-aggregated `last` (this turn) and `total`
       // (entire thread) plus `modelContextWindow`, strictly more info than
       // Claude gives us. Codex doesn't include a dollar cost the way Claude
-      // does, so we compute API-$ from the running token total × the
-      // model's catalog pricing (when known).
-      const pricing = codexPricingFor(opts.model);
+      // does, so we derive API-$ from the catalog pricing (when known) — at the
+      // priority-tier card for a fast turn, since that is the tier requested
+      // below.
+      const pricing = codexPricingFor(opts.model, opts.fast);
+      // The turn's own usage, restated by each update rather than accumulated.
+      // Unlike Claude, codex tells us where a turn stands while it is running,
+      // which is what lets the composer's figure climb during a turn: each
+      // update carries the turn's price so far as a provisional number, and the
+      // settled bill below is that same figure once the turn stops moving.
+      let turnUsage = emptyUsage();
       const offUsage = conn.on("thread/tokenUsage/updated", (params) => {
         if (!belongsToTurn(params)) return;
         const ev = params as {
@@ -527,15 +603,44 @@ export class CodexBackend implements ChatBackend {
           typeof ev.tokenUsage.modelContextWindow === "number"
             ? ev.tokenUsage.modelContextWindow
             : undefined;
-        const costUsd = pricing ? computeApiCost(total, pricing) : undefined;
+        turnUsage = last;
         opts.onEvent?.({
           type: "usage",
           last,
           total,
           modelContextWindow: win,
-          costUsd,
+          ...(pricing ? { turnCostUsd: computeApiCost(last, pricing) } : {}),
         });
       });
+
+      // What the turn ends up billing. Codex publishes no dollar figure of its
+      // own, so this is the catalog price of the tokens it reported, which makes
+      // the settled bill exactly the provisional one the composer was already
+      // showing.
+      //
+      // Reported for however far the turn got, not only for one that finished:
+      // OpenAI charges for the tokens it produced before a Stop or a rate-limit
+      // failure just as it does for a clean turn, so those have to land in the
+      // log too. Driven from `cleanup` (the one funnel every terminal path goes
+      // through) and guarded, because a turn can reach cleanup twice — an abort
+      // rejects, and the turn-start rejection that follows rejects again.
+      let reportedBilling = false;
+      const reportBilling = () => {
+        if (reportedBilling) return;
+        reportedBilling = true;
+        if (usageTokenCount(turnUsage) === 0) return;
+        opts.onBilling?.([
+          {
+            model: opts.model,
+            usage: turnUsage,
+            // Codex reports no cache writes at all, so there is no TTL to split.
+            cacheWrite1hTokens: 0,
+            fast: opts.fast === true,
+            webSearchRequests: 0,
+            costUsd: pricing ? computeApiCost(turnUsage, pricing) : 0,
+          },
+        ]);
+      };
 
       // Codex fires this when it auto-compacts the thread because the
       // context window is full. The UI flags the next gauge update as a
@@ -574,6 +679,11 @@ export class CodexBackend implements ChatBackend {
       });
 
       const cleanup = () => {
+        // Bill first: this is the last moment the turn's reported usage is in
+        // hand, and it is owed whether the turn completed, failed, or was
+        // interrupted. Never reached by a retryable stream error, which does not
+        // clean up because codex is about to replay the request.
+        reportBilling();
         offDelta();
         offCompleted();
         offFailed();
@@ -642,6 +752,7 @@ export class CodexBackend implements ChatBackend {
       // `nearest_effort`. Our chat efforts are always drawn from the model's
       // curated menu (see shared/catalog.ts), and codex clamps anything it
       // doesn't support, so pass the chat's effort straight through.
+      if (opts.fast) this.warnIfFastTierUnavailable(conn, opts.model);
       turnStartPromise = conn.send("turn/start", {
         threadId,
         clientUserMessageId: userMessageId,
@@ -653,14 +764,15 @@ export class CodexBackend implements ChatBackend {
         summary: "detailed",
         // (The turn id this resolves to is reported through onMeta below: it
         // is the anchor a future edit forks this thread at.)
-        // Pin the standard ("default") service tier per turn rather than via
-        // a launch-time `-c service_tier=...` flag. `serviceTier` is a
-        // first-class turn param (it sits next to `effort` in the v2
-        // turn-start struct), so this is exactly the path a future UI "fast
-        // mode" toggle would use to send "priority" for a given chat, with no
-        // app-server restart needed. It also guarantees a workspace image's
-        // baked config.toml can't silently push turns onto a premium tier.
-        serviceTier: "default",
+        // The service tier, per turn rather than via a launch-time
+        // `-c service_tier=...` flag: fast mode is a per-chat setting, and
+        // `serviceTier` is a first-class turn param (it sits next to `effort` in
+        // the v2 turn-start struct), so a chat can change it between turns with
+        // no app-server restart. "priority" is what codex's ServiceTier::Fast
+        // sends; naming the standard tier explicitly rather than omitting the
+        // field also stops a workspace image's baked config.toml from silently
+        // pushing turns onto a premium tier.
+        serviceTier: opts.fast ? FAST_SERVICE_TIER : "default",
         effort: opts.effort,
       }) as Promise<{ turn: { id: string } }>;
       this.activeTurns.set(opts.chatId, {
@@ -1003,7 +1115,10 @@ function parseCodexUsage(u: Record<string, unknown> | undefined): TokenUsage {
     cacheCreationInputTokens: 0,
     outputTokens: Math.max(0, rawOutput - reasoning),
     reasoningOutputTokens: reasoning,
-    totalTokens: num(u?.totalTokens),
+    // The sum of our disjoint buckets rather than codex's own `totalTokens`,
+    // which counts the nested subsets it reports and so double-counts against
+    // the shape TokenUsage documents.
+    totalTokens: rawInput + Math.max(0, rawOutput - reasoning) + reasoning,
   };
 }
 

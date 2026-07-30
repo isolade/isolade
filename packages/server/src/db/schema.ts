@@ -188,6 +188,11 @@ export const chats = sqliteTable("chats", {
   // Reasoning effort level for this chat. Server resolves to the model's
   // declared default when null (older rows pre-migration) or unsupported.
   effort: text("effort"),
+  // Whether this chat runs its model in the provider's fast mode, which trades
+  // a premium rate for speed (2× list on Opus 5, 6× on Opus 4.6). Off unless
+  // the user turns it on, per chat rather than per VM, because it is applied
+  // through the CLI's in-memory flag settings rather than any settings file.
+  fastMode: integer("fast_mode", { mode: "boolean" }).notNull().default(false),
   claudeSessionId: text("claude_session_id"),
   codexThreadId: text("codex_thread_id"),
   // Cumulative token counts across all turns in this chat. Updated at the
@@ -214,9 +219,12 @@ export const chats = sqliteTable("chats", {
   // has been auto-compacted at least once. Cleared when the model/provider
   // changes (alongside the session ids).
   compacted: integer("compacted", { mode: "boolean" }),
-  // Cumulative API-equivalent dollar cost. For Claude this is the authoritative
-  // total_cost_usd reported by the CLI. For codex we derive it from the
-  // catalog pricing × token totals.
+  // What the chat has cost in API-equivalent dollars, across every agent it has
+  // run on. Unlike every column above it this is NOT scoped to the active native
+  // session: usage events report what they add to the bill (Claude's per-turn
+  // total_cost_usd, or catalog pricing × tokens for codex) and this sums them, so
+  // it survives a switch retiring a session and a restart losing a process, and
+  // only ever grows. Null until the first usage event that carries a cost.
   costUsd: real("cost_usd"),
   // Tip of the active branch: the id of the chat_messages row the UI's
   // visible thread currently ends at. Messages form a tree (see
@@ -422,6 +430,12 @@ export const usageEvents = sqliteTable(
   {
     id: text("id").primaryKey(),
     profileId: text("profile_id").notNull(),
+    /** The chat this event belongs to. Not a foreign key: the log outlives the
+        chats it describes, so this is a label, and rows written before it
+        existed carry null. Lets a single chat's spend be broken down by bucket
+        and by the model each part was billed at, which the per-chat columns
+        cannot do (they keep one running total, no history). */
+    chatId: text("chat_id"),
     provider: text("provider", { enum: ["anthropic", "openai"] }).notNull(),
     /** The model in effect for this event (the turn's model, or the chat's model
         at creation). Kept so per-model-over-time views are a query away. */
@@ -434,8 +448,20 @@ export const usageEvents = sqliteTable(
     cacheCreationInputTokens: integer("cache_creation_input_tokens").notNull().default(0),
     outputTokens: integer("output_tokens").notNull().default(0),
     reasoningOutputTokens: integer("reasoning_output_tokens").notNull().default(0),
-    // API-equivalent dollar cost for this event (Claude: authoritative delta.
-    // Codex: derived from catalog pricing × tokens).
+    // Whether this turn was billed at the model's fast-mode rates, which are a
+    // multiple of list. Recorded per row because the mode is per turn.
+    fast: integer("fast", { mode: "boolean" }).notNull().default(false),
+    // How many of `cacheCreationInputTokens` were written with a one-hour TTL,
+    // which Anthropic bills at twice the input rate instead of 1.25×. A subset of
+    // that column, not an addition to it. Zero when the provider reported no
+    // split, which means five-minute entries.
+    cacheWrite1hTokens: integer("cache_write_1h_tokens").notNull().default(0),
+    // Server-side searches the provider ran for this turn and bills per request
+    // rather than per token. Recorded so a cost breakdown can point at spend
+    // that no token bucket explains. Anthropic reports these; codex does not.
+    webSearchRequests: integer("web_search_requests").notNull().default(0),
+    // API-equivalent dollar cost for this turn's share of the model's work
+    // (Claude: the provider's own figure. Codex: catalog pricing × tokens).
     costUsd: real("cost_usd").notNull().default(0),
     // Pricing-weighted input-equivalent for this turn, at the model in effect
     // for it. Persisted (not recomputed) so it stays correct if catalog pricing
@@ -451,6 +477,8 @@ export const usageEvents = sqliteTable(
     // Serves the per-profile scans (lifetime + history) and future
     // (profile, provider, time-range) rolling-window queries.
     lookup: index("idx_usage_events_lookup").on(t.profileId, t.provider, t.createdAt),
+    // Serves one chat's cost breakdown (see ChatManager.getChatCostBreakdown).
+    chat: index("idx_usage_events_chat").on(t.chatId),
   }),
 );
 

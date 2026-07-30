@@ -549,7 +549,7 @@ describe("chat streaming resilience", () => {
     backend.setScript([
       {
         kind: "event",
-        event: { type: "usage", last: usage, total: usage, costUsd: 0.01 },
+        event: { type: "usage", last: usage, total: usage },
       },
       { kind: "delta", text: "answer" },
     ]);
@@ -578,7 +578,6 @@ describe("chat streaming resilience", () => {
       inputTokens: usage.inputTokens,
       cachedInputTokens: usage.cachedInputTokens,
       outputTokens: usage.outputTokens,
-      costUsd: 0.01,
     });
   });
 

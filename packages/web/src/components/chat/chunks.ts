@@ -20,6 +20,9 @@ export interface UsageState {
   last: TokenUsage;
   total: TokenUsage;
   modelContextWindow?: number;
+  // What the chat has cost, across every agent it has run on. The one figure in
+  // here that is not scoped to the live session, and so the one that outlives an
+  // agent switch.
   costUsd?: number;
   subscriptionShare?: SubscriptionShare;
   compacted?: boolean;

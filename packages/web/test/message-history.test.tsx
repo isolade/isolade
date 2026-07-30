@@ -433,7 +433,7 @@ describe("MessageHistory", () => {
     );
 
     // The label uses catalog model names, with no provider prefix.
-    expect(html).toContain("Switched from Opus 4.8 to GPT-5.6-Sol");
+    expect(html).toContain("Switched from Opus 4.8 to GPT-5.6 Sol");
     // The divider renders ABOVE the user message that triggered the switch, and
     // it is not duplicated inside the assistant bubble.
     const dividerAt = html.indexOf("provider-switch-divider");
@@ -485,7 +485,7 @@ describe("MessageHistory", () => {
       />,
     );
 
-    expect(html).toContain("Switched from Opus 4.8 to GPT-5.6-Sol");
+    expect(html).toContain("Switched from Opus 4.8 to GPT-5.6 Sol");
     const dividerAt = html.indexOf("provider-switch-divider");
     const userAt = html.indexOf('data-message-id="optimistic-user"');
     expect(dividerAt).toBeGreaterThanOrEqual(0);

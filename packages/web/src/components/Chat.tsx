@@ -15,6 +15,7 @@ import {
   dispatchQueuedChatMessage,
   enqueueChatMessage,
   getChatContextBreakdown,
+  getChatCostBreakdown,
   getChatToolDetails,
   getInFlightChatRender,
   listChatRenderChunks,
@@ -78,7 +79,7 @@ import {
   type SessionMessageRow,
 } from "./chat/MessageHistory";
 import { QueuedMessages, reconcileQueuedMessageSnapshot } from "./chat/QueuedMessages";
-import { ContextBar, ContextBreakdownDetail, ContextDetail } from "./chat/UsagePanel";
+import { ChatCost, ContextBar, ContextBreakdownDetail, ContextDetail } from "./chat/UsagePanel";
 import { MessageBox } from "./MessageBox";
 import { ModelEffortPicker } from "./ModelEffortPicker";
 
@@ -243,6 +244,9 @@ function Chat({
   const hydratedRef = useRef(false);
   const [currentModel, setCurrentModel] = useState(model);
   const [currentEffort, setCurrentEffort] = useState<ChatEffort>(effort);
+  // Mirrors the persisted chat row. Applied to the live process before the next
+  // turn, so a turn already running finishes at the rate it started on.
+  const [fastMode, setFastMode] = useState(chat.fastMode);
   // A selected-but-not-yet-activated cross-provider switch. While set, the
   // picker shows the target model and the composer notes that the next message
   // transfers the conversation. The server activates it on the next send and
@@ -273,12 +277,13 @@ function Chat({
   useEffect(() => {
     if (!streaming) setActiveSwitch(null);
   }, [streaming]);
-  // Server-synced (model, effort) pair. The picker stays interactive while a
-  // turn is streaming. In that case we update the displayed values locally
-  // and defer the PATCH until the user sends the next message. See
-  // `sendMessage` for the flush.
+  // Server-synced (model, effort, fastMode) triple. The picker stays
+  // interactive while a turn is streaming. In that case we update the displayed
+  // values locally and defer the PATCH until the user sends the next message.
+  // See `sendMessage` for the flush.
   const appliedModelRef = useRef(model);
   const appliedEffortRef = useRef<ChatEffort>(effort);
+  const appliedFastModeRef = useRef(chat.fastMode);
   // Tracks the in-flight turn so the Stop button (and unmount) can abort the
   // SSE fetch. Stop also sends an explicit cancellation request. A plain
   // disconnect leaves the server turn running during its reconnect grace.
@@ -299,6 +304,12 @@ function Chat({
   // turn and cleared when switching chats. Model and effort changes keep the
   // live Claude process and its accumulated usage.
   const [usage, setUsage] = useState<UsageState | null>(() => usageSeedFromChat(chat));
+  // What the chat has cost, for the composer's ticker. The live figure rides
+  // along with each usage event; the persisted row covers the gap before this
+  // session has reported a cost of its own, which is also the case right after
+  // an agent switch, where the seed above is empty but the chat has already
+  // spent money.
+  const chatCostUsd = usage?.costUsd ?? chat.costUsd ?? undefined;
   // Live context breakdown requested from the persistent Claude process when
   // the model picker opens. Refreshed on every open so the table reflects the
   // current session state.
@@ -484,6 +495,13 @@ function Chat({
       if (debugReplayRef.current === capture) debugReplayRef.current = null;
     };
   }, [chatId, instanceId, showDebug]);
+
+  // Read when the composer's cost card opens. Its own component owns the
+  // request state, so this stays a plain fetch.
+  const loadCostBreakdown = useCallback(
+    () => getChatCostBreakdown(instanceId, chatId),
+    [instanceId, chatId],
+  );
 
   const refreshBreakdown = useCallback(() => {
     setBreakdownLoading(true);
@@ -1047,6 +1065,11 @@ function Chat({
         return null;
       });
       if (updated) {
+        // Fast mode is read back rather than assumed: the server drops the
+        // opt-in when the newly selected model has no fast rate card, and the
+        // picker must not go on showing a premium the chat is not paying.
+        appliedFastModeRef.current = updated.fastMode;
+        setFastMode(updated.fastMode);
         if (updated.pendingSwitch) {
           // A cross-provider selection: the chat still runs its current
           // provider until the next send activates the switch. Reflect the
@@ -1073,6 +1096,21 @@ function Chat({
     [instanceId, chatId],
   );
 
+  // Flush every picker edit the user made while the previous turn was still
+  // streaming, as one PATCH, just before the next turn kicks off. Every send
+  // path funnels through here so no field can be left behind on one of them:
+  // fast mode was, which left the picker claiming a premium rate the chat had
+  // never been switched to.
+  const flushPickerChanges = useCallback(async () => {
+    const body: UpdateChatBody = {};
+    if (currentModel !== appliedModelRef.current) body.model = currentModel;
+    if (currentEffort !== appliedEffortRef.current) body.effort = currentEffort;
+    if (fastMode !== appliedFastModeRef.current) body.fastMode = fastMode;
+    // The PATCH rejects a body that asks for nothing, and nothing drifted.
+    if (Object.keys(body).length === 0) return;
+    await applyModelChange(body);
+  }, [currentModel, currentEffort, fastMode, applyModelChange]);
+
   const handleModelChange = useCallback(
     (newModel: string) => {
       setCurrentModel(newModel);
@@ -1096,6 +1134,17 @@ function Chat({
       if (!streaming) void applyModelChange({ effort: next });
     },
     [streaming, isFreshChat, applyModelChange],
+  );
+
+  // Fast mode is a per-chat billing choice, so it is never remembered as a
+  // default for the next chat the way model and effort are: opting into a
+  // premium rate should be a decision each time, not a setting that follows you.
+  const handleFastModeChange = useCallback(
+    (next: boolean) => {
+      setFastMode(next);
+      if (!streaming) void applyModelChange({ fastMode: next });
+    },
+    [streaming, applyModelChange],
   );
 
   // Drives one streaming turn from `runChatTurn` (or `resumeChatTurn`).
@@ -1311,7 +1360,10 @@ function Chat({
             last: usagePayload.last,
             total: usagePayload.total,
             modelContextWindow: usagePayload.modelContextWindow,
-            costUsd: usagePayload.costUsd,
+            // Carried forward like `compacted`: an event only carries the cost
+            // once the chat has one, and the composer's total must never tick
+            // backwards while a fresh session warms up.
+            costUsd: usagePayload.costUsd ?? prev?.costUsd,
             subscriptionShare: usagePayload.subscriptionShare,
             compacted: prev?.compacted,
           }));
@@ -1719,15 +1771,7 @@ function Chat({
       if (navigatingBranchRef.current && !force) return;
 
       if (streaming && !force) {
-        if (
-          currentModel !== appliedModelRef.current ||
-          currentEffort !== appliedEffortRef.current
-        ) {
-          const body: UpdateChatBody = {};
-          if (currentModel !== appliedModelRef.current) body.model = currentModel;
-          if (currentEffort !== appliedEffortRef.current) body.effort = currentEffort;
-          await applyModelChange(body);
-        }
+        await flushPickerChanges();
         const id = crypto.randomUUID();
         const now = new Date();
         const optimistic: QueuedMessage = {
@@ -1787,15 +1831,7 @@ function Chat({
       setStreaming(true);
       liveLastSeqRef.current = -1;
 
-      // Flush any model/effort change the user made while the previous turn
-      // was still streaming. Picker edits are local-only mid-turn and apply
-      // here, just before the new turn kicks off.
-      if (currentModel !== appliedModelRef.current || currentEffort !== appliedEffortRef.current) {
-        const body: UpdateChatBody = {};
-        if (currentModel !== appliedModelRef.current) body.model = currentModel;
-        if (currentEffort !== appliedEffortRef.current) body.effort = currentEffort;
-        await applyModelChange(body);
-      }
+      await flushPickerChanges();
 
       // Optimistic user bubble at the tip of the visible branch. The server's
       // `user_message` frame swaps in the real row (id + parent) once the
@@ -1887,9 +1923,7 @@ function Chat({
       messages,
       pinNextCommitToBottom,
       setActiveLeaf,
-      currentModel,
-      currentEffort,
-      applyModelChange,
+      flushPickerChanges,
       drainTurn,
       invalidateTranscriptRequests,
     ],
@@ -2079,12 +2113,7 @@ function Chat({
       liveLastSeqRef.current = -1;
       turnUserIdRef.current = null;
 
-      if (currentModel !== appliedModelRef.current || currentEffort !== appliedEffortRef.current) {
-        const body: UpdateChatBody = {};
-        if (currentModel !== appliedModelRef.current) body.model = currentModel;
-        if (currentEffort !== appliedEffortRef.current) body.effort = currentEffort;
-        await applyModelChange(body);
-      }
+      await flushPickerChanges();
 
       const replacementId = crypto.randomUUID();
       const prefix = sourceChunks.slice(0, chunkIndex);
@@ -2181,10 +2210,8 @@ function Chat({
       }
     },
     [
-      applyModelChange,
+      flushPickerChanges,
       chatId,
-      currentEffort,
-      currentModel,
       detachActiveDrain,
       drainTurn,
       instanceId,
@@ -2278,16 +2305,8 @@ function Chat({
 
       let replacementStarted = false;
       try {
-        // Same deferred model/effort flush as a normal send.
-        if (
-          currentModel !== appliedModelRef.current ||
-          currentEffort !== appliedEffortRef.current
-        ) {
-          const body: UpdateChatBody = {};
-          if (currentModel !== appliedModelRef.current) body.model = currentModel;
-          if (currentEffort !== appliedEffortRef.current) body.effort = currentEffort;
-          await applyModelChange(body);
-        }
+        // Same deferred picker flush as a normal send.
+        await flushPickerChanges();
 
         const ac = new AbortController();
         abortRef.current = ac;
@@ -2326,9 +2345,7 @@ function Chat({
       chatId,
       pinNextCommitToBottom,
       setActiveLeaf,
-      currentModel,
-      currentEffort,
-      applyModelChange,
+      flushPickerChanges,
       detachActiveDrain,
       invalidateTranscriptRequests,
       resetChunkCache,
@@ -2778,7 +2795,8 @@ function Chat({
             attachments={
               <AttachmentStrip items={attachments.items} onRemove={attachments.remove} />
             }
-            leftToolbar={
+            status={<ChatCost costUsd={chatCostUsd} loadBreakdown={loadCostBreakdown} />}
+            modelPicker={
               <ModelEffortPicker
                 models={pickerModels}
                 overrides={modelOverrides}
@@ -2786,6 +2804,8 @@ function Chat({
                 currentEffort={currentEffort}
                 onModelChange={handleModelChange}
                 onEffortChange={handleEffortChange}
+                fastMode={fastMode}
+                onFastModeChange={handleFastModeChange}
                 prepend={
                   <div className="px-2 pt-2 pb-1.5 space-y-2">
                     {usage && (

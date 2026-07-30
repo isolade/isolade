@@ -54,7 +54,10 @@ type ControlRequest =
   | { subtype: "set_model"; model?: string }
   | {
       subtype: "apply_flag_settings";
-      settings: { effortLevel: string | null };
+      // Merged into the CLI's in-memory "flag settings" layer, which outranks
+      // the settings files without touching them. `null` clears a key (JSON
+      // drops `undefined`, and the CLI reads null as a deletion).
+      settings: { effortLevel?: string | null; fastMode?: true | null };
     }
   | { subtype: "get_context_usage" };
 
@@ -66,6 +69,10 @@ export interface ClaudeSessionOpts {
   command: string;
   model: string;
   effort: string | undefined;
+  // Whether this process starts with fast mode on. A fresh process always
+  // starts standard (the CLI has no flag for it), so a chat that wants fast is
+  // switched over by the first reconfigure.
+  fast: boolean;
   // Called exactly once when the process ends (clean exit, crash, or
   // force-kill) so the backend can drop this session from its map.
   onExit: () => void;
@@ -88,6 +95,7 @@ export class ClaudeSession {
   readonly vmId: string;
   model: string;
   effort: string | undefined;
+  fast: boolean;
 
   private readonly opts: ClaudeSessionOpts;
   private readonly interruptGraceMs: number;
@@ -131,6 +139,7 @@ export class ClaudeSession {
     this.vmId = opts.vmId;
     this.model = opts.model;
     this.effort = opts.effort;
+    this.fast = opts.fast;
     this.interruptGraceMs = opts.interruptGraceMs ?? 5_000;
     this.shutdownGraceMs = opts.shutdownGraceMs ?? 5_000;
     this.controlTimeoutMs = opts.controlTimeoutMs ?? DEFAULT_CONTROL_TIMEOUT_MS;
@@ -252,7 +261,7 @@ export class ClaudeSession {
   // these controls to subsequent turns, so callers invoke this only while the
   // session is idle. Keeping the process preserves background commands and
   // other in-memory state that a --resume restart would lose.
-  async reconfigure(model: string, effort: string | undefined): Promise<void> {
+  async reconfigure(model: string, effort: string | undefined, fast: boolean): Promise<void> {
     if (this.active) throw new Error("cannot reconfigure claude during an active turn");
     if (model !== this.model) {
       await this.sendControl({ subtype: "set_model", model });
@@ -264,6 +273,17 @@ export class ClaudeSession {
         settings: { effortLevel: effort ?? null },
       });
       this.effort = effort;
+    }
+    // Fast mode has no command-line flag: headless CLIs read it from settings,
+    // and the flag-settings layer is the one that is per process and in memory.
+    // Writing the user's own settings file would be both VM-wide (every chat in
+    // the instance shares it) and a mutation of a file we don't own.
+    if (fast !== this.fast) {
+      await this.sendControl({
+        subtype: "apply_flag_settings",
+        settings: { fastMode: fast ? true : null },
+      });
+      this.fast = fast;
     }
   }
 

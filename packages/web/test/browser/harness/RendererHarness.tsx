@@ -197,6 +197,7 @@ const PANEL_GESTURE_CHAT: Chat = {
   model: "claude-sonnet-5",
   provider: "anthropic",
   effort: "high",
+  fastMode: false,
   claudeSessionId: null,
   codexThreadId: null,
   inputTokens: null,

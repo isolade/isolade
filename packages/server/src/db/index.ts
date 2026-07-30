@@ -68,8 +68,32 @@ function defaultDbPath(): string {
  * rows that carry a non-null native `session_id` or `anchor_id`, since those
  * prove the row belongs to the chat's then-current provider. Rows with no such
  * evidence stay NULL rather than being guessed.
+ *
+ * Version 11 is intentionally empty: an earlier per-chat cost design was stamped
+ * under that number in development builds and then abandoned. See {@link migrations}.
+ *
+ * Version 12 labels each `usage_events` row with the chat it came from, so one
+ * chat's spend can be broken down by token bucket and by the model each part was
+ * billed at. The per-chat columns can't answer that (they keep running totals,
+ * not history). Rows written before this stay NULL: a breakdown covers the turns
+ * recorded since upgrading, while the chat's total cost is unaffected.
+ *
+ * Version 13 adds `usage_events.web_search_requests`, so spend that is billed
+ * per request instead of per token can be named in that breakdown rather than
+ * left as an unexplained remainder. Existing rows keep the default of zero.
+ *
+ * Version 14 adds `usage_events.cache_write_1h_tokens`. Anthropic bills a
+ * one-hour cache write at twice the input rate where a five-minute one costs
+ * 1.25×, and Claude Code asks for one-hour entries on subscription accounts, so
+ * without the split a chat's itemization understates its largest bucket by 60%.
+ * Existing rows keep the default of zero, i.e. all five-minute.
+ *
+ * Version 15 adds `chats.fast_mode`, the per-chat opt-in to the provider's fast
+ * mode, and `usage_events.fast`, which records whether a turn was actually
+ * billed at those premium rates. Both default to off, so no existing chat starts
+ * paying a premium and no past turn is re-costed as though it had.
  */
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 15;
 
 /**
  * The complete, current schema: one CREATE TABLE (plus indexes) per table in
@@ -181,6 +205,7 @@ function createSchema(sqlite: Database): void {
       model TEXT NOT NULL,
       provider TEXT NOT NULL,
       effort TEXT,
+      fast_mode INTEGER NOT NULL DEFAULT 0,
       claude_session_id TEXT,
       codex_thread_id TEXT,
       input_tokens INTEGER,
@@ -296,6 +321,7 @@ function createSchema(sqlite: Database): void {
     CREATE TABLE IF NOT EXISTS usage_events (
       id TEXT PRIMARY KEY,
       profile_id TEXT NOT NULL,
+      chat_id TEXT,
       provider TEXT NOT NULL,
       model TEXT NOT NULL,
       kind TEXT NOT NULL,
@@ -304,6 +330,9 @@ function createSchema(sqlite: Database): void {
       cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
       output_tokens INTEGER NOT NULL DEFAULT 0,
       reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+      fast INTEGER NOT NULL DEFAULT 0,
+      cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0,
+      web_search_requests INTEGER NOT NULL DEFAULT 0,
       cost_usd REAL NOT NULL DEFAULT 0,
       effective_input_tokens REAL NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER))
@@ -315,6 +344,11 @@ function createSchema(sqlite: Database): void {
     CREATE INDEX IF NOT EXISTS idx_usage_events_lookup
     ON usage_events (profile_id, provider, created_at)
   `);
+  // `idx_usage_events_chat` is deliberately NOT created here. This function runs
+  // before the migration ladder, and on a database from an older build the
+  // column it indexes does not exist yet, so indexing it would throw on boot.
+  // It is created by migration 12 (alongside the column it indexes) and, for a
+  // fresh database, by `migrate` (the same split `idx_chat_messages_parent` uses).
 
   // Generic singleton/key-value store for small, global, machine-local state
   // (one JSON value per key). Currently holds the update-check state, which used
@@ -618,6 +652,69 @@ const migrations: Record<number, (sqlite: Database) => void> = {
       )
     `);
   },
+  // Deliberately empty. Version 11 was an earlier take on per-chat cost that
+  // never left development: it added columns to `chats` that the shipped design
+  // does not use. Development databases are already stamped 11, so re-using the
+  // number would silently skip the work for exactly the machines that ran those
+  // builds. The number stays burned and 12 does the work for every database.
+  11: () => {},
+  12: (sqlite) => {
+    // Guarded like migration 10's ALTERs, and for a second reason here: a
+    // database stamped 11 by one of those development builds reaches this step
+    // with the column already present or absent depending on which build it ran.
+    const hasColumn =
+      sqlite
+        .query("SELECT name FROM pragma_table_info('usage_events') WHERE name = 'chat_id'")
+        .get() != null;
+    if (!hasColumn) sqlite.run(`ALTER TABLE usage_events ADD COLUMN chat_id TEXT`);
+    // No backfill is possible: the log never recorded which chat a row came
+    // from, and the chat rows only carry running totals. Existing rows stay
+    // unlabelled and simply don't appear in any per-chat breakdown.
+    sqlite.run(`
+      CREATE INDEX IF NOT EXISTS idx_usage_events_chat ON usage_events (chat_id)
+    `);
+  },
+  13: (sqlite) => {
+    const hasColumn =
+      sqlite
+        .query(
+          "SELECT name FROM pragma_table_info('usage_events') WHERE name = 'web_search_requests'",
+        )
+        .get() != null;
+    if (!hasColumn) {
+      sqlite.run(
+        `ALTER TABLE usage_events ADD COLUMN web_search_requests INTEGER NOT NULL DEFAULT 0`,
+      );
+    }
+  },
+  14: (sqlite) => {
+    const hasColumn =
+      sqlite
+        .query(
+          "SELECT name FROM pragma_table_info('usage_events') WHERE name = 'cache_write_1h_tokens'",
+        )
+        .get() != null;
+    if (!hasColumn) {
+      sqlite.run(
+        `ALTER TABLE usage_events ADD COLUMN cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0`,
+      );
+    }
+  },
+  15: (sqlite) => {
+    const hasColumn =
+      sqlite.query("SELECT name FROM pragma_table_info('chats') WHERE name = 'fast_mode'").get() !=
+      null;
+    if (!hasColumn) {
+      sqlite.run(`ALTER TABLE chats ADD COLUMN fast_mode INTEGER NOT NULL DEFAULT 0`);
+    }
+    const hasEventColumn =
+      sqlite
+        .query("SELECT name FROM pragma_table_info('usage_events') WHERE name = 'fast'")
+        .get() != null;
+    if (!hasEventColumn) {
+      sqlite.run(`ALTER TABLE usage_events ADD COLUMN fast INTEGER NOT NULL DEFAULT 0`);
+    }
+  },
 };
 
 function migrate(sqlite: Database): void {
@@ -647,6 +744,9 @@ function migrate(sqlite: Database): void {
     sqlite.run(`
       CREATE INDEX IF NOT EXISTS idx_chat_messages_parent
       ON chat_messages (chat_id, parent_id)
+    `);
+    sqlite.run(`
+      CREATE INDEX IF NOT EXISTS idx_usage_events_chat ON usage_events (chat_id)
     `);
     sqlite.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     return;

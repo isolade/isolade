@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import type { ChatEvent } from "../src/chat/backend";
+import type { ChatEvent, ModelBilling } from "../src/chat/backend";
 import { ClaudeBackend } from "../src/chat/claude-backend";
-import type { ChatManager } from "../src/chats";
+import type { Chat, ChatManager } from "../src/chats";
 import type { SandboxClient } from "../src/sandbox-client";
 import { FakeProc, tick } from "./fake-proc";
 
@@ -25,37 +25,47 @@ class FakeSandboxClient {
   }
 }
 
-// ClaudeBackend only calls updateSessionId on the manager during a turn.
-function fakeChatManager(sink: (id: string) => void): ChatManager {
+// During a turn ClaudeBackend calls updateSessionId, plus `get` when it resumes
+// a session and has to recover the chat's running totals (see
+// seedTotalsFromChat). `row` stands in for the persisted chat.
+function fakeChatManager(sink: (id: string) => void, row?: Partial<Chat>): ChatManager {
   return {
     updateSessionId: (_chatId: string, sessionId?: string) => sessionId && sink(sessionId),
+    get: () => row as Chat | undefined,
   } as unknown as ChatManager;
 }
 
-function backendFor(lines: object[], exitCode = 0) {
+function backendFor(lines: object[], exitCode = 0, row?: Partial<Chat>) {
   const sessionIds: string[] = [];
   const client = new FakeSandboxClient(lines, exitCode);
   const backend = new ClaudeBackend(
     client as unknown as SandboxClient,
-    fakeChatManager((id) => sessionIds.push(id)),
+    fakeChatManager((id) => sessionIds.push(id), row),
   );
   return { backend, sessionIds };
 }
 
-async function run(lines: object[], exitCode = 0) {
-  const { backend, sessionIds } = backendFor(lines, exitCode);
+async function run(
+  lines: object[],
+  exitCode = 0,
+  turn: { sessionId?: string; row?: Partial<Chat> } = {},
+) {
+  const { backend, sessionIds } = backendFor(lines, exitCode, turn.row);
   const deltas: string[] = [];
   const events: ChatEvent[] = [];
+  const billed: ModelBilling[][] = [];
   const result = await backend.sendMessage({
     vmId: "vm",
     chatId: "chat",
     message: "hi",
     model: "claude-sonnet-4-5",
     effort: "high",
+    ...(turn.sessionId != null ? { sessionId: turn.sessionId } : {}),
     onDelta: (t) => deltas.push(t),
     onEvent: (e) => events.push(e),
+    onBilling: (models) => billed.push(models),
   });
-  return { result, deltas, events, sessionIds };
+  return { result, deltas, events, billed, sessionIds };
 }
 
 const textDelta = (text: string) => ({
@@ -237,7 +247,267 @@ describe("ClaudeBackend stream-json parsing", () => {
     const last = usage[usage.length - 1]!;
     expect(last.last.inputTokens).toBe(100);
     expect(last.last.outputTokens).toBe(50);
-    expect(last.costUsd).toBeCloseTo(0.01);
+    // Usage frames are the gauge and carry no money at all.
+    expect(usage.every((event) => !("turnCostUsd" in event))).toBe(true);
+  });
+
+  it("bills a turn once it settles, from the model breakdown", async () => {
+    const { billed } = await run([
+      { type: "system", subtype: "init", session_id: "s" },
+      {
+        type: "result",
+        result: "ok",
+        usage: { input_tokens: 100, cache_read_input_tokens: 20, output_tokens: 50 },
+        total_cost_usd: 0.42,
+        // Two models in one turn: the main loop plus a sub-agent. The flat
+        // `usage` above sees only the former, which is why it is not the source.
+        modelUsage: {
+          "claude-sonnet-4-5": {
+            inputTokens: 100,
+            outputTokens: 50,
+            cacheReadInputTokens: 20,
+            cacheCreationInputTokens: 5,
+            webSearchRequests: 2,
+            costUSD: 0.3,
+          },
+          "claude-haiku-4-5-20251001": {
+            inputTokens: 900,
+            outputTokens: 40,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.12,
+          },
+        },
+      },
+    ]);
+    expect(billed).toHaveLength(1);
+    expect(billed[0]).toEqual([
+      {
+        model: "claude-sonnet-4-5",
+        usage: {
+          inputTokens: 100,
+          cachedInputTokens: 20,
+          cacheCreationInputTokens: 5,
+          outputTokens: 50,
+          reasoningOutputTokens: 0,
+          totalTokens: 175,
+        },
+        cacheWrite1hTokens: 0,
+        fast: false,
+        webSearchRequests: 2,
+        costUsd: 0.3,
+      },
+      {
+        model: "claude-haiku-4-5-20251001",
+        usage: {
+          inputTokens: 900,
+          cachedInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          outputTokens: 40,
+          reasoningOutputTokens: 0,
+          totalTokens: 940,
+        },
+        cacheWrite1hTokens: 0,
+        fast: false,
+        webSearchRequests: 0,
+        costUsd: 0.12,
+      },
+    ]);
+  });
+
+  it("reads the cache-write TTL split off the envelope's flat usage", async () => {
+    // Anthropic bills a one-hour write at twice input where five minutes costs
+    // 1.25x, and only the flat `usage` carries the split: `modelUsage` sums the
+    // two together. Reproduces the shape of a real first turn, whose bill is
+    // almost entirely the system prompt and tools being cached.
+    const { billed } = await run([
+      { type: "system", subtype: "init", session_id: "s" },
+      {
+        type: "result",
+        result: "ok",
+        usage: {
+          input_tokens: 20,
+          cache_creation_input_tokens: 11_520,
+          output_tokens: 28,
+          cache_creation: {
+            ephemeral_5m_input_tokens: 0,
+            ephemeral_1h_input_tokens: 11_520,
+          },
+        },
+        modelUsage: {
+          "claude-sonnet-4-5": {
+            inputTokens: 20,
+            outputTokens: 28,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 11_520,
+            webSearchRequests: 0,
+            costUSD: 0.1155,
+          },
+        },
+      },
+    ]);
+    expect(billed[0]![0]).toMatchObject({
+      cacheWrite1hTokens: 11_520,
+      usage: { cacheCreationInputTokens: 11_520 },
+    });
+  });
+
+  it("treats writes as five-minute when the CLI reports no split", async () => {
+    // Accounts that never get one-hour entries (API keys, subscribers in
+    // overage) report no `cache_creation` object at all.
+    const { billed } = await run([
+      { type: "system", subtype: "init", session_id: "s" },
+      {
+        type: "result",
+        result: "ok",
+        usage: { input_tokens: 20, cache_creation_input_tokens: 500, output_tokens: 5 },
+        modelUsage: {
+          "claude-sonnet-4-5": {
+            inputTokens: 20,
+            outputTokens: 5,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 500,
+            webSearchRequests: 0,
+            costUSD: 0.01,
+          },
+        },
+      },
+    ]);
+    expect(billed[0]![0]!.cacheWrite1hTokens).toBe(0);
+  });
+
+  it("leaves a sub-agent's writes unsplit rather than guessing at them", async () => {
+    // The flat `usage` covers the main loop only, so the split can only be
+    // attributed to the model the turn ran on.
+    const { billed } = await run([
+      { type: "system", subtype: "init", session_id: "s" },
+      {
+        type: "result",
+        result: "ok",
+        usage: {
+          input_tokens: 1,
+          cache_creation_input_tokens: 100,
+          output_tokens: 1,
+          cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 100 },
+        },
+        modelUsage: {
+          "claude-sonnet-4-5": {
+            inputTokens: 1,
+            outputTokens: 1,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 100,
+            webSearchRequests: 0,
+            costUSD: 0.01,
+          },
+          "claude-haiku-4-5-20251001": {
+            inputTokens: 900,
+            outputTokens: 40,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 700,
+            webSearchRequests: 0,
+            costUSD: 0.002,
+          },
+        },
+      },
+    ]);
+    const byModel = new Map(billed[0]!.map((entry) => [entry.model, entry]));
+    expect(byModel.get("claude-sonnet-4-5")!.cacheWrite1hTokens).toBe(100);
+    expect(byModel.get("claude-haiku-4-5-20251001")!.cacheWrite1hTokens).toBe(0);
+  });
+
+  it("records the rate card the provider actually billed at", async () => {
+    // What was asked for and what was charged can differ: fast mode can be
+    // refused, and it drops into cooldown after a rate limit. The turn's own
+    // report is the one that decides how it is costed.
+    const withSpeed = (speed?: string) => [
+      { type: "system", subtype: "init", session_id: "s" },
+      {
+        type: "result",
+        result: "ok",
+        usage: { input_tokens: 100, output_tokens: 10, ...(speed ? { speed } : {}) },
+        modelUsage: {
+          "claude-sonnet-4-5": {
+            inputTokens: 100,
+            outputTokens: 10,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.02,
+          },
+        },
+      },
+    ];
+    expect((await run(withSpeed("fast"))).billed[0]![0]!.fast).toBe(true);
+    expect((await run(withSpeed("standard"))).billed[0]![0]!.fast).toBe(false);
+    expect((await run(withSpeed())).billed[0]![0]!.fast).toBe(false);
+  });
+
+  it("falls back to the flat usage and cost when the CLI reports no model breakdown", async () => {
+    const { billed } = await run([
+      { type: "system", subtype: "init", session_id: "s" },
+      {
+        type: "result",
+        result: "ok",
+        usage: { input_tokens: 100, cache_read_input_tokens: 20, output_tokens: 50 },
+        total_cost_usd: 0.01,
+      },
+    ]);
+    expect(billed).toHaveLength(1);
+    expect(billed[0]![0]).toMatchObject({
+      model: "claude-sonnet-4-5",
+      costUsd: 0.01,
+      usage: { inputTokens: 100, cachedInputTokens: 20, outputTokens: 50 },
+    });
+  });
+
+  // A fresh backend with a chat row that already holds usage is what a restarted
+  // server looks like: Claude reports one turn at a time, so without recovering
+  // the row the next turn would report token totals lower than the row already
+  // holds, dipping the UI and clamping that turn out of every rollup.
+  const oneTurn = [
+    { type: "system", subtype: "init", session_id: "s" },
+    {
+      type: "stream_event",
+      event: {
+        type: "message_start",
+        message: { usage: { input_tokens: 100, cache_read_input_tokens: 20, output_tokens: 1 } },
+      },
+    },
+    {
+      type: "result",
+      result: "ok",
+      usage: { input_tokens: 100, cache_read_input_tokens: 20, output_tokens: 50 },
+      total_cost_usd: 0.01,
+    },
+  ];
+  const spentChat: Partial<Chat> = {
+    inputTokens: 900,
+    cachedInputTokens: 100,
+    cacheCreationInputTokens: 0,
+    outputTokens: 50,
+    reasoningOutputTokens: 0,
+    costUsd: 1.5,
+  };
+  const finalUsage = (events: ChatEvent[]) =>
+    events.filter((e) => e.type === "usage").at(-1) as Extract<ChatEvent, { type: "usage" }>;
+
+  it("resumes a restarted server's running token totals from the chat row", async () => {
+    const { events } = await run(oneTurn, 0, { sessionId: "s", row: spentChat });
+    const usage = finalUsage(events);
+    expect(usage.total.inputTokens).toBe(1000);
+    expect(usage.total.cachedInputTokens).toBe(120);
+    expect(usage.total.outputTokens).toBe(100);
+  });
+
+  it("does not inherit the row's token totals when starting a fresh session", async () => {
+    // No resume id means a new native session (a retired one's figures are not
+    // this session's), so the turn stands alone.
+    const { events, billed } = await run(oneTurn, 0, { row: spentChat });
+    const usage = finalUsage(events);
+    expect(usage.total.inputTokens).toBe(100);
+    // The bill is the turn's own either way: it never consults the row.
+    expect(billed[0]![0]!.costUsd).toBeCloseTo(0.01);
   });
 
   it("reports `last` usage as the latest sub-call, not the sum, across a tool-use turn", async () => {

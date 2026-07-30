@@ -291,6 +291,23 @@ test.describe("message renderer browser gate", () => {
     await scroller.dispatchEvent("wheel", { deltaX: 0, deltaY: 100 });
     await expect.poll(() => scroller.evaluate((element) => element.scrollLeft)).toBeGreaterThan(0);
 
+    // Two equal reads in a row, so the strip has stopped moving. A scroll still
+    // in flight can outrun the scroll-into-view the next click triggers and
+    // leave the strip somewhere neither of them intended, which no amount of
+    // polling afterwards recovers from.
+    const scrollAtRest = async () => {
+      let previous = Number.NaN;
+      await expect
+        .poll(async () => {
+          const current = await scroller.evaluate((element) => element.scrollLeft);
+          const settled = current === previous;
+          previous = current;
+          return settled;
+        })
+        .toBe(true);
+    };
+    await scrollAtRest();
+
     const lastTab = page.locator('[data-tab-id="overflow-tab-11"]');
     await lastTab.evaluate((element) => element.click());
     await expect(lastTab).toHaveAttribute("aria-selected", "true");
@@ -311,6 +328,7 @@ test.describe("message renderer browser gate", () => {
     await scroller.evaluate((element) => {
       element.scrollLeft = element.scrollWidth;
     });
+    await scrollAtRest();
     const addButton = page.getByRole("button", { name: "New tab" });
     await expect
       .poll(async () => {
@@ -322,17 +340,23 @@ test.describe("message renderer browser gate", () => {
         return addBounds.x - (lastBounds.x + lastBounds.width);
       })
       .toBeGreaterThanOrEqual(-1);
-    const [lastBounds, addBounds] = await Promise.all([
-      lastTab.boundingBox(),
-      addButton.boundingBox(),
-    ]);
-    if (!lastBounds || !addBounds) throw new Error("Missing tab-strip control bounds");
-    expect(addBounds.x - (lastBounds.x + lastBounds.width)).toBeLessThanOrEqual(1);
-    const panelBounds = await panel.boundingBox();
-    if (!panelBounds) throw new Error("Missing panel bounds");
-    expect(
-      Math.abs(panelBounds.x + panelBounds.width - (addBounds.x + addBounds.width)),
-    ).toBeLessThanOrEqual(1);
+    // Poll the upper bounds too, rather than reading the boxes once: the strip's
+    // scroll and the resize observation that follows it can land a frame apart,
+    // and a single read can catch the add button mid-settle.
+    await expect
+      .poll(async () => {
+        const [lastBounds, addBounds, panelBounds] = await Promise.all([
+          lastTab.boundingBox(),
+          addButton.boundingBox(),
+          panel.boundingBox(),
+        ]);
+        if (!lastBounds || !addBounds || !panelBounds) return null;
+        return Math.max(
+          addBounds.x - (lastBounds.x + lastBounds.width),
+          Math.abs(panelBounds.x + panelBounds.width - (addBounds.x + addBounds.width)),
+        );
+      })
+      .toBeLessThanOrEqual(1);
   });
 
   test("scrolls chat messages inside a keep-alive panel body", async ({ page }) => {
@@ -694,6 +718,7 @@ test.describe("message renderer browser gate", () => {
           model: "claude-opus-5",
           provider: "anthropic",
           effort: "high",
+          fastMode: false,
           claudeSessionId: null,
           codexThreadId: null,
           inputTokens: null,
@@ -1692,6 +1717,175 @@ test.describe("message renderer browser gate", () => {
     const work = await page.evaluate(() => window.__isoladeProductionChatHarness?.metrics());
     expect(work?.historyMappings).toBe(0);
     expect(work?.historicalRowRenders).toBe(0);
+  });
+
+  // The composer's cost ticker reads the live `usage` frame through a cast, so
+  // this is what holds the published payload and the field the UI reads
+  // together. The count-up in between is deliberately not asserted: sampling
+  // frames would only be testing an easing curve, flakily.
+  test("composer shows what the chat has cost across agents once usage lands", async ({ page }) => {
+    const tokens = {
+      inputTokens: 12_000,
+      cachedInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      outputTokens: 400,
+      reasoningOutputTokens: 0,
+      totalTokens: 12_400,
+    };
+    await page.route("**/api/instances/*/chats/*/transcript?*", async (route) => {
+      await route.fulfill({ json: transcriptFixture("chat-a") });
+    });
+    await page.route("**/api/instances/*/chats/chat-a/messages", async (route) => {
+      if (route.request().method() !== "POST") {
+        await route.fallback();
+        return;
+      }
+      const userMessage = {
+        id: "production-cost-user",
+        chatId: "chat-a",
+        role: "user",
+        content: "Spend something",
+        parentId: "chat-a-production-m59",
+        createdAt: new Date(20_000).toISOString(),
+      };
+      await route.fulfill({
+        contentType: "text/event-stream",
+        body:
+          `event: user_message\ndata: ${JSON.stringify(userMessage)}\n\n` +
+          'event: message_id\ndata: "production-cost-assistant"\n\n' +
+          'id: 0\nevent: delta\ndata: "Done"\n\n' +
+          // The server publishes what the chat has cost so far, agent switches
+          // included, so the composer never has to add anything up.
+          `id: 1\nevent: usage\ndata: ${JSON.stringify({
+            last: tokens,
+            total: tokens,
+            costUsd: 1.25,
+          })}\n\n` +
+          "event: done\ndata: null\n\n",
+      });
+    });
+
+    await page.goto("/test/browser/harness/index.html?production=1&chats=1");
+    await page.waitForFunction(
+      () => document.documentElement.dataset.productionHarnessReady === "true",
+    );
+    // The readout is a hover-card trigger, so it is a focusable button rather
+    // than plain text.
+    const cost = page.getByRole("button", {
+      name: "What this chat has cost so far, across every agent it has run on",
+    });
+    // A chat that has never streamed reads zero, so the figure is there from the
+    // first message rather than appearing partway through.
+    await expect(cost).toHaveText("$0.00");
+
+    await page
+      .getByPlaceholder("Message... (Enter to send, Shift+Enter for newline)")
+      .fill("Spend something");
+    await page.getByRole("button", { name: "Send" }).click();
+
+    await expect(cost).toHaveText("$1.25");
+  });
+
+  // The picker stays interactive mid-turn and its edits are local until the next
+  // send flushes them. Fast mode has to ride that flush like model and effort do:
+  // left out of it, the toggle went on showing a premium rate the server had
+  // never been told about, for every turn that followed.
+  test("flushes a mid-turn fast-mode toggle with the next send", async ({ page }) => {
+    const patches: Record<string, unknown>[] = [];
+    let releaseTurn!: () => void;
+    const turnHeld = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    await page.route("**/api/instances/*/chats/chat-a", async (route) => {
+      if (route.request().method() !== "PATCH") {
+        await route.fallback();
+        return;
+      }
+      const body = route.request().postDataJSON() as Record<string, unknown>;
+      patches.push(body);
+      await route.fulfill({
+        json: {
+          id: "chat-a",
+          instanceId: "instance-production-harness",
+          model: "gpt-5.6-sol",
+          provider: "openai",
+          effort: "medium",
+          fastMode: body.fastMode === true,
+          claudeSessionId: null,
+          codexThreadId: null,
+          inputTokens: null,
+          cachedInputTokens: null,
+          cacheCreationInputTokens: null,
+          outputTokens: null,
+          reasoningOutputTokens: null,
+          costUsd: null,
+          lastInputTokens: null,
+          lastCachedInputTokens: null,
+          lastCacheCreationInputTokens: null,
+          lastOutputTokens: null,
+          lastReasoningOutputTokens: null,
+          modelContextWindow: null,
+          compacted: null,
+          activeLeafId: null,
+          createdAt: new Date(0).toISOString(),
+        },
+      });
+    });
+    // Hold the turn open so the composer stays in its streaming state while the
+    // picker is used, which is the case the flush exists for.
+    await page.route("**/api/instances/*/chats/chat-a/messages", async (route) => {
+      if (route.request().method() !== "POST") {
+        await route.fallback();
+        return;
+      }
+      await turnHeld;
+      await route.fulfill({
+        contentType: "text/event-stream",
+        body: "event: done\ndata: null\n\n",
+      });
+    });
+    let queued: Record<string, unknown> | null = null;
+    await page.route("**/api/instances/*/chats/chat-a/queue", async (route) => {
+      queued = route.request().postDataJSON() as Record<string, unknown>;
+      await route.fulfill({
+        json: {
+          id: String(queued.id),
+          chatId: "chat-a",
+          content: String(queued.content),
+          mode: "later",
+          status: "queued",
+          targetMessageId: null,
+          error: null,
+          createdAt: new Date(0).toISOString(),
+          updatedAt: new Date(0).toISOString(),
+        },
+      });
+    });
+
+    // GPT-5.6 Sol publishes a fast rate card, so the toggle is on offer.
+    await openProductionHarness(page, 1, { messages: 2, crossProviderPicker: true });
+    const composer = page.getByPlaceholder("Message... (Enter to send, Shift+Enter for newline)");
+    await composer.fill("First");
+    await page.getByRole("button", { name: "Send" }).click();
+    await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
+
+    const fastToggle = page.getByRole("switch", { name: /Fast mode/ });
+    await page.locator('[data-demo="model-picker"]').click();
+    await expect(fastToggle).toHaveAttribute("aria-checked", "false");
+    await fastToggle.click();
+    // Local only while the turn runs: changing the billing rate under a turn
+    // already in flight is exactly what the deferral avoids.
+    expect(patches).toEqual([]);
+
+    await composer.fill("Second");
+    await page.getByRole("button", { name: "Queue message" }).click();
+    await expect.poll(() => patches).toEqual([{ fastMode: true }]);
+    await expect.poll(() => queued).not.toBeNull();
+
+    // And the picker still reads on, now backed by the server's own answer.
+    await page.locator('[data-demo="model-picker"]').click();
+    await expect(fastToggle).toHaveAttribute("aria-checked", "true");
+    releaseTurn();
   });
 
   test("retains two 10k normal-flow chats and isolates switching and live work @stress", async ({

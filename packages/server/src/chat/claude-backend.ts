@@ -3,9 +3,12 @@ import { type ChatEffort, type ContextBreakdown, findChatModel } from "../contra
 import { KeyedQueue } from "../keyed-queue";
 import type { SandboxApi } from "../sandbox-client";
 import {
+  addUsage,
   type ChatBackend,
   type ChatEvent,
   emptyUsage,
+  type ModelBilling,
+  subtractUsage,
   type TokenUsage,
   type TurnMeta,
   type UserMessageReceipt,
@@ -44,9 +47,12 @@ export class ClaudeBackend implements ChatBackend {
   // unified `usage` event always carries both `last` and `total`. Cleared when
   // a chat starts without a resumable Claude session.
   private chatTotals = new Map<string, TokenUsage>();
-  // Same story for cost: Claude's `total_cost_usd` reports the cost of the
-  // current turn only, so we sum it across turns ourselves.
-  private chatCosts = new Map<string, number>();
+  // The last `modelUsage` the CLI reported, per chat, per model. That field is
+  // cumulative for the LIFE OF THE PROCESS, not per turn (see
+  // billingFromResult), so a turn's bill is the rise since the previous turn.
+  // Keyed by chat because the process is: it is dropped whenever a new one
+  // starts, which is exactly when the CLI's own counters restart at zero.
+  private processUsage = new Map<string, Map<string, ModelUsageSnapshot>>();
 
   // One long-lived `claude -p --input-format stream-json` process per chat.
   // Reused across turns so the conversation (and any background tasks the
@@ -77,7 +83,121 @@ export class ClaudeBackend implements ChatBackend {
 
   resetTotals(chatId: string) {
     this.chatTotals.delete(chatId);
-    this.chatCosts.delete(chatId);
+    this.resetProcessUsage(chatId);
+  }
+
+  // Forget what the CLI last reported, because a new process is about to report
+  // from zero again. Called wherever a process is created or retired, so the
+  // baseline can never outlive the counters it is a baseline for.
+  private resetProcessUsage(chatId: string) {
+    this.processUsage.delete(chatId);
+  }
+
+  // Turn a `result` envelope into what THIS turn billed, by differencing the
+  // CLI's process-cumulative `modelUsage` against what it last reported (see
+  // parseModelUsage for why that differencing is mandatory). Advances the
+  // baseline as a side effect, so calling it twice for one envelope would report
+  // the second as free, and returns one entry per model that did work.
+  //
+  // Falls back to the flat `usage` + `total_cost_usd` pair for CLI builds that
+  // predate `modelUsage`. That pair needs the same treatment: `total_cost_usd`
+  // is process-cumulative too, while `usage` is per turn.
+  private billingFromResult(
+    chatId: string,
+    model: string,
+    event: { usage?: unknown; modelUsage?: unknown; total_cost_usd?: unknown },
+  ): ModelBilling[] {
+    // Anthropic prices a cache write by its TTL, and only the envelope's flat
+    // `usage` carries the split (accumulated across the turn's sub-calls);
+    // `modelUsage` aggregates the two together. That flat field covers the main
+    // loop only, so this is attributed to the model the turn ran on and clamped
+    // to what that model actually wrote. A sub-agent's writes stay unsplit,
+    // which reads as five-minute: understating beats inventing.
+    const cacheWrite1hTokens = parseCacheWrite1h(
+      event.usage as Record<string, unknown> | undefined,
+    );
+    // Which rate card the provider actually billed at, from the same flat usage
+    // (the CLI keeps the most recent request's speed there). Trusting what was
+    // reported beats trusting what we asked for: fast mode can be refused, and
+    // it drops into cooldown after a rate limit.
+    const fast = parseFastSpeed(event.usage as Record<string, unknown> | undefined);
+    const baseline = this.processUsage.get(chatId) ?? new Map<string, ModelUsageSnapshot>();
+    const reported = parseModelUsage(event.modelUsage);
+    if (reported.size === 0) {
+      // Rebuild the same cumulative shape from the flat pair, so one
+      // differencing pass below serves both: `usage` there is per turn (add it
+      // onto the baseline) while `total_cost_usd` is already cumulative (take
+      // it as it comes).
+      const previous = baseline.get(model);
+      reported.set(model, {
+        usage: addUsage(
+          previous?.usage ?? emptyUsage(),
+          parseClaudeResultUsage(event.usage as Record<string, unknown> | undefined),
+        ),
+        webSearchRequests: previous?.webSearchRequests ?? 0,
+        costUsd:
+          typeof event.total_cost_usd === "number"
+            ? event.total_cost_usd
+            : (previous?.costUsd ?? 0),
+      });
+    }
+
+    const billed: ModelBilling[] = [];
+    for (const [reportedModel, snapshot] of reported) {
+      const previous = baseline.get(reportedModel);
+      const usage = subtractUsage(snapshot.usage, previous?.usage);
+      const webSearchRequests = Math.max(
+        0,
+        snapshot.webSearchRequests - (previous?.webSearchRequests ?? 0),
+      );
+      const costUsd = Math.max(0, snapshot.costUsd - (previous?.costUsd ?? 0));
+      if (usage.totalTokens > 0 || webSearchRequests > 0 || costUsd > 0) {
+        billed.push({
+          model: reportedModel,
+          usage,
+          cacheWrite1hTokens: reportedModel === model ? cacheWrite1hTokens : 0,
+          fast: reportedModel === model ? fast : false,
+          webSearchRequests,
+          costUsd,
+        });
+      }
+    }
+    this.processUsage.set(chatId, reported);
+    return billed;
+  }
+
+  // Restore the running token totals for a resumed session from the persisted
+  // chat row. Those columns hold exactly what the map holds (one native
+  // session's cumulative counts), and the map lives only as long as the process
+  // does. A server restart mid-chat would otherwise resume with it at zero and
+  // the next turn would report a total *lower* than the row already holds,
+  // making the UI's totals visibly dip before climbing again. Billing is immune
+  // to this by construction: a turn reports what it billed, so nothing is
+  // reconciled against a figure a dead process was holding. Only ever fills an
+  // empty slot, so a live process's own tallies always win over the row it has
+  // been writing.
+  private seedTotalsFromChat(chatId: string) {
+    if (this.chatTotals.has(chatId)) return;
+    const chat = this.chatManager.get(chatId);
+    if (!chat || chat.inputTokens == null) return;
+    const inputTokens = chat.inputTokens;
+    const cachedInputTokens = chat.cachedInputTokens ?? 0;
+    const cacheCreationInputTokens = chat.cacheCreationInputTokens ?? 0;
+    const outputTokens = chat.outputTokens ?? 0;
+    const reasoningOutputTokens = chat.reasoningOutputTokens ?? 0;
+    this.chatTotals.set(chatId, {
+      inputTokens,
+      cachedInputTokens,
+      cacheCreationInputTokens,
+      outputTokens,
+      reasoningOutputTokens,
+      totalTokens:
+        inputTokens +
+        cachedInputTokens +
+        cacheCreationInputTokens +
+        outputTokens +
+        reasoningOutputTokens,
+    });
   }
 
   // Shut down the persistent process for one chat. Used when the chat is
@@ -88,6 +208,9 @@ export class ClaudeBackend implements ChatBackend {
     if (!session) return Promise.resolve();
     this.sessions.delete(chatId);
     this.clearIdle(chatId);
+    // The next turn gets a new process counting from zero, so the baseline it
+    // would be differenced against dies with this one.
+    this.resetProcessUsage(chatId);
     return session.shutdown();
   }
 
@@ -131,6 +254,9 @@ export class ClaudeBackend implements ChatBackend {
       command: buildTitleSessionCommand(TITLE_MODEL),
       model: TITLE_MODEL,
       effort: undefined,
+      // Titling is a cheap one-shot on a small model and never fast: it would
+      // pay a premium rate for a sentence nobody is waiting on.
+      fast: false,
       onExit: () => {
         if (this.titleSessions.get(vmId) === session) this.titleSessions.delete(vmId);
       },
@@ -151,8 +277,11 @@ export class ClaudeBackend implements ChatBackend {
     onDelta: (text: string) => void;
     onEvent?: (event: ChatEvent) => void;
     onMeta?: (meta: TurnMeta) => void;
+    fast?: boolean;
+    onBilling?: (models: ModelBilling[]) => void;
     onUserMessageAcknowledged?: (receipt?: UserMessageReceipt) => void;
   }): Promise<{ content: string; sessionId?: string }> {
+    const fast = opts.fast === true;
     // Claude CLI accepts: low | medium | high | xhigh | max. Other values
     // from the union (none/minimal, which are codex-only) are dropped. The model
     // falls back to its own default.
@@ -178,9 +307,13 @@ export class ClaudeBackend implements ChatBackend {
       // Don't let an idle timer retire the process while a control request is
       // waiting for its correlated response.
       this.clearIdle(opts.chatId);
-      if (session.model !== opts.model || session.effort !== claudeEffort) {
+      if (
+        session.model !== opts.model ||
+        session.effort !== claudeEffort ||
+        session.fast !== fast
+      ) {
         try {
-          await session.reconfigure(opts.model, claudeEffort);
+          await session.reconfigure(opts.model, claudeEffort, fast);
         } catch (err) {
           // Older or incompatible CLI versions may reject a control. Preserve
           // compatibility by falling back to the old resume-and-restart path.
@@ -195,9 +328,14 @@ export class ClaudeBackend implements ChatBackend {
     }
 
     if (!session) {
+      // A process is about to start, and the CLI's cumulative counters start
+      // with it, so the baseline they are differenced against has to go.
+      this.resetProcessUsage(opts.chatId);
       // No resume id → brand new session, so the running totals from any
-      // previous chat under this id are stale.
-      if (!opts.sessionId) this.resetTotals(opts.chatId);
+      // previous chat under this id are stale. Resuming one instead means the
+      // totals may predate this process (a restart), so recover them.
+      if (opts.sessionId) this.seedTotalsFromChat(opts.chatId);
+      else this.resetTotals(opts.chatId);
       const created = this.createChatSession(
         opts.chatId,
         opts.vmId,
@@ -208,6 +346,18 @@ export class ClaudeBackend implements ChatBackend {
       );
       this.sessions.set(opts.chatId, created);
       session = created;
+      if (fast) {
+        // A fresh CLI starts standard, so switch it over before the turn. Never
+        // at the cost of the turn itself: an older build that rejects the
+        // control, or one that never answers, should cost the user a standard
+        // turn rather than no turn. The bill follows what the CLI reports it
+        // did, so degrading here cannot misprice anything.
+        try {
+          await session.reconfigure(opts.model, claudeEffort, true);
+        } catch (err) {
+          console.warn(`[claude] enabling fast mode failed (chat=${opts.chatId}):`, err);
+        }
+      }
     }
 
     // Don't let the idle reaper fire while a turn is running. A long turn
@@ -367,6 +517,9 @@ export class ClaudeBackend implements ChatBackend {
       command: this.buildCommand(model, effort, sessionId, fork),
       model,
       effort,
+      // A fresh CLI always starts standard: fast mode has no command-line flag,
+      // so a chat that wants it gets switched over by the reconfigure below.
+      fast: false,
       onExit: () => {
         // The process ended on its own (VM restart, crash, idle reap that
         // already closed stdin). Drop it so the next turn starts fresh.
@@ -410,6 +563,8 @@ export class ClaudeBackend implements ChatBackend {
     onDelta: (text: string) => void;
     onEvent?: (event: ChatEvent) => void;
     onMeta?: (meta: TurnMeta) => void;
+    onBilling?: (models: ModelBilling[]) => void;
+    fast?: boolean;
   }): TurnHooks {
     let fullContent = "";
     // Per-turn state for assembling streaming content blocks. Anthropic
@@ -462,36 +617,23 @@ export class ClaudeBackend implements ChatBackend {
     // prompt size is what we want. For billing totals, see `turnTotal` below.
     let turnUsage: TokenUsage = emptyUsage();
     const modelWindow = findChatModel(opts.model)?.contextWindow;
-    const emitUsage = (turnCostUsd?: number, turnTotalForChat?: TokenUsage) => {
+    // Money is deliberately absent here. Claude reports nothing about cost until
+    // a turn is over, so there is no honest figure to put on a mid-turn frame,
+    // and inventing one from list prices would only be corrected downstream when
+    // the real bill lands. See onBilling at the `result` envelope.
+    const emitUsage = (turnTotalForChat?: TokenUsage) => {
       const prev = this.chatTotals.get(opts.chatId) ?? emptyUsage();
-      const prevCost = this.chatCosts.get(opts.chatId) ?? 0;
       // `total` is the running sum across turns. During streaming we use the
       // latest sub-call as an estimate of "this turn's billable"; at the
-      // final `result` event we override with the CLI's authoritative
-      // turn-cumulative count so the persisted total reflects every
-      // sub-call's tokens, not just the last one.
-      const turnBillable = turnTotalForChat ?? turnUsage;
-      const total: TokenUsage = {
-        inputTokens: prev.inputTokens + turnBillable.inputTokens,
-        cachedInputTokens: prev.cachedInputTokens + turnBillable.cachedInputTokens,
-        cacheCreationInputTokens:
-          prev.cacheCreationInputTokens + turnBillable.cacheCreationInputTokens,
-        outputTokens: prev.outputTokens + turnBillable.outputTokens,
-        reasoningOutputTokens: prev.reasoningOutputTokens + turnBillable.reasoningOutputTokens,
-        totalTokens: prev.totalTokens + turnBillable.totalTokens,
-      };
-      // During streaming we don't yet know this turn's cost, so emit the
-      // accumulated cost from prior turns so the gauge doesn't blink off
-      // mid-turn. The final `result` envelope supplies turnCostUsd and we
-      // emit prev+turn one last time before rolling it into chatCosts.
-      const costUsd =
-        turnCostUsd != null ? prevCost + turnCostUsd : prevCost > 0 ? prevCost : undefined;
+      // final `result` event we override with what the turn actually billed,
+      // so the persisted total reflects every sub-call and every sub-agent
+      // rather than just the last message.
+      const total = addUsage(prev, turnTotalForChat ?? turnUsage);
       opts.onEvent?.({
         type: "usage",
         last: turnUsage,
         total,
         modelContextWindow: modelWindow,
-        costUsd,
       });
     };
     // Anthropic's `usage` object across message_start / message_delta / result.
@@ -784,32 +926,35 @@ export class ClaudeBackend implements ChatBackend {
         if (event.result) {
           fullContent = event.result;
         }
-        // The final `result` envelope carries the turn-cumulative
-        // billable token counts (summed across every sub-call this turn
-        // produced) plus total_cost_usd. We keep `turnUsage` pointing
-        // at the latest sub-call so the emitted `last` stays usable as
-        // a context-pressure signal, and roll the cumulative figure
-        // into chatTotals separately for accurate lifetime billing.
-        const turnTotal = parseClaudeResultUsage(
-          event.usage as Record<string, unknown> | undefined,
-        );
-        const turnCostUsd =
-          typeof event.total_cost_usd === "number" ? event.total_cost_usd : undefined;
-        emitUsage(turnCostUsd, turnTotal);
-        const prev = this.chatTotals.get(opts.chatId) ?? emptyUsage();
-        this.chatTotals.set(opts.chatId, {
-          inputTokens: prev.inputTokens + turnTotal.inputTokens,
-          cachedInputTokens: prev.cachedInputTokens + turnTotal.cachedInputTokens,
-          cacheCreationInputTokens:
-            prev.cacheCreationInputTokens + turnTotal.cacheCreationInputTokens,
-          outputTokens: prev.outputTokens + turnTotal.outputTokens,
-          reasoningOutputTokens: prev.reasoningOutputTokens + turnTotal.reasoningOutputTokens,
-          totalTokens: prev.totalTokens + turnTotal.totalTokens,
-        });
-        if (turnCostUsd != null) {
-          const prevCost = this.chatCosts.get(opts.chatId) ?? 0;
-          this.chatCosts.set(opts.chatId, prevCost + turnCostUsd);
+        // The turn is over, so this is where its bill becomes knowable. What
+        // it billed is the rise in the CLI's process-cumulative counters since
+        // the previous turn, per model (see billingFromResult). `turnUsage`
+        // keeps pointing at the latest sub-call so the emitted `last` stays a
+        // context-pressure signal, while the billed tokens advance the chat's
+        // running total: those include the sub-agents this turn spawned, which
+        // the envelope's flat `usage` leaves out.
+        // The CLI's own verdict on the mode, for the model that just ran. It
+        // gates fast mode on more than we can see from here (the plan, a
+        // cooldown after a rate limit, and which models the installed build
+        // supports at all), so a chat can ask for fast and be quietly served
+        // standard. Say so rather than leave the toggle looking effective.
+        if (opts.fast === true && event.fast_mode_state !== "on") {
+          console.warn(
+            `[claude] fast mode not applied (chat=${opts.chatId} model=${opts.model}): CLI reports ${
+              typeof event.fast_mode_state === "string" ? event.fast_mode_state : "no state"
+            }`,
+          );
         }
+        const billed = this.billingFromResult(opts.chatId, opts.model, event);
+        const turnTotal = billed.reduce((sum, entry) => addUsage(sum, entry.usage), emptyUsage());
+        // Report the bill before the frame that carries the new total, so the
+        // gauge and the composer's figure land on the client together.
+        if (billed.length > 0) opts.onBilling?.(billed);
+        emitUsage(turnTotal);
+        this.chatTotals.set(
+          opts.chatId,
+          addUsage(this.chatTotals.get(opts.chatId) ?? emptyUsage(), turnTotal),
+        );
         handled = true;
       }
 
@@ -867,7 +1012,8 @@ export class ClaudeBackend implements ChatBackend {
       this.clearIdle(opts.chatId);
       if (session.model !== opts.model || session.effort !== claudeEffort) {
         try {
-          await session.reconfigure(opts.model, claudeEffort);
+          // A probe never changes the billing mode, so it leaves fast as it is.
+          await session.reconfigure(opts.model, claudeEffort, session.fast);
         } catch (err) {
           console.warn("[claude] live model/effort update failed during context probe:", err);
           if (this.sessions.get(opts.chatId) === session) {
@@ -1056,6 +1202,79 @@ function finiteNonnegative(value: unknown): number | null {
 
 function finitePositive(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+// One model's entry in the CLI's `modelUsage` map, as of the latest `result`
+// envelope. Every field is cumulative for the life of the CLI process.
+interface ModelUsageSnapshot {
+  usage: TokenUsage;
+  webSearchRequests: number;
+  costUsd: number;
+}
+
+// Read the `modelUsage` map off a `result` envelope: what each model has
+// consumed and cost SO FAR IN THIS PROCESS. Two properties of it matter, and
+// both are easy to get wrong:
+//
+//   - It is cumulative, not per turn. The CLI adds every API call into a
+//     process-global tally (`STATE.totalCostUSD` and friends) and reports the
+//     running figure on every turn's result. We keep one long-lived process per
+//     chat and push many turns through it, so a turn's bill is the RISE since
+//     the previous turn, never the reported number itself. Reading it as a
+//     per-turn figure inflates a chat's cost quadratically in its turn count.
+//   - It covers everything the CLI did, including sub-agents. The flat `usage`
+//     field beside it does not: that one accumulates only the main loop's
+//     messages, so a turn that delegated to a sub-agent under-reports its tokens
+//     there while its cost still includes them.
+//
+// Absent on CLI versions that predate the field, which the caller falls back
+// from. Entries with no model name are dropped rather than merged under a
+// placeholder, since we would not know what to price them at.
+function parseModelUsage(value: unknown): Map<string, ModelUsageSnapshot> {
+  const snapshots = new Map<string, ModelUsageSnapshot>();
+  if (!value || typeof value !== "object") return snapshots;
+  const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  for (const [model, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (!model || !raw || typeof raw !== "object") continue;
+    const entry = raw as Record<string, unknown>;
+    const inputTokens = num(entry.inputTokens);
+    const cachedInputTokens = num(entry.cacheReadInputTokens);
+    const cacheCreationInputTokens = num(entry.cacheCreationInputTokens);
+    const outputTokens = num(entry.outputTokens);
+    snapshots.set(model, {
+      usage: {
+        inputTokens,
+        cachedInputTokens,
+        cacheCreationInputTokens,
+        outputTokens,
+        // Anthropic bills thinking as ordinary output and does not report it
+        // separately here, so it is already inside outputTokens.
+        reasoningOutputTokens: 0,
+        totalTokens: inputTokens + cachedInputTokens + cacheCreationInputTokens + outputTokens,
+      },
+      webSearchRequests: num(entry.webSearchRequests),
+      costUsd: num(entry.costUSD),
+    });
+  }
+  return snapshots;
+}
+
+// How many of a turn's cache writes were made with a one-hour TTL, from the
+// `cache_creation` sub-object Anthropic reports alongside the flat total. Absent
+// on accounts that only ever get five-minute entries, and on CLI builds that
+// predate the field, both of which mean "none of them".
+function parseCacheWrite1h(u: Record<string, unknown> | undefined): number {
+  const breakdown = u?.cache_creation;
+  if (!breakdown || typeof breakdown !== "object") return 0;
+  const value = (breakdown as Record<string, unknown>).ephemeral_1h_input_tokens;
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
+// Whether the turn's most recent request ran in fast mode, which the provider
+// bills at a premium. Absent means standard, which is also what every CLI build
+// that predates the field means.
+function parseFastSpeed(u: Record<string, unknown> | undefined): boolean {
+  return u?.speed === "fast";
 }
 
 // Parse the `usage` object on Claude CLI's `result` envelope, which is the

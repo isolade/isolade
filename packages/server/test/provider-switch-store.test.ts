@@ -123,6 +123,7 @@ describe("ChatManager cross-provider helpers", () => {
         cacheCreationInputTokens: 20,
         outputTokens: 30,
         reasoningOutputTokens: 40,
+        totalTokens: 0,
       },
       last: {
         inputTokens: 100,
@@ -130,10 +131,27 @@ describe("ChatManager cross-provider helpers", () => {
         cacheCreationInputTokens: 2,
         outputTokens: 3,
         reasoningOutputTokens: 4,
+        totalTokens: 0,
       },
       modelContextWindow: 1_000_000,
-      costUsd: 12.5,
     });
+    cm.recordTurnBilling(chat.id, [
+      {
+        model: chat.model,
+        cacheWrite1hTokens: 0,
+        fast: false,
+        usage: {
+          inputTokens: 500_000,
+          cachedInputTokens: 10,
+          cacheCreationInputTokens: 20,
+          outputTokens: 30,
+          reasoningOutputTokens: 40,
+          totalTokens: 500_100,
+        },
+        webSearchRequests: 0,
+        costUsd: 12.5,
+      },
+    ]);
     cm.markCompacted(chat.id);
     expect(cm.get(chat.id)?.inputTokens).toBe(500_000);
 
@@ -144,66 +162,77 @@ describe("ChatManager cross-provider helpers", () => {
     expect(after.lastInputTokens).toBeNull();
     expect(after.modelContextWindow).toBeNull();
     expect(after.compacted).toBeNull();
-    expect(after.costUsd).toBeNull();
+    // Everything the chat has spent outlives the retired session: cost is a sum
+    // of increments, with nothing session-shaped in it to reset.
+    expect(after.costUsd).toBeCloseTo(12.5, 5);
   });
 
-  it("resetActiveUsage lets the first target usage event log a real delta", () => {
+  it("keeps a retired session from disturbing what turns have billed", () => {
     const chat = cm.create(instanceId, "claude-opus-4-8", "anthropic", "high");
-    // A large source-session total.
-    cm.updateUsage(chat.id, {
-      total: {
-        inputTokens: 800_000,
-        cachedInputTokens: 0,
-        cacheCreationInputTokens: 0,
-        outputTokens: 0,
-        reasoningOutputTokens: 0,
-      },
-      last: {
-        inputTokens: 0,
-        cachedInputTokens: 0,
-        cacheCreationInputTokens: 0,
-        outputTokens: 0,
-        reasoningOutputTokens: 0,
-      },
-      costUsd: 20,
-    });
-    const before = db
-      .select()
-      .from(schema.usageEvents)
-      .all()
-      .filter((e) => e.kind === "usage").length;
+    const settle = (inputTokens: number, costUsd: number) =>
+      cm.recordTurnBilling(chat.id, [
+        {
+          model: chat.model,
+          cacheWrite1hTokens: 0,
+          fast: false,
+          usage: {
+            inputTokens,
+            cachedInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            outputTokens: 0,
+            reasoningOutputTokens: 0,
+            totalTokens: inputTokens,
+          },
+          webSearchRequests: 0,
+          costUsd,
+        },
+      ]);
 
-    // Target-session commit resets the active counters ...
+    // A big source-session turn, then the target-session commit that retires it.
+    settle(800_000, 20);
     cm.resetActiveUsage(chat.id);
-    // ... so the target's first (smaller) cumulative total is not clamped away.
-    cm.updateUsage(chat.id, {
-      total: {
-        inputTokens: 5_000,
-        cachedInputTokens: 0,
-        cacheCreationInputTokens: 0,
-        outputTokens: 1_000,
-        reasoningOutputTokens: 0,
-      },
-      last: {
-        inputTokens: 5_000,
-        cachedInputTokens: 0,
-        cacheCreationInputTokens: 0,
-        outputTokens: 1_000,
-        reasoningOutputTokens: 0,
-      },
-      costUsd: 0.3,
-    });
+    // The target's first turn is much smaller. Under a scheme that diffed
+    // running totals this is where usage got clamped away; here each turn simply
+    // reports its own figures, so there is nothing to clamp.
+    settle(5_000, 0.3);
+
     const usageEvents = db
       .select()
       .from(schema.usageEvents)
       .all()
       .filter((e) => e.kind === "usage");
-    expect(usageEvents.length).toBe(before + 1);
-    const latest = usageEvents.at(-1)!;
-    // Without the reset, 5_000 - 800_000 would clamp to 0 and be dropped.
-    expect(latest.inputTokens).toBe(5_000);
-    expect(latest.outputTokens).toBe(1_000);
-    expect(latest.costUsd).toBeCloseTo(0.3, 5);
+    expect(usageEvents.map((e) => e.inputTokens)).toEqual([800_000, 5_000]);
+    expect(usageEvents.at(-1)!.costUsd).toBeCloseTo(0.3, 5);
+    expect(cm.get(chat.id)?.costUsd).toBeCloseTo(20.3, 5);
+  });
+
+  it("leaves the cost alone for a turn that billed nothing", () => {
+    const chat = cm.create(instanceId, "claude-opus-4-8", "anthropic", "high");
+    const nothing = {
+      model: chat.model,
+      usage: {
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        outputTokens: 0,
+        reasoningOutputTokens: 0,
+        totalTokens: 0,
+      },
+      cacheWrite1hTokens: 0,
+      fast: false,
+      webSearchRequests: 0,
+      costUsd: 0,
+    };
+
+    cm.recordTurnBilling(chat.id, [nothing]);
+    expect(cm.get(chat.id)?.costUsd).toBeNull();
+    expect(
+      db
+        .select()
+        .from(schema.usageEvents)
+        .all()
+        .filter((e) => e.kind === "usage"),
+    ).toEqual([]);
   });
 
   it("resolveForkPoint returns null when the edited prefix crosses providers", () => {

@@ -1,64 +1,63 @@
 #!/usr/bin/env bun
 // Regenerate the static model catalog (packages/shared/src/catalog.ts) from
-// models.dev — first-party, MIT-licensed rate cards plus, for Claude, a
-// per-model reasoning-effort matrix. The catalog used to be discovered per
-// profile at runtime; it's now static, so this is the maintenance path — run it
-// after a new model ships, after bumping the codex binary, or when a provider
-// changes prices.
+// models.dev — first-party, MIT-licensed rate cards plus a per-model
+// reasoning-effort matrix, for both providers. The catalog used to be discovered
+// per profile at runtime; it's now static, so this is the maintenance path — run
+// it after a new model ships or when a provider changes prices.
 //
 //   bun run refresh-catalog             # rewrite the generated blocks in catalog.ts
 //   bun run refresh-catalog --check     # don't write; report drift, exit 1 if any
-//   bun run refresh-catalog anthropic   # only the Claude half (no codex CLI needed)
+//   bun run refresh-catalog anthropic   # only the Claude half
 //   bun run refresh-catalog codex       # only the Codex half
 //
 // Source-of-truth split (what this script owns vs what stays hand-managed):
 //
-//   Codex (OpenAI)
-//     list + names + effort menus  ← `codex app-server` `model/list` (the
-//       user's logged-in account is the authority on which models exist)
-//     pricing                      ← models.dev (codex exposes none)
-//     rewrites  <codex:start>…<codex:end>  and  <codex-pricing:start>…<end>
+//   models.dev, per allowlisted id
+//     name, effort menu, pricing, and — Claude only — context window and the
+//     fast-mode rate card. Neither CLI publishes prices, and neither publishes a
+//     default effort, so those come from here and from the constants below.
+//     Rewrites <anthropic:…>, <codex:…> and <codex-pricing:…>.
 //
-//   Claude (Anthropic)
-//     which ids to offer + order   ← ANTHROPIC_ALLOWLIST in catalog.ts (models.dev
-//       has no per-subscription view and the `claude` CLI has no list command)
-//     name + context + efforts + pricing  ← models.dev, per allowlisted id
-//     rewrites  <anthropic:start>…<anthropic:end>  (pricing is inline; unlike
-//       codex, only subscription-share reads it, via findChatModel().pricing)
-//
-// Not touched by either half: the default frontier/"More…" placement
-// (MORE_BY_DEFAULT_MODEL_IDS) and CODEX_PRICING_HISTORICAL (delisted ids
-// models.dev no longer carries). New/removed ids are flagged so you remember to
-// place them; ids without a models.dev price are flagged too.
+//   Hand-managed in catalog.ts (this script only reads it)
+//     which ids to offer and in what order (ANTHROPIC_ALLOWLIST /
+//     OPENAI_ALLOWLIST — models.dev carries every model either vendor ever
+//     shipped, with no notion of what a plan can reach), which effort levels to
+//     decline (EXCLUDED_EFFORTS), the default frontier/"More…" placement
+//     (MORE_BY_DEFAULT_MODEL_IDS), and CODEX_PRICING_HISTORICAL (delisted ids
+//     models.dev no longer carries). New/removed ids are flagged so you remember
+//     to place them; ids without a models.dev price are flagged too.
 //
 // Changing prices only affects future turns — historical usage is persisted
 // per-turn at the rate in effect (see the usage_events table), never recomputed.
-
-import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ChatEffort } from "../packages/shared/src/base";
-import { ANTHROPIC_ALLOWLIST, CHAT_MODELS, codexPricingFor } from "../packages/shared/src/catalog";
+import {
+  ANTHROPIC_ALLOWLIST,
+  CHAT_MODELS,
+  codexPricingFor,
+  EXCLUDED_EFFORTS,
+  OPENAI_ALLOWLIST,
+} from "../packages/shared/src/catalog";
 
 const CATALOG_PATH = join(import.meta.dir, "../packages/shared/src/catalog.ts");
 const ANTHROPIC_MARKERS = { start: "// <anthropic:start>", end: "// <anthropic:end>" };
 const CODEX_MARKERS = { start: "// <codex:start>", end: "// <codex:end>" };
 const PRICING_MARKERS = { start: "// <codex-pricing:start>", end: "// <codex-pricing:end>" };
+const FAST_PRICING_MARKERS = {
+  start: "// <codex-fast-pricing:start>",
+  end: "// <codex-fast-pricing:end>",
+};
 const MODELSDEV_URL = "https://models.dev/api.json";
 
 // Claude models.dev entries don't publish a default effort, and a few (e.g.
 // Haiku) publish no effort menu at all. Fix a sane default and a full-menu
 // fallback here; both are clamped to whatever menu the model does advertise.
 const ANTHROPIC_DEFAULT_EFFORT: ChatEffort = "high";
+// Codex publishes no default either, and the app-server's (which used to supply
+// it) is gone. "medium" preserves what the committed catalog has always had.
+const CODEX_DEFAULT_EFFORT: ChatEffort = "medium";
 const ANTHROPIC_EFFORT_FALLBACK: ChatEffort[] = ["low", "medium", "high", "xhigh", "max"];
-
-interface CodexModel {
-  id: string;
-  displayName?: string;
-  hidden?: boolean;
-  supportedReasoningEfforts: { reasoningEffort: string }[];
-  defaultReasoningEffort: string;
-}
 
 // USD per million tokens. cacheWrite is Anthropic-only (codex publishes no
 // cache-write rate); both cache fields are optional.
@@ -69,7 +68,8 @@ interface Pricing {
   outputPerMTok: number;
 }
 
-// One Codex catalog entry, reduced to the fields the model-list source owns.
+// One Codex catalog entry. Pricing is referenced by id from CODEX_PRICING rather
+// than inlined, since the server also looks it up there for historical ids.
 interface CodexEntry {
   id: string;
   name: string;
@@ -85,14 +85,26 @@ interface AnthropicEntry {
   supportedEfforts: ChatEffort[];
   defaultEffort: ChatEffort;
   pricing?: Pricing;
+  fastPricing?: Pricing;
 }
 
 // Shape of the slice of models.dev we consume, per provider.
+type ModelsDevCost = {
+  input?: number;
+  output?: number;
+  cache_read?: number;
+  cache_write?: number;
+};
 interface ModelsDevModel {
   name?: string;
   reasoning_options?: { type: string; values?: string[] }[];
   limit?: { context?: number };
-  cost?: { input?: number; output?: number; cache_read?: number; cache_write?: number };
+  cost?: ModelsDevCost;
+  // A separate rate card for a provider's fast mode, where it offers one:
+  // same buckets, premium rates (2× list on Opus 5, 6× on Opus 4.6). Under
+  // `experimental` upstream, so treat its absence as "no fast mode" rather
+  // than an error.
+  experimental?: { modes?: { fast?: { cost?: ModelsDevCost } } };
 }
 interface ModelsDev {
   anthropic?: { models?: Record<string, ModelsDevModel> };
@@ -105,7 +117,13 @@ async function fetchModelsDev(): Promise<ModelsDev> {
   return (await res.json()) as ModelsDev;
 }
 
-function pricingFromCost(cost: ModelsDevModel["cost"]): Pricing | undefined {
+type PricingMode = "standard" | "fast";
+
+function fastPricingFrom(m: ModelsDevModel): Pricing | undefined {
+  return pricingFromCost(m.experimental?.modes?.fast?.cost);
+}
+
+function pricingFromCost(cost: ModelsDevCost | undefined): Pricing | undefined {
   if (!cost || cost.input == null || cost.output == null) return undefined;
   const p: Pricing = { inputPerMTok: cost.input, outputPerMTok: cost.output };
   if (cost.cache_read != null) p.cachedInputPerMTok = cost.cache_read;
@@ -113,103 +131,72 @@ function pricingFromCost(cost: ModelsDevModel["cost"]): Pricing | undefined {
   return p;
 }
 
+// The effort menu one model offers, minus the levels isolade declines
+// (EXCLUDED_EFFORTS). `fallback` covers a model models.dev publishes no
+// reasoning options for; pass [] to treat that as a hard error instead.
+function effortMenu(m: ModelsDevModel, fallback: ChatEffort[]): ChatEffort[] {
+  const advertised = m.reasoning_options?.find((o) => o.type === "effort")?.values;
+  const menu = advertised?.length ? advertised : fallback;
+  return menu.filter((e) => !EXCLUDED_EFFORTS.includes(e)) as ChatEffort[];
+}
+
 // ---------- Codex ----------
 
-// Drive `codex app-server` over stdio JSON-RPC: initialize, then model/list
-// (including hidden, so we can drop them ourselves and log what we dropped).
-async function fetchCodexModels(): Promise<CodexModel[]> {
-  const proc = spawn(
-    "codex",
-    ["app-server", "--listen", "stdio://", "--disable", "apps", "-c", "features.memories=false"],
-    { stdio: ["pipe", "pipe", "pipe"] },
-  );
-
-  let buf = "";
-  let reqId = 0;
-  const pending = new Map<
-    number,
-    (msg: { result?: unknown; error?: { message?: string } }) => void
-  >();
-  const send = (method: string, params: unknown) => {
-    const id = ++reqId;
-    return new Promise<{ result?: unknown; error?: { message?: string } }>((resolve) => {
-      pending.set(id, resolve);
-      proc.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
-    });
-  };
-  proc.stdout.on("data", (chunk: Buffer) => {
-    buf += chunk.toString("utf8");
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const msg = JSON.parse(trimmed);
-        if (msg && typeof msg === "object" && "id" in msg && pending.has(msg.id)) {
-          pending.get(msg.id)?.(msg);
-          pending.delete(msg.id);
-        }
-      } catch {
-        // Non-JSON stdout (startup noise) — ignore.
-      }
-    }
-  });
-
-  const guard = setTimeout(() => {
-    proc.kill();
-    throw new Error("codex app-server timed out; is `codex` installed and logged in?");
-  }, 60_000);
-
-  try {
-    await send("initialize", { clientInfo: { name: "isolade-refresh-catalog", version: "1.0" } });
-    const res = await send("model/list", { includeHidden: true });
-    if (res.error) throw new Error(`codex model/list failed: ${res.error.message}`);
-    return (res.result as { data: CodexModel[] }).data;
-  } finally {
-    clearTimeout(guard);
-    proc.kill();
-  }
-}
-
-// Map codex's shape onto isolade's: drop hidden models and copy the advertised
-// efforts through verbatim (ChatEffort is a free-form string, so there's nothing
-// to filter). A model that somehow advertises no efforts is skipped, since the
-// picker needs at least one.
-function toCodexEntries(models: CodexModel[]): { entries: CodexEntry[]; dropped: string[] } {
-  const dropped: string[] = [];
+// Resolve each allowlisted OpenAI id against models.dev, mirroring the Claude
+// half: same dataset, same fields, same reporting of ids it doesn't carry.
+//
+// This replaced a `codex app-server` `model/list` handshake. That was the better
+// source in theory (the logged-in account knows which models it may use) and not
+// in practice: the result is generated once from a maintainer's account and
+// committed, so no user ever saw their own entitlements, while the dependency
+// meant a catalog refresh needed codex installed and logged in. What we gave up
+// with it is the `hidden` flag, which the allowlist now covers by hand, and the
+// per-model default effort, which we pick ourselves anyway.
+function toCodexEntries(
+  db: ModelsDev,
+  allowlist: readonly string[],
+): { entries: CodexEntry[]; missing: string[]; extra: string[] } {
+  const models = db.openai?.models ?? {};
   const entries: CodexEntry[] = [];
-  for (const m of models) {
-    if (m.hidden) {
-      dropped.push(`${m.id} (hidden)`);
+  const missing: string[] = [];
+  for (const id of allowlist) {
+    const m = models[id];
+    if (!m) {
+      missing.push(id);
       continue;
     }
-    const supportedEfforts = m.supportedReasoningEfforts.map(
-      (e) => e.reasoningEffort as ChatEffort,
-    );
+    const supportedEfforts = effortMenu(m, []);
     const [firstEffort] = supportedEfforts;
     if (!firstEffort) {
-      dropped.push(`${m.id} (no advertised efforts)`);
+      missing.push(`${id} (no advertised efforts)`);
       continue;
     }
-    const declaredDefault = m.defaultReasoningEffort as ChatEffort;
-    const defaultEffort = supportedEfforts.includes(declaredDefault)
-      ? declaredDefault
+    const defaultEffort = supportedEfforts.includes(CODEX_DEFAULT_EFFORT)
+      ? CODEX_DEFAULT_EFFORT
       : firstEffort;
-    entries.push({ id: m.id, name: m.displayName || m.id, supportedEfforts, defaultEffort });
+    entries.push({ id, name: m.name ?? id, supportedEfforts, defaultEffort });
   }
-  return { entries, dropped };
+  // Informational, like the Claude half: a newly-shipped model shouldn't go
+  // unnoticed just because the allowlist predates it. Only the gpt-5+ line is
+  // worth reporting — models.dev carries every OpenAI model ever published.
+  const offered = new Set(allowlist);
+  const extra = Object.keys(models).filter(
+    (id) => !offered.has(id) && /^gpt-[5-9]/.test(id) && models[id]?.reasoning_options?.length,
+  );
+  return { entries, missing, extra };
 }
 
-// models.dev pricing for the given OpenAI-provider ids. Ids the dataset doesn't
-// price are simply absent from the returned map. Codex catalog entries omit
-// cache-write (only input/cached/output are surfaced), so we drop it here —
-// keeping it would show as perpetual drift against the committed CODEX_PRICING.
-function codexPricing(db: ModelsDev, ids: string[]): Map<string, Pricing> {
+// models.dev pricing for the given OpenAI-provider ids, standard or fast-tier.
+// Ids the dataset doesn't price are simply absent from the returned map. Codex
+// reports no cache-creation tokens, so its entries omit cache-write and we drop
+// that rate here — keeping it would show as perpetual drift against the
+// committed records and price a bucket that is always zero.
+function codexPricing(db: ModelsDev, ids: string[], mode: PricingMode = "standard") {
   const models = db.openai?.models ?? {};
   const out = new Map<string, Pricing>();
   for (const id of ids) {
-    const p = pricingFromCost(models[id]?.cost);
+    const m = models[id];
+    const p = pricingFromCost(mode === "fast" ? m?.experimental?.modes?.fast?.cost : m?.cost);
     if (p) {
       delete p.cacheWritePerMTok;
       out.set(id, p);
@@ -242,10 +229,7 @@ function toAnthropicEntries(
       missing.push(`${id} (no context window)`);
       continue;
     }
-    const advertised = m.reasoning_options?.find((o) => o.type === "effort")?.values;
-    const supportedEfforts = (advertised?.length ? advertised : ANTHROPIC_EFFORT_FALLBACK) as
-      | ChatEffort[]
-      | string[] as ChatEffort[];
+    const supportedEfforts = effortMenu(m, ANTHROPIC_EFFORT_FALLBACK);
     const defaultEffort = supportedEfforts.includes(ANTHROPIC_DEFAULT_EFFORT)
       ? ANTHROPIC_DEFAULT_EFFORT
       : supportedEfforts[0];
@@ -258,6 +242,7 @@ function toAnthropicEntries(
       supportedEfforts,
       defaultEffort,
       pricing: pricingFromCost(m.cost),
+      fastPricing: fastPricingFrom(m),
     });
   }
   const offered = new Set(allowlist);
@@ -280,8 +265,8 @@ function renderEfforts(efforts: ChatEffort[]): string {
 // Render a pricing object as an expanded (multiline) literal. models.dev prices
 // can push the inline form past biome's 100-col width, so we always expand for
 // a uniform, format-stable block.
-function renderPricingLiteral(p: Pricing, indent: string): string {
-  const lines = [`${indent}pricing: {`, `${indent}  inputPerMTok: ${p.inputPerMTok},`];
+function renderPricingLiteral(p: Pricing, indent: string, key = "pricing"): string {
+  const lines = [`${indent}${key}: {`, `${indent}  inputPerMTok: ${p.inputPerMTok},`];
   if (p.cachedInputPerMTok != null)
     lines.push(`${indent}  cachedInputPerMTok: ${p.cachedInputPerMTok},`);
   if (p.cacheWritePerMTok != null)
@@ -301,6 +286,7 @@ function renderAnthropicEntry(e: AnthropicEntry): string {
     `    defaultEffort: ${JSON.stringify(e.defaultEffort)},`,
   ];
   if (e.pricing) lines.push(renderPricingLiteral(e.pricing, "    "));
+  if (e.fastPricing) lines.push(renderPricingLiteral(e.fastPricing, "    ", "fastPricing"));
   lines.push("  },");
   return lines.join("\n");
 }
@@ -316,11 +302,20 @@ function renderCodexEntry(e: CodexEntry): string {
     `    supportedEfforts: ${renderEfforts(e.supportedEfforts)},`,
     `    defaultEffort: ${JSON.stringify(e.defaultEffort)},`,
     `    pricing: CODEX_PRICING[${JSON.stringify(e.id)}],`,
+    `    fastPricing: CODEX_FAST_PRICING[${JSON.stringify(e.id)}],`,
     "  },",
   ].join("\n");
 }
 
-// Render one CODEX_PRICING entry for the <codex-pricing:…> block.
+// The lines of a codex pricing record, in catalog order, skipping unpriced ids.
+function renderCodexPricingBlock(ids: string[], pricing: Map<string, Pricing>): string {
+  return ids
+    .filter((id) => pricing.has(id))
+    .map((id) => renderCodexPricing(id, pricing.get(id)!))
+    .join("\n");
+}
+
+// Render one pricing-record entry for a <codex-…pricing:…> block.
 function renderCodexPricing(id: string, p: Pricing): string {
   const parts = [`inputPerMTok: ${p.inputPerMTok}`];
   if (p.cachedInputPerMTok != null) parts.push(`cachedInputPerMTok: ${p.cachedInputPerMTok}`);
@@ -376,7 +371,11 @@ function samePricing(a: Pricing | undefined, b: Pricing | undefined): boolean {
 }
 
 // Print Codex model + pricing drift relative to the committed catalog.
-function reportCodexDrift(entries: CodexEntry[], pricing: Map<string, Pricing>): boolean {
+function reportCodexDrift(
+  entries: CodexEntry[],
+  pricing: Map<string, Pricing>,
+  fastPricing: Map<string, Pricing>,
+): boolean {
   const cur = currentCodexEntries();
   const curById = new Map(cur.map((e) => [e.id, e]));
   const nextById = new Map(entries.map((e) => [e.id, e]));
@@ -400,6 +399,20 @@ function reportCodexDrift(entries: CodexEntry[], pricing: Map<string, Pricing>):
     } else if (!samePricing(codexPricingFor(e.id), live)) {
       console.log(
         `  $ ${e.id} price changed → in=${live.inputPerMTok} cached=${live.cachedInputPerMTok ?? "-"} out=${live.outputPerMTok}`,
+      );
+      drift = true;
+    }
+    // A model that loses its fast card (or never had one) drops the composer's
+    // fast-mode toggle, so report that as drift too rather than only price moves.
+    const liveFast = fastPricing.get(e.id);
+    const currentFast = codexPricingFor(e.id, true);
+    const hadFast = currentFast != null && !samePricing(currentFast, codexPricingFor(e.id));
+    if (!liveFast && hadFast) {
+      console.log(`  ! ${e.id} (no fast-tier rate on models.dev — fast mode will hide)`);
+      drift = true;
+    } else if (liveFast && (!hadFast || !samePricing(currentFast, liveFast))) {
+      console.log(
+        `  $ ${e.id} fast-tier price ${hadFast ? "changed" : "added"} → in=${liveFast.inputPerMTok} out=${liveFast.outputPerMTok}`,
       );
       drift = true;
     }
@@ -450,26 +463,28 @@ function reportAnthropicDrift(entries: AnthropicEntry[]): boolean {
 // ---------- main ----------
 
 async function refreshCodex(src: string, check: boolean): Promise<{ src: string; drift: boolean }> {
-  const models = await fetchCodexModels();
-  const { entries, dropped } = toCodexEntries(models);
-  if (entries.length === 0) throw new Error("codex returned no usable models");
-  const pricing = codexPricing(
-    await sharedDb(),
-    entries.map((e) => e.id),
-  );
+  const db = await sharedDb();
+  const { entries, missing, extra } = toCodexEntries(db, OPENAI_ALLOWLIST);
+  if (missing.length) {
+    throw new Error(
+      `models.dev has no usable entry for: ${missing.join(", ")}. Remove them from OPENAI_ALLOWLIST or fix the id.`,
+    );
+  }
+  if (entries.length === 0) throw new Error("no usable OpenAI models");
+  const ids = entries.map((e) => e.id);
+  const pricing = codexPricing(db, ids);
+  const fastPricing = codexPricing(db, ids, "fast");
 
-  console.log(`\nCodex: ${entries.length} model(s): ${entries.map((e) => e.id).join(", ")}`);
-  if (dropped.length) console.log(`  dropped: ${dropped.join(", ")}`);
+  console.log(`\nCodex: ${entries.length} model(s): ${ids.join(", ")}`);
+  if (extra.length) console.log(`  on models.dev but not offered: ${extra.join(", ")}`);
   console.log(`  priced from models.dev: ${[...pricing.keys()].join(", ") || "(none)"}`);
-  const drift = reportCodexDrift(entries, pricing);
+  console.log(`  fast-tier rates: ${[...fastPricing.keys()].join(", ") || "(none)"}`);
+  const drift = reportCodexDrift(entries, pricing, fastPricing);
   if (check) return { src, drift };
 
   let out = splice(src, CODEX_MARKERS, entries.map(renderCodexEntry).join("\n"));
-  const pricingBlock = entries
-    .filter((e) => pricing.has(e.id))
-    .map((e) => renderCodexPricing(e.id, pricing.get(e.id)!))
-    .join("\n");
-  out = splice(out, PRICING_MARKERS, pricingBlock);
+  out = splice(out, PRICING_MARKERS, renderCodexPricingBlock(ids, pricing));
+  out = splice(out, FAST_PRICING_MARKERS, renderCodexPricingBlock(ids, fastPricing));
   return { src: out, drift };
 }
 
