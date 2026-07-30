@@ -75,6 +75,12 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Fixed
 
+- Codex's tool calls now carry the same icons as Claude's. A shell command gets
+  the terminal prompt, a file change the pencil, a web search the globe, and a
+  plan the checklist, where all four used to sit behind the generic wrench with
+  the internal item type spelled out next to it ("Shell", "FileChange"). A Codex
+  file change also names the file it touched, and counts the rest when it
+  touched several, rather than showing nothing at all.
 - The app stays responsive with many chats open. Chats you are not looking at
   are kept alive so switching back to them is instant, but they no longer cost
   anything to keep around: opening a menu, typing in a new chat, or switching

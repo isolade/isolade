@@ -50,9 +50,16 @@ const TOOL_PRESENTATIONS: Record<string, ToolPresentation> = {
   Task: { icon: Bot },
   Agent: { icon: Bot },
   TodoWrite: { icon: ListChecks, noun: "Todos" },
-  // Codex item types
-  exec_command: { icon: Terminal, noun: "Shell" },
-  file_change: { icon: FilePen, noun: "File change" },
+  // Codex names its calls itself (codexToolName in codex-backend.ts humanizes
+  // the thread item type), so its shell and web search need their own entries
+  // even though Claude's Bash and WebSearch are the same tools. Its "Edit" and
+  // "Read" happen to land on Claude's keys above. Anything else Codex sends
+  // falls through to the wrench with its name, which is what we want for the
+  // long tail (McpToolCall, ImageGeneration, …).
+  Shell: { icon: Terminal },
+  "Web Search": { icon: Globe },
+  FileChange: { icon: FilePen, noun: "File change" },
+  Plan: { icon: ListChecks, noun: "Plan" },
 };
 
 // The words on a tool row, if any. Usually none, because the icon says what

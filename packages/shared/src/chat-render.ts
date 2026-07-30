@@ -159,6 +159,19 @@ export function summarizeChatToolInput(input: unknown): string {
   else if (typeof value.description === "string") summary = value.description;
   else if (Array.isArray(value.command)) summary = value.command.map(String).join(" ");
   else if (typeof value.command === "string") summary = value.command.split("\n")[0] ?? "";
+  // Codex's fileChange item keeps the paths one level down, in a `changes`
+  // array (see FileUpdateChange in its app-server schema). Name the first file
+  // and count the rest, so an edit says which file it touched the way Claude's
+  // does instead of standing there with no argument at all.
+  else if (Array.isArray(value.changes)) {
+    const paths = value.changes
+      .map((change) =>
+        change && typeof change === "object" ? (change as { path?: unknown }).path : undefined,
+      )
+      .filter((path): path is string => typeof path === "string" && path.length > 0);
+    const [first, ...rest] = paths;
+    if (first) summary = rest.length > 0 ? `${first} (+${rest.length} more)` : first;
+  }
   if (summary.length <= TOOL_SUMMARY_PREVIEW_CHARS) return summary;
   return `${summary.slice(0, TOOL_SUMMARY_PREVIEW_CHARS)}\u2026`;
 }
