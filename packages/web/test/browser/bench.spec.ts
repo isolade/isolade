@@ -18,13 +18,14 @@ function stat(samples: number[]) {
   };
 }
 
-test("bench @bench", async ({ page }) => {
+test("bench @bench", async ({ page, browserName }) => {
   test.setTimeout(900_000);
 
   // Engine-phase attribution. Wall-clock says how bad it is; these say which
   // phase is paying, which is the part that is not guessable from the outside.
-  const cdp = await page.context().newCDPSession(page);
-  await cdp.send("Performance.enable");
+  // CDP is Chromium-only, so WebKit runs report wall clock alone.
+  const cdp = browserName === "chromium" ? await page.context().newCDPSession(page) : null;
+  await cdp?.send("Performance.enable");
   const phaseKeys = [
     "TaskDuration",
     "ScriptDuration",
@@ -34,6 +35,7 @@ test("bench @bench", async ({ page }) => {
     "RecalcStyleCount",
   ] as const;
   const readPhases = async (): Promise<Record<string, number>> => {
+    if (!cdp) return {};
     const { metrics } = await cdp.send("Performance.getMetrics");
     return Object.fromEntries(metrics.map((m) => [m.name, m.value]));
   };
@@ -84,13 +86,13 @@ test("bench @bench", async ({ page }) => {
     };
 
     // The old behaviour, reproduced from the page: off-screen panes laid out
-    // and painted like any other content. Toggling this property is exactly
-    // what the fix flips, so it is a faithful A/B without rebuilding the set.
+    // and painted like any other content. This must flip the same property the
+    // app uses, or both columns measure the same thing.
     const setSkipping = async (on: boolean) => {
       const panes = document.querySelectorAll<HTMLElement>(
         '[data-retained-instance][aria-hidden="true"]',
       );
-      for (const pane of panes) pane.style.contentVisibility = on ? "hidden" : "visible";
+      for (const pane of panes) pane.style.display = on ? "none" : "flex";
       document.body.getBoundingClientRect();
       for (let index = 0; index < 3; index++) await frame();
     };
@@ -200,8 +202,8 @@ test("bench @bench", async ({ page }) => {
       await page.evaluate(() => window.__isoladeWorkspaceHarness?.waitFrames(3));
     });
   };
-  const phasesLaidOut = await cycle(false);
-  const phasesSkipped = await cycle(true);
+  const phasesLaidOut = cdp ? await cycle(false) : null;
+  const phasesSkipped = cdp ? await cycle(true) : null;
 
   const report = (m: typeof out.before) => ({
     openPicker: stat(m.open),
@@ -229,7 +231,10 @@ test("bench @bench", async ({ page }) => {
         after: report(out.after),
         pollWithOneChangedInstance: out.poll,
         // One open+close of the model picker, by engine phase.
-        pickerCyclePhases: { laidOut: phasesLaidOut, skipped: phasesSkipped },
+        engine: browserName,
+        pickerCyclePhases: cdp
+          ? { laidOut: phasesLaidOut, skipped: phasesSkipped }
+          : "chromium only",
       },
       null,
       2,

@@ -134,8 +134,13 @@ test.describe("retained workspace", () => {
   test("skipping an off-screen pane preserves its reading position @stress", async ({ page }) => {
     await openWorkspace(page);
 
-    // A freshly revealed pane lands on its tail, not at scrollTop 0.
+    // A freshly revealed pane lands on its tail, not at scrollTop 0. Wait for it
+    // to actually be shown: it is held unpainted while its layout rebuilds, so
+    // measuring on a fixed frame count would sample a pane the reader cannot see.
     await pressRow(page, 0);
+    expect(
+      await page.evaluate(() => window.__isoladeWorkspaceHarness?.waitForActivePaneShown()),
+    ).toBe(true);
     expect(
       await page.evaluate(() =>
         window.__isoladeWorkspaceHarness?.activeTranscriptDistanceFromBottom(),
@@ -157,7 +162,9 @@ test.describe("retained workspace", () => {
     ).toBeGreaterThan(100);
 
     await pressRow(page, 1);
+    await page.evaluate(() => window.__isoladeWorkspaceHarness?.waitForActivePaneShown());
     await pressRow(page, 0);
+    await page.evaluate(() => window.__isoladeWorkspaceHarness?.waitForActivePaneShown());
     const restored = await page.evaluate(() =>
       window.__isoladeWorkspaceHarness?.activeReadingAnchor(),
     );
