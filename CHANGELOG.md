@@ -48,13 +48,7 @@ _Changes landed on `main` that haven't shipped in a release yet._
 ### Changed
 
 - Tool calls in a chat no longer name what they did. A call reads as its icon
-  followed by the file, command, or query it was given, since "Ran" in front of
-  a shell command was a word doing no work, and the argument now has the full
-  width of the row before it truncates. The sweeping highlight moved onto that
-  argument, so a call still shows while it is in flight. Words remain where they
-  are the only thing carrying the meaning: a failed call still says so, a tool
-  with no icon of its own still shows its name, and a call with no argument to
-  show keeps a short noun instead of standing as a bare icon.
+  followed by the file, command, or query it was given.
 - Each chat in the sidebar now shows when it last did something ("just now",
   "46m ago", a date for older chats) under its title, next to the unpushed diff
   counts, which moved off the title line. Both read in a small, quiet type so a
@@ -75,17 +69,10 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Fixed
 
-- Codex's tool calls now carry the same icons as Claude's. A shell command gets
-  the terminal prompt, a file change the pencil, a web search the globe, and a
-  plan the checklist, where all four used to sit behind the generic wrench with
-  the internal item type spelled out next to it ("Shell", "FileChange"). A Codex
-  file change also names the file it touched, and counts the rest when it
-  touched several, rather than showing nothing at all.
-- A Codex shell call now shows the command it ran. Codex runs everything through
-  a login shell, so the row used to read `/bin/bash -lc 'sleep 2'`, spending its
-  first and most readable characters on a wrapper that is the same on every
-  single call. Calls that were already on screen are relabelled too, the next
-  time their chat is opened, rather than keeping the text they were stored with.
+- Codex's tool calls now carry the same icons as Claude's, and a Codex file
+  change names the file it touched.
+- A Codex shell call now shows the command it ran, not the login shell around it
+  (`/bin/bash -lc 'sleep 2'`).
 - The app stays responsive with many chats open. Chats you are not looking at
   are kept alive so switching back to them is instant, but they no longer cost
   anything to keep around: opening a menu, typing in a new chat, or switching
