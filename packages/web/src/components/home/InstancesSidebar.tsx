@@ -200,7 +200,7 @@ const InstanceRow = memo(function InstanceRow({
               className={cn(
                 "block truncate",
                 // Working: a bright glint sweeps across the dimmed title (see
-                // .text-shimmer, shared with in-flight tool verbs). Unread: bold,
+                // .text-shimmer, shared with in-flight tool calls). Unread: bold,
                 // full strength.
                 showWorking && "text-shimmer",
                 showUnread && "font-semibold",

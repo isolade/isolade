@@ -29,44 +29,51 @@ import { UserMessage } from "./UserMessage";
 type ThoughtChunk = Extract<StreamChunk, { kind: "thought" }>;
 const NO_USER_MESSAGE_CAPABILITIES = {};
 
-// Visual presentation per tool: icon + present/past verb. Verb-based naming
-// reads more naturally than the raw tool name ("Reading file.ts" vs "Read:
-// file.ts"). Unknown tools get a generic wrench + the tool name as-is.
-type ToolPresentation = { icon: LucideIcon; present: string; past: string };
+// Visual presentation per tool: an icon, and a noun for the few tools whose own
+// name reads like an internal identifier. No verb: a call renders as its icon
+// plus the call's argument (a page icon next to "src/app.ts"), which says what
+// happened without spending a word on it and leaves the full width to the
+// argument. The `noun` only surfaces on calls that have no argument to show
+// (see labelFor).
+type ToolPresentation = { icon: LucideIcon; noun?: string };
 const TOOL_PRESENTATIONS: Record<string, ToolPresentation> = {
-  Bash: { icon: Terminal, present: "Running", past: "Ran" },
-  Read: { icon: FileText, present: "Reading", past: "Read" },
-  Write: { icon: FilePen, present: "Writing", past: "Wrote" },
-  Edit: { icon: FilePen, present: "Editing", past: "Edited" },
-  MultiEdit: { icon: FilePen, present: "Editing", past: "Edited" },
-  NotebookEdit: { icon: FilePen, present: "Editing", past: "Edited" },
-  Grep: { icon: Search, present: "Searching", past: "Searched" },
-  Glob: { icon: Search, present: "Finding files", past: "Found files" },
-  WebFetch: { icon: Globe, present: "Fetching", past: "Fetched" },
-  WebSearch: {
-    icon: Globe,
-    present: "Searching the web",
-    past: "Searched the web",
-  },
-  Task: { icon: Bot, present: "Delegating", past: "Delegated" },
-  Agent: { icon: Bot, present: "Delegating", past: "Delegated" },
-  TodoWrite: {
-    icon: ListChecks,
-    present: "Updating todos",
-    past: "Updated todos",
-  },
-  // Codex item types
-  exec_command: { icon: Terminal, present: "Running", past: "Ran" },
-  file_change: { icon: FilePen, present: "Editing", past: "Edited" },
+  Bash: { icon: Terminal },
+  Read: { icon: FileText },
+  Write: { icon: FilePen },
+  Edit: { icon: FilePen },
+  MultiEdit: { icon: FilePen },
+  NotebookEdit: { icon: FilePen },
+  Grep: { icon: Search },
+  Glob: { icon: Search },
+  WebFetch: { icon: Globe },
+  WebSearch: { icon: Globe },
+  Task: { icon: Bot },
+  Agent: { icon: Bot },
+  TodoWrite: { icon: ListChecks, noun: "Todos" },
+  // Codex names its calls itself (codexToolName in codex-backend.ts humanizes
+  // the thread item type), so its shell and web search need their own entries
+  // even though Claude's Bash and WebSearch are the same tools. Its "Edit" and
+  // "Read" happen to land on Claude's keys above. Anything else Codex sends
+  // falls through to the wrench with its name, which is what we want for the
+  // long tail (McpToolCall, ImageGeneration, …).
+  Shell: { icon: Terminal },
+  "Web Search": { icon: Globe },
+  FileChange: { icon: FilePen, noun: "File change" },
+  Plan: { icon: ListChecks, noun: "Plan" },
 };
-function presentationFor(name: string): ToolPresentation {
-  return (
-    TOOL_PRESENTATIONS[name] ?? {
-      icon: Wrench,
-      present: `Calling ${name}`,
-      past: `Called ${name}`,
-    }
-  );
+
+// The words on a tool row, if any. Usually none, because the icon says what
+// kind of call it is and the shimmer says whether it is still going. Three
+// cases still need saying out loud:
+//   - failures, where the icon's red tint on its own is too quiet to catch;
+//   - tools we have no icon for, where the name is the only clue what ran;
+//   - calls with no argument to show, which would otherwise leave a bare icon
+//     sitting on an empty line.
+function labelFor(name: string, isError: boolean, summary: string): string | undefined {
+  const known = TOOL_PRESENTATIONS[name];
+  if (isError) return known ? "Failed" : `${name} failed`;
+  if (!known) return name;
+  return summary ? undefined : (known.noun ?? name);
 }
 
 const ThinkingBlock = memo(function ThinkingBlock({ text }: { text: string }) {
@@ -259,9 +266,18 @@ const ToolCallBlock = memo(function ToolCallBlock({
 }) {
   const [open, setOpen] = useState(false);
   const summary = chunk.summary ?? summarizeChatToolInput(chunk.input);
-  const { icon: Icon, present, past } = presentationFor(chunk.name);
+  const Icon = TOOL_PRESENTATIONS[chunk.name]?.icon ?? Wrench;
   const isRunning = chunk.status === "running";
-  const verb = chunk.isError ? "Failed" : isRunning ? present : past;
+  const label = labelFor(chunk.name, chunk.isError === true, summary);
+  // The row leaves the tool and its state to the icon and the shimmer, neither
+  // of which a screen reader can see, so spell them out for it.
+  const spokenLabel = [
+    chunk.name,
+    chunk.isError ? "failed" : isRunning ? "running" : "done",
+    summary,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   useEffect(() => {
     if (open && chunk.detailsAvailable) onRequestDetails?.(chunk.id);
   }, [chunk, onRequestDetails, open]);
@@ -270,6 +286,8 @@ const ToolCallBlock = memo(function ToolCallBlock({
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        aria-label={spokenLabel}
         className="group w-full flex items-center gap-2 text-left text-sm py-0.5 rounded"
       >
         <Icon
@@ -282,23 +300,27 @@ const ToolCallBlock = memo(function ToolCallBlock({
                 : "text-muted-foreground/80",
           )}
         />
-        <span
-          className={cn(
-            "text-[13px] flex-shrink-0",
-            chunk.isError
-              ? "text-destructive font-medium"
-              : isRunning
-                ? "text-shimmer font-medium"
-                : "text-muted-foreground",
-          )}
-        >
-          {verb}
-        </span>
+        {label && (
+          <span
+            className={cn(
+              "text-[13px] flex-shrink-0",
+              chunk.isError
+                ? "text-destructive font-medium"
+                : isRunning
+                  ? "text-shimmer font-medium"
+                  : "text-muted-foreground",
+            )}
+          >
+            {label}
+          </span>
+        )}
         {summary && (
+          // The shimmer used to live on the verb. With the verb gone the
+          // argument carries it, so an in-flight call still reads as active.
           <span
             className={cn(
               "font-mono text-xs truncate min-w-0 flex-1",
-              isRunning ? "text-foreground/70" : "text-muted-foreground/80",
+              isRunning ? "text-shimmer" : "text-muted-foreground/80",
             )}
           >
             {summary}

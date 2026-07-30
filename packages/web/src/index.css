@@ -293,8 +293,8 @@ svg.animate-spin {
 }
 
 /* Shared sweeping-highlight treatment for anything that's actively working: the
-   verb of an in-flight tool call and the sidebar title of a chat whose agent is
-   busy. The text sits at the dimmed muted-foreground and a bright full-strength
+   argument of an in-flight tool call, the "Thinking" label, and the sidebar
+   title of a chat whose agent is busy. The text sits at the dimmed muted-foreground and a bright full-strength
    band sweeps across it, so the highlight reads as a clear travelling glint
    against a lower base rather than a faint dip in otherwise full-strength text.
    The base is the same muted-foreground used across the UI for secondary text,

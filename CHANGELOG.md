@@ -47,6 +47,8 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Changed
 
+- Tool calls in a chat no longer name what they did. A call reads as its icon
+  followed by the file, command, or query it was given.
 - Each chat in the sidebar now shows when it last did something ("just now",
   "46m ago", a date for older chats) under its title, next to the unpushed diff
   counts, which moved off the title line. Both read in a small, quiet type so a
@@ -67,6 +69,10 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Fixed
 
+- Codex's tool calls now carry the same icons as Claude's, and a Codex file
+  change names the file it touched.
+- A Codex shell call now shows the command it ran, not the login shell around it
+  (`/bin/bash -lc 'sleep 2'`).
 - The app stays responsive with many chats open. Chats you are not looking at
   are kept alive so switching back to them is instant, but they no longer cost
   anything to keep around: opening a menu, typing in a new chat, or switching

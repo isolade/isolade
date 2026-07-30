@@ -147,6 +147,42 @@ export const TOOL_INPUT_PREVIEW_CHARS = 1_024;
 export const TOOL_OUTPUT_PREVIEW_CHARS = 2_048;
 export const TOOL_SUMMARY_PREVIEW_CHARS = 512;
 
+// `<path>/bash -lc '<script>'` and its variants: sh, zsh, dash, ksh, `-c`,
+// `--login -c`, double quotes. Only a script quoted as a whole is unwrapped.
+// With an inner quote of the same kind the unescaping is a shell lexer's job,
+// and the raw string, ugly as it is, at least stays true to what ran.
+const WRAPPING_SHELL =
+  /^(?:\S*\/)?(?:bash|sh|zsh|dash|ksh)(?:\s+--?[A-Za-z-]+)*\s+-[A-Za-z]*c\s+(?:'([^']*)'|"([^"\\]*)")$/;
+
+// The one line worth putting on a tool row for a shell call. Codex runs
+// everything through a login shell, so its raw command reads
+// `/bin/bash -lc 'sleep 2'` where only `sleep 2` says anything. It also ships
+// its own parse of the script in `commandActions`, which it collapses to a
+// single entry holding the whole script with the wrapper already stripped
+// whenever it could not break the script into recognized steps (see
+// parse_command in codex's shell-command crate) — exactly the string to show.
+// Where it did recognize several steps, those entries are pipeline pieces, so we
+// unwrap the raw command ourselves rather than joining them back into a command
+// line that never ran.
+function shellCommandSummary(command: string, actions: unknown): string {
+  const script = soleParsedScript(actions) ?? unwrappedScript(command) ?? command;
+  const lines = script.split("\n").map((line) => line.trim());
+  return lines.find((line) => line.length > 0) ?? "";
+}
+
+function soleParsedScript(actions: unknown): string | undefined {
+  if (!Array.isArray(actions) || actions.length !== 1) return undefined;
+  const parsed = actions[0] as { command?: unknown } | null;
+  if (!parsed || typeof parsed.command !== "string" || !parsed.command.trim()) return undefined;
+  return parsed.command;
+}
+
+function unwrappedScript(command: string): string | undefined {
+  const match = WRAPPING_SHELL.exec(command.trim());
+  const inner = match?.[1] ?? match?.[2];
+  return inner?.trim() ? inner : undefined;
+}
+
 export function summarizeChatToolInput(input: unknown): string {
   if (!input || typeof input !== "object") return "";
   const value = input as Record<string, unknown>;
@@ -158,7 +194,21 @@ export function summarizeChatToolInput(input: unknown): string {
   else if (typeof value.pattern === "string") summary = value.pattern;
   else if (typeof value.description === "string") summary = value.description;
   else if (Array.isArray(value.command)) summary = value.command.map(String).join(" ");
-  else if (typeof value.command === "string") summary = value.command.split("\n")[0] ?? "";
+  else if (typeof value.command === "string")
+    summary = shellCommandSummary(value.command, value.commandActions);
+  // Codex's fileChange item keeps the paths one level down, in a `changes`
+  // array (see FileUpdateChange in its app-server schema). Name the first file
+  // and count the rest, so an edit says which file it touched the way Claude's
+  // does instead of standing there with no argument at all.
+  else if (Array.isArray(value.changes)) {
+    const paths = value.changes
+      .map((change) =>
+        change && typeof change === "object" ? (change as { path?: unknown }).path : undefined,
+      )
+      .filter((path): path is string => typeof path === "string" && path.length > 0);
+    const [first, ...rest] = paths;
+    if (first) summary = rest.length > 0 ? `${first} (+${rest.length} more)` : first;
+  }
   if (summary.length <= TOOL_SUMMARY_PREVIEW_CHARS) return summary;
   return `${summary.slice(0, TOOL_SUMMARY_PREVIEW_CHARS)}\u2026`;
 }
@@ -195,7 +245,13 @@ export function boundChatRenderChunks(chunks: ChatRenderChunk[]): ChatRenderChun
     const detailsAvailable = chunk.detailsAvailable === true || input.truncated || output.truncated;
     return {
       ...chunk,
-      summary: chunk.summary ?? summarizeChatToolInput(chunk.input),
+      // Summarize afresh rather than keeping what a stored chunk already
+      // carries. Both projections in chatMessageRenders bake the summary in at
+      // write time, so a change in how a call is summarized would otherwise
+      // never reach a message that had been rendered once, no matter how many
+      // restarts. A chunk whose input was already flattened to a truncated
+      // string has nothing left to summarize and keeps what it came with.
+      summary: summarizeChatToolInput(chunk.input) || chunk.summary || "",
       input: input.value,
       output: output.value,
       ...(detailsAvailable ? { detailsAvailable: true } : {}),

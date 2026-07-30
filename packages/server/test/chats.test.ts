@@ -613,6 +613,45 @@ describe("chat API", () => {
       ) as { summary?: string }[];
       expect(healed[0]?.summary).toStartWith("echo legacy ");
     });
+
+    it("resummarizes a cached tool preview when the summary rules change", async () => {
+      const instanceId = seedInstance();
+      const chat = chatManager.create(instanceId, DEFAULT_ANTHROPIC_MODEL_ID, "anthropic", "high");
+      const assistant = chatManager.addMessage(chat.id, "assistant", "finished");
+      chatManager.setActiveLeaf(chat.id, assistant.id);
+      const input = {
+        command: "/bin/bash -lc 'sleep 2'",
+        commandActions: [{ type: "unknown", command: "sleep 2" }],
+      };
+      chatManager.saveMessageRender(chat.id, assistant.id, [
+        { kind: "tool", id: "shell-tool", name: "Shell", input, status: "done" },
+      ]);
+      // A preview cached while the login-shell wrapper was still shown. The row
+      // is otherwise current: it has a summary, so the legacy heal above skips it.
+      db.update(schema.chatMessageRenders)
+        .set({
+          previewChunks: JSON.stringify([
+            {
+              kind: "tool",
+              id: "shell-tool",
+              name: "Shell",
+              input,
+              status: "done",
+              summary: "/bin/bash -lc 'sleep 2'",
+            },
+          ]),
+        })
+        .where(eq(schema.chatMessageRenders.messageId, assistant.id))
+        .run();
+
+      const response = await fetch(
+        `${baseUrl}/api/instances/${instanceId}/chats/${chat.id}/transcript`,
+      );
+      const transcript = (await response.json()) as {
+        chunksByMessage: Record<string, { summary?: string }[]>;
+      };
+      expect(transcript.chunksByMessage[assistant.id]?.[0]?.summary).toBe("sleep 2");
+    });
   });
 
   describe("POST /api/instances/:id/chats/:chatId/messages", () => {
