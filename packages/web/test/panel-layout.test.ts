@@ -6,7 +6,6 @@ import {
   collectTabs,
   defaultLayout,
   findTopLeftPanelId,
-  leftEdgePanelIds,
   makeChatTab,
   makeTab,
   moveTab,
@@ -175,18 +174,6 @@ describe("workspace edge panels", () => {
     const topEdge = topEdgePanelIds(colSplit);
     expect(topEdge.size).toBe(1);
     expect(topEdge.has(asPanel(colSplit.children[0]).id)).toBe(true);
-  });
-
-  it("counts both children of a column split but only the left of a row split", () => {
-    const start = asPanel(defaultLayout(["c1", "c2"]));
-    const rowSplit = asSplit(moveTab(start, start.tabs[1]!.id, start.id, "right"));
-    const leftEdge = leftEdgePanelIds(rowSplit);
-    expect(leftEdge.size).toBe(1);
-    expect(leftEdge.has(asPanel(rowSplit.children[0]).id)).toBe(true);
-
-    const colStart = asPanel(defaultLayout(["c1", "c2"]));
-    const colSplit = asSplit(moveTab(colStart, colStart.tabs[1]!.id, colStart.id, "bottom"));
-    expect(leftEdgePanelIds(colSplit).size).toBe(2);
   });
 });
 

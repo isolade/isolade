@@ -64,7 +64,6 @@ import {
   type DropZone,
   defaultLayout,
   findTopLeftPanelId,
-  leftEdgePanelIds,
   makeChatTab,
   makeTab,
   makeTerminalTab,
@@ -123,7 +122,6 @@ export interface DragState {
 // doesn't re-render on every pointer move. The drag ghost/preview live in a
 // separate <DragLayer> instead.
 interface WorkspaceCtx {
-  leftEdge: Set<string>;
   topEdge: Set<string>;
   topLeftPanelId: string;
   focusedPanelId: string;
@@ -595,7 +593,6 @@ export default function PanelWorkspace({
     [applyLayout, hitTest],
   );
 
-  const leftEdge = useMemo(() => (layout ? leftEdgePanelIds(layout) : new Set<string>()), [layout]);
   const topEdge = useMemo(() => (layout ? topEdgePanelIds(layout) : new Set<string>()), [layout]);
   const topLeftPanelId = useMemo(() => (layout ? findTopLeftPanelId(layout) : ""), [layout]);
   const effectiveFocusedPanelId =
@@ -731,7 +728,6 @@ export default function PanelWorkspace({
 
   const ctx = useMemo<WorkspaceCtx>(
     () => ({
-      leftEdge,
       topEdge,
       topLeftPanelId,
       focusedPanelId: effectiveFocusedPanelId,
@@ -747,7 +743,6 @@ export default function PanelWorkspace({
       tabLabel,
     }),
     [
-      leftEdge,
       topEdge,
       topLeftPanelId,
       effectiveFocusedPanelId,
@@ -1098,7 +1093,6 @@ function SplitView({ node }: { node: SplitNode }) {
 
 function PanelView({ panel }: { panel: PanelNode }) {
   const ctx = useWorkspace();
-  const isLeftEdge = ctx.leftEdge.has(panel.id);
   const isTopEdge = ctx.topEdge.has(panel.id);
   const isTopLeft = panel.id === ctx.topLeftPanelId;
   const isFocused = panel.id === ctx.focusedPanelId;
@@ -1119,10 +1113,7 @@ function PanelView({ panel }: { panel: PanelNode }) {
       {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions */}
       <div
         data-strip-id={panel.id}
-        className={cn(
-          "flex items-center h-8 bg-background flex-shrink-0 select-none",
-          isLeftEdge && !ctx.sidebarCollapsed && "pl-1.5",
-        )}
+        className="flex items-center h-8 bg-background flex-shrink-0 select-none"
         {...stripDrag}
       >
         {isTopLeft && ctx.sidebarCollapsed && ctx.chromeInset > 0 && (
