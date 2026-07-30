@@ -22,6 +22,10 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Changed
 
+- Each chat in the sidebar now shows when it last did something ("just now",
+  "46m ago", a date for older chats) under its title, next to the unpushed diff
+  counts, which moved off the title line. Both read in a small, quiet type so a
+  long list still scans as a list of titles.
 - The thinking indicator no longer pulses and sways while an agent thinks. Its
   icon now sits still like every other icon in the chat, and the sweeping
   highlight on the "Thinking" label still marks the turn as active.
