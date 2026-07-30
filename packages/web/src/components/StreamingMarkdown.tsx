@@ -1,4 +1,5 @@
 import { memo, useRef } from "react";
+import { retainMarkdownCache } from "@/lib/markdown-cache";
 import { type MarkdownFragment, StreamingMarkdownCache } from "@/lib/streaming-markdown";
 import Markdown from "./Markdown";
 
@@ -38,6 +39,15 @@ export interface StreamingMarkdownProps {
   streaming?: boolean;
   /** Exposed for session ownership and deterministic work-count tests. */
   cache?: StreamingMarkdownCache;
+  /**
+   * Stable identity for this piece of content, normally the message id plus a
+   * discriminator. Given one, the parse is kept outside the component tree and
+   * survives unmounting, so a row can be dropped and remounted without redoing
+   * it. Without one the parse lives and dies with the component, which is only
+   * right for content that has no identity to key by (a live turn before it
+   * commits).
+   */
+  cacheKey?: string;
 }
 
 /** Proper live Markdown whose parser-derived sealed blocks retain identity. */
@@ -45,10 +55,14 @@ export const StreamingMarkdown = memo(function StreamingMarkdown({
   content,
   streaming = false,
   cache,
+  cacheKey,
 }: StreamingMarkdownProps) {
   const localCacheRef = useRef<StreamingMarkdownCache | null>(null);
   if (!localCacheRef.current) localCacheRef.current = new StreamingMarkdownCache();
-  const model = (cache ?? localCacheRef.current).update(content, streaming, streaming);
+  // A streaming turn keeps its parser local: it has no settled identity yet,
+  // and its content changes every frame, so there is nothing to reuse later.
+  const keyed = cacheKey !== undefined && !streaming ? retainMarkdownCache(cacheKey) : null;
+  const model = (cache ?? keyed ?? localCacheRef.current).update(content, streaming, streaming);
 
   return (
     <>

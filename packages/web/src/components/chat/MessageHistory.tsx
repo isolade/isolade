@@ -231,6 +231,7 @@ export const MessageRow = memo(function MessageRow({
               <>
                 <StreamView
                   chunks={chunks}
+                  cacheScope={streaming ? undefined : message.id}
                   showDebug={showDebug}
                   streaming={streaming}
                   instanceId={instanceId}
@@ -247,7 +248,7 @@ export const MessageRow = memo(function MessageRow({
                 )}
               </>
             ) : (
-              <StreamingMarkdown content={message.content} />
+              <StreamingMarkdown content={message.content} cacheKey={`${message.id}:content`} />
             )}
             {version && (
               <VersionPager

@@ -27,6 +27,8 @@ export interface WorkspaceHarnessApi {
    * Markdown was re-parsed and no historical row was re-rendered.
    */
   renderMetrics: () => MetricSnapshot;
+  /** Unmount the whole workspace and mount it again. */
+  remountWorkspace: () => Promise<void>;
   /** Dirty one instance row, then let one poll cycle deliver it. */
   pollWithChange: () => Promise<CommitProfile>;
   /** Press an element and report the wall clock until the frame after it lands. */
@@ -81,6 +83,10 @@ function activeScroller(): HTMLElement {
 }
 
 export function WorkspaceHarness() {
+  // Lets a test tear the whole workspace out of the tree and put it back, which
+  // is the only way to state that the parse survives a row's mount rather than
+  // merely never being asked to repeat while the row is retained.
+  const [mounted, setMounted] = useState(true);
   const parameters = useMemo(() => new URLSearchParams(window.location.search), []);
   const [mock] = useState<WorkspaceApiMock>(() =>
     installWorkspaceApiMock({
@@ -109,6 +115,14 @@ export function WorkspaceHarness() {
       },
       profile: snapshot,
       renderMetrics: () => getRenderMetrics().snapshot(),
+      async remountWorkspace() {
+        setMounted(false);
+        await frame();
+        await frame();
+        setMounted(true);
+        await frame();
+        await frame();
+      },
       async pollWithChange() {
         await api.resetProfile();
         mock.touchInstance(0);
@@ -177,7 +191,7 @@ export function WorkspaceHarness() {
   return (
     <Profiler id="workspace" onRender={onRender}>
       <div className="flex h-screen flex-col bg-background text-foreground">
-        <HomeTab isTauri={false} />
+        {mounted && <HomeTab isTauri={false} />}
       </div>
     </Profiler>
   );

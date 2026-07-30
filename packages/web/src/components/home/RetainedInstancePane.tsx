@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useState } from "react";
 import type {
   AttachedPr,
   ChatModelDefinition,
@@ -12,12 +12,6 @@ import PanelWorkspace from "./PanelWorkspace";
 
 const EMPTY_PORTS: PortForward[] = [];
 const EMPTY_PRS: AttachedPr[] = [];
-
-// Frames the outgoing pane keeps covering the switch, and the ceiling on how
-// long the incoming one waits for its transcript height to stop moving. The
-// first must exceed the second, or the hand-off shows a gap.
-const SETTLE_MAX_FRAMES = 12;
-const HIDE_DELAY_FRAMES = 16;
 
 interface RetainedInstancePaneProps {
   instance: Instance;
@@ -78,59 +72,20 @@ function RetainedInstancePane({
   onTerminalCreated,
   onTerminalDeleted,
 }: RetainedInstancePaneProps) {
-  // Taking a pane out of the box tree discards its layout, so both edges of a
-  // switch need a grace period, measured in frames:
-  //
-  //  - Hiding waits, because the commit that hides a pane is also the commit
-  //    where Chat captures its reading anchor, and a pane with no boxes measures
-  //    as zero. The outgoing pane also stays *painted* through the wait, so it
-  //    covers the incoming one while that settles.
-  //  - Revealing puts the boxes back immediately, but keeps the pane unpainted
-  //    until its transcript's height stops moving. Rebuilding the layout of a
-  //    long transcript takes a few frames, and it would otherwise paint scrolled
-  //    to the top and then a screen short of the tail before landing.
+  // Hiding is deferred by a frame, because the commit that hides a pane is also
+  // the commit where Chat captures its reading anchor, and a pane with no boxes
+  // measures as zero. Revealing is not deferred: the boxes come back during the
+  // same render, before any layout effect reads them, and Chat absorbs the
+  // transcript's rebuild before each paint rather than a frame later.
   const [skipped, setSkipped] = useState(!active);
-  const [settled, setSettled] = useState(active);
   useEffect(() => {
-    if (!active) {
-      setSettled(false);
-      // Outlast the incoming pane's settle, so the reader keeps seeing the chat
-      // they are leaving instead of a gap. It sits above the incoming one until
-      // it goes, so the two never both show.
-      let raf = 0;
-      let framesLeft = HIDE_DELAY_FRAMES;
-      const step = () => {
-        if (--framesLeft <= 0) {
-          setSkipped(true);
-          return;
-        }
-        raf = requestAnimationFrame(step);
-      };
-      raf = requestAnimationFrame(step);
-      return () => cancelAnimationFrame(raf);
+    if (active) {
+      setSkipped(false);
+      return;
     }
-    setSkipped(false);
-    // Wait for the transcript's height to stop changing, bounded so a chat that
-    // never settles (a live stream) still appears promptly.
-    let raf = 0;
-    let lastHeight = -1;
-    let stableFrames = 0;
-    let framesLeft = SETTLE_MAX_FRAMES;
-    const step = () => {
-      const scroller = paneRef.current?.querySelector<HTMLElement>("[data-chat-scroll]");
-      const height = scroller?.scrollHeight ?? 0;
-      const stable = height > 0 && height === lastHeight;
-      lastHeight = height;
-      if ((stable && ++stableFrames >= 2) || --framesLeft <= 0) {
-        setSettled(true);
-        return;
-      }
-      raf = requestAnimationFrame(step);
-    };
-    raf = requestAnimationFrame(step);
+    const raf = requestAnimationFrame(() => setSkipped(true));
     return () => cancelAnimationFrame(raf);
   }, [active]);
-  const paneRef = useRef<HTMLDivElement>(null);
 
   const detachPr = useCallback(
     (pr: AttachedPr) => onDetachPr(instance.id, pr),
@@ -139,7 +94,6 @@ function RetainedInstancePane({
 
   return (
     <div
-      ref={paneRef}
       data-retained-instance={instance.id}
       className="absolute inset-0 flex min-h-0"
       aria-hidden={!active}
@@ -151,11 +105,7 @@ function RetainedInstancePane({
         // nested scroller inert in macOS WebKit.
         contain: "layout style",
         display: !active && skipped ? "none" : "flex",
-        // The pane being left stays on top until it is dropped, so it covers the
-        // incoming one for the frames that one spends rebuilding its layout.
-        zIndex: active ? 0 : 1,
-        visibility: active && !settled ? "hidden" : "visible",
-        opacity: active || !skipped ? 1 : 0,
+        opacity: active ? 1 : 0,
         pointerEvents: active ? "auto" : "none",
       }}
     >
