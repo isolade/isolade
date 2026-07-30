@@ -81,6 +81,7 @@ export function WorkspaceHarness() {
       chatsPerInstance: Number(parameters.get("chatsPerInstance") ?? 2),
       messagesPerChat: Number(parameters.get("messages") ?? 120),
       split: parameters.get("split") === "1",
+      prsPerInstance: Number(parameters.get("prs") ?? 0),
       profileId: "profile-test",
     }),
   );

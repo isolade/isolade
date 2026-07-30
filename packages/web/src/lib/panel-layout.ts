@@ -82,6 +82,15 @@ export function findTopLeftPanelId(node: LayoutNode): string {
   return node.type === "panel" ? node.id : findTopLeftPanelId(node.children[0]);
 }
 
+// The rightmost-topmost leaf panel: follow the second child of a row split (it
+// sits to the right) and the first child of a column split (it sits on top).
+// This is the panel whose tab strip ends at the window's top-right corner, which
+// is where instance-wide status (the attached-PR badge) belongs.
+export function findTopRightPanelId(node: LayoutNode): string {
+  if (node.type === "panel") return node.id;
+  return findTopRightPanelId(node.children[node.direction === "row" ? 1 : 0]);
+}
+
 // Panels whose tab strip touches the top edge of the window. A row split spans
 // the full height so BOTH children reach the top; a column split stacks, so
 // only its first (top) child does. These strips double as the window title bar,

@@ -1,5 +1,5 @@
-import { CHAT_MODELS } from "@isolade/shared";
-import type { Chat, Instance, Layout } from "@/lib/contracts";
+import { CHAT_MODELS, type PrRefBody } from "@isolade/shared";
+import type { AttachedPr, Chat, Instance, Layout } from "@/lib/contracts";
 
 // An in-page stand-in for the API server, installed over `window.fetch` before
 // the workspace mounts. Playwright's own request interception routes every call
@@ -15,7 +15,35 @@ export interface WorkspaceFixtureOptions {
   messagesPerChat: number;
   /** Give each instance a two-panel layout, so two chat bodies mount per instance. */
   split: boolean;
+  /** Attached pull requests per instance, for the tab strip's PR badge. */
+  prsPerInstance: number;
   profileId: string;
+}
+
+// Attached PRs for one instance, cycling through the states the badge draws so a
+// single fixture covers open, draft, merged and closed.
+const PR_STATES: { state: AttachedPr["state"]; isDraft: boolean }[] = [
+  { state: "open", isDraft: false },
+  { state: "merged", isDraft: false },
+  { state: "open", isDraft: true },
+  { state: "closed", isDraft: false },
+];
+
+function prsFor(instanceIndex: number, count: number): AttachedPr[] {
+  return Array.from({ length: count }, (_, index) => {
+    const { state, isDraft } = PR_STATES[index % PR_STATES.length] as (typeof PR_STATES)[number];
+    const number = 100 + instanceIndex * 10 + index;
+    return {
+      host: "github.com",
+      owner: "tenzir",
+      repo: "isolade",
+      number,
+      title: `Keep the retained workspace out of the rendering path (${number})`,
+      state,
+      isDraft,
+      url: `https://github.com/tenzir/isolade/pull/${number}`,
+    };
+  });
 }
 
 // A turn's worth of assistant output, cycling through the shapes that actually
@@ -155,7 +183,14 @@ export interface WorkspaceApiMock {
 }
 
 export function installWorkspaceApiMock(options: WorkspaceFixtureOptions): WorkspaceApiMock {
-  const { instances: instanceCount, chatsPerInstance, messagesPerChat, split, profileId } = options;
+  const {
+    instances: instanceCount,
+    chatsPerInstance,
+    messagesPerChat,
+    split,
+    prsPerInstance,
+    profileId,
+  } = options;
   const now = new Date();
   const instances: Instance[] = Array.from({ length: instanceCount }, (_, index) => ({
     id: `instance-${index}`,
@@ -167,6 +202,7 @@ export function installWorkspaceApiMock(options: WorkspaceFixtureOptions): Works
     profileId,
     diffAdded: index,
     diffDeleted: 0,
+    prs: prsFor(index, prsPerInstance),
     working: false,
     unread: false,
     archived: false,
@@ -267,6 +303,25 @@ export function installWorkspaceApiMock(options: WorkspaceFixtureOptions): Works
     const layout = path.match(/^\/api\/instances\/([^/]+)\/layout$/);
     if (layout) return json({ layout: layouts.get(layout[1]!) ?? null });
     if (/^\/api\/instances\/[^/]+\/terminals$/.test(path)) return json([]);
+    // Detaching a PR has to stick, or the once-a-second instance poll would put
+    // the badge straight back.
+    const prs = path.match(/^\/api\/instances\/([^/]+)\/prs$/);
+    if (prs && method === "DELETE") {
+      const instance = instances.find((row) => row.id === prs[1]);
+      const ref = JSON.parse(String(init?.body ?? "{}")) as Partial<PrRefBody>;
+      if (instance) {
+        instance.prs = (instance.prs ?? []).filter(
+          (pr) =>
+            !(
+              pr.host === ref.host &&
+              pr.owner === ref.owner &&
+              pr.repo === ref.repo &&
+              pr.number === ref.number
+            ),
+        );
+      }
+      return json({ ok: true });
+    }
     if (/^\/api\/instances\/[^/]+\/read$/.test(path)) return json({ ok: true });
     const transcript = path.match(/^\/api\/instances\/[^/]+\/chats\/([^/]+)\/transcript$/);
     if (transcript) return json(transcripts.get(transcript[1]!) ?? transcriptFor("unknown", 0));

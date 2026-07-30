@@ -218,3 +218,67 @@ test.describe("retained workspace", () => {
     expect(metrics?.historicalRowRenders).toBe(0);
   });
 });
+
+// The attached-PR badge is instance-wide status living in panel chrome, so what
+// matters is that it appears once per workspace, in the tab strip rather than in
+// a row of its own, and that it stays out of the transcript's way.
+test.describe("attached PR badge", () => {
+  const openInstance = async (page: Page, prs: number, split: boolean) => {
+    await page.goto(
+      `/test/browser/harness/index.html?workspace=1&instances=2&chatsPerInstance=2` +
+        `&messages=6&prs=${prs}${split ? "&split=1" : ""}`,
+    );
+    await page.waitForFunction(
+      () => document.documentElement.dataset.workspaceHarnessReady === "true",
+    );
+    await pressRow(page, 0);
+    await expect(page.locator('[data-retained-instance][aria-hidden="false"]')).toHaveCount(1);
+  };
+
+  const visible = (page: Page, selector: string) =>
+    page.locator(`[data-retained-instance][aria-hidden="false"] ${selector}`);
+
+  test("sits in one tab strip and leaves the chat body where it was", async ({ page }) => {
+    await openInstance(page, 3, true);
+
+    // Two panels, one badge: the PRs belong to the instance, not to a panel.
+    const badge = visible(page, '[data-demo="pr-badge"]');
+    await expect(visible(page, "[data-strip-id]")).toHaveCount(2);
+    await expect(badge).toHaveCount(1);
+    await expect(badge).toHaveText("3 PRs");
+
+    // In the strip, not above the body: the badge shares the strip's box, and
+    // the body still starts where the strip ends.
+    const strips = await visible(page, "[data-strip-id]").evaluateAll((els) =>
+      els.map((el) => el.getBoundingClientRect().toJSON()),
+    );
+    const badgeBox = (await badge.boundingBox()) ?? { x: 0, y: 0, width: 0, height: 0 };
+    const host = strips.find((strip) => badgeBox.y >= strip.y && badgeBox.y < strip.bottom);
+    expect(host).toBeDefined();
+    // Trailing end of the rightmost strip, past the tabs.
+    expect(badgeBox.x).toBeGreaterThan(Math.max(...strips.map((strip) => strip.x)));
+    const bodyTop = await visible(page, "[data-chat-scroll]")
+      .first()
+      .evaluate((el) => el.getBoundingClientRect().top);
+    expect(bodyTop).toBeCloseTo(host?.bottom ?? -1, 0);
+  });
+
+  test("names a single PR, and opens a menu that detaches one", async ({ page }) => {
+    await openInstance(page, 1, false);
+
+    const badge = visible(page, '[data-demo="pr-badge"]');
+    await expect(badge).toHaveText("#100");
+    await badge.click();
+    const menu = page.locator('[data-slot="dropdown-menu-content"]');
+    await expect(menu).toContainText("tenzir/isolade#100");
+
+    await menu.getByLabel("Detach PR #100").click();
+    // The last PR gone takes the badge (and its menu) with it.
+    await expect(visible(page, '[data-demo="pr-badge"]')).toHaveCount(0);
+  });
+
+  test("is absent from a chat with no attached PR", async ({ page }) => {
+    await openInstance(page, 0, false);
+    await expect(visible(page, '[data-demo="pr-badge"]')).toHaveCount(0);
+  });
+});
