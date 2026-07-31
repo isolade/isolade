@@ -118,6 +118,31 @@ export function getVmMemoryMib(hostMemoryMib = getHostMemoryMib()) {
   return Math.max(1, Math.floor((hostMemoryMib * 3) / 4));
 }
 
+// Logical size of the writable overlay upper (upper.ext4), which is what
+// /workspace and every guest write outside a bind mount land on. Sparse on the
+// host, so this is a ceiling, not an allocation: the formatter writes only its
+// own metadata up front (measured: ~3.6 MiB at 4 GiB, ~8.6 MiB at 64 GiB,
+// ~138 MiB at 1 TiB) and the guest allocates the rest on write. The guest sees
+// 62.9 GiB free of 64 GiB; the ~1 GiB gap is ext4's own metadata (4.2M inodes).
+//
+// 64 GiB, chosen against two costs that both scale with the logical size:
+//   - mkfs runs on the VM-create path, before boot. ~6 ms at 4 GiB, ~95 ms
+//     here, ~2.5s at 1 TiB. Chat creation is latency-sensitive, so a
+//     multi-second format is not acceptable.
+//   - the cap is the only thing containing a runaway write. Below the host's
+//     free space, a `dd` in one chat hits a clean guest ENOSPC and stays that
+//     chat's problem. Above it, the guest keeps writing until the host volume
+//     is full: every other VM's upper starts failing writes, and this guest's
+//     ext4 sees virtio-blk I/O errors (remount-ro) rather than ENOSPC.
+// 64 GiB clears a large monorepo checkout plus node_modules and build output
+// while staying well under a normal host's headroom. microsandbox's own
+// default is 4 GiB, which a single big build can exhaust.
+//
+// Only applies to newly created VMs. Existing uppers keep the size they were
+// formatted at; microsandbox can grow one offline (never live, overlayfs holds
+// it) but shrink is unsupported, so raising this is a one-way door per VM.
+const UPPER_SIZE_MIB = 64 * 1024;
+
 /** The host's canonical IANA timezone, as seen by the sandbox process. */
 export function getHostTimezone(): string | undefined {
   try {
@@ -384,7 +409,9 @@ export class VmManager {
     let patchedHomePaths: string[] = [];
     const networkPolicy = buildNetworkPolicy(opts.hostPorts ?? [], opts.network);
     let builder = Sandbox.builder(name)
-      .image(opts.image)
+      // imageWith (not image) so the overlay upper is sized explicitly. See
+      // UPPER_SIZE_MIB; the default would be 4 GiB.
+      .imageWith((i) => i.oci(opts.image).upperSize(UPPER_SIZE_MIB))
       .hostname("vm")
       // The image is fully ingested into microsandbox's local cache by the
       // builder (post-push `microsandbox pull`), and the in-process registry
@@ -445,7 +472,13 @@ export class VmManager {
     const tBuilderConfigured = performance.now();
 
     const upperPath = join(msbStateHome(), "sandboxes", name, "upper.ext4");
-    const upperTargetBytes = 128 * 1024 * 1024 * 1024;
+    // Must track UPPER_SIZE_MIB: the formatter set_len()s the sparse file to
+    // its full apparent size before writing any metadata, so a threshold above
+    // the configured size is never reached and the timing log below prints "?"
+    // for upperFull/mkfs/postMkfs. (Because set_len comes first, upperAppeared
+    // and upperFull land in the same poll tick, so mkfs reads ~0 and the format
+    // itself is folded into postMkfs.)
+    const upperTargetBytes = UPPER_SIZE_MIB * MIB;
     let tUpperAppeared: number | null = null;
     let tUpperFull: number | null = null;
     const probe = setInterval(() => {
