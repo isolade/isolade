@@ -1,10 +1,12 @@
-// The composer bar's usage surfaces: the running chat cost in the composer's
-// bottom row, the context-pressure bar under the model picker, and the
-// token/cost/subscription breakdowns shown in the picker dropdown. Data comes
-// from Chat.tsx's UsageState (persisted-row seed + live SSE usage events).
+// The composer bar's usage surfaces: whether the agent is working and for how
+// long, the running chat cost beside it in the composer's bottom row, the
+// context-pressure bar under the model picker, and the token/cost/subscription
+// breakdowns shown in the picker dropdown. Data comes from Chat.tsx's UsageState
+// (persisted-row seed + live SSE usage events) and its turn clock.
+import { Check, Loader2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
-import { formatTokens } from "@/lib/format";
+import { formatDuration, formatTokens } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import {
   type ChatCostBreakdown,
@@ -341,6 +343,111 @@ export function CostBreakdownDetail({
         </>
       )}
     </div>
+  );
+}
+
+// Where the composer's turn clock stands. While `running`, `startedAt` is when
+// the turn began on the browser's own clock, or null for a turn whose start
+// nobody knows (a pointer a restarted server left behind, which a client only
+// ever sees for the instant it takes to settle), which shows as working but with
+// no figure to put on it. Once it settles, `lastMs` holds what that turn took,
+// and is null on a chat with no turn worth reporting.
+export interface TurnClock {
+  running: boolean;
+  startedAt: number | null;
+  lastMs: number | null;
+}
+
+// Milliseconds between repaints of a running turn's age. It is shown to the
+// second, so this is the coarsest tick that never leaves a stale figure on
+// screen. Unaligned to the second boundary on purpose: the displayed second can
+// trail the true one by up to a tick, which nobody watching a turn can tell, and
+// aligning would cost a timer reset on every tick.
+const TURN_TICK_MS = 1000;
+
+// Milliseconds since `startedAt`, repainting while it is non-null. Re-reads the
+// clock when a turn begins so the first frame counts from the new start rather
+// than from whenever this component last happened to tick.
+function useElapsed(startedAt: number | null): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (startedAt === null) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), TURN_TICK_MS);
+    return () => window.clearInterval(timer);
+  }, [startedAt]);
+  return startedAt === null ? 0 : now - startedAt;
+}
+
+// Whether the turn clock has anything to put on screen. The separator between
+// this readout and the cost depends on the answer, so it is decided once here
+// rather than inferred again by whoever draws the separator.
+function hasTurnFigure({ running, lastMs }: TurnClock): boolean {
+  return running || lastMs !== null;
+}
+
+// Whether the agent is working, and how long the turn has taken. Sits beside the
+// running cost in the composer's bottom row, because "is it still going" and
+// "what is it costing me" are one glance. A running turn spins and counts up. A
+// settled one swaps the spinner for a tick and holds the final figure, so the
+// last turn's duration is still there to read while the next message is typed. A
+// chat between turns with nothing to report renders nothing rather than a zero.
+//
+// Type comes from the ComposerStatus cluster below rather than being set here, so
+// this and the cost figure share one strut and their digits sit on the same
+// baseline. Sized on its own the 12px text made a 16px line box next to the
+// cost's inherited 24px one, and the two readouts landed a pixel apart.
+export function TurnStatus({ running, startedAt, lastMs }: TurnClock) {
+  const elapsed = useElapsed(running ? startedAt : null);
+  const ms = running ? (startedAt === null ? null : elapsed) : lastMs;
+  if (!hasTurnFigure({ running, startedAt, lastMs })) return null;
+  const shown = ms == null ? null : formatDuration(ms);
+  const label = running
+    ? shown === null
+      ? "Working"
+      : `Working, ${shown} so far`
+    : `Last turn took ${shown}`;
+  return (
+    <span
+      className="flex select-none items-center gap-1 px-1"
+      title={label}
+      aria-label={label}
+      // Deliberately not a live region: the label above is read when focus
+      // reaches the composer's send corner, and announcing a count-up once a
+      // second would talk over everything else.
+    >
+      {running ? (
+        <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden />
+      ) : (
+        <Check className="size-3 shrink-0 text-muted-foreground/70" aria-hidden />
+      )}
+      {shown}
+    </span>
+  );
+}
+
+// The composer's send corner: how the turn is going, then what the chat has
+// spent. One readout in one type, separated the way the rest of the app separates
+// quiet metadata on a line, because two mono figures set side by side with only a
+// gap between them read as two unrelated numbers competing for the corner rather
+// than as one status line. The type is set once here so both figures share a
+// strut and sit on the same baseline, and each figure carries its own inset so
+// the separator is evenly spaced between them.
+export function ComposerStatus({
+  turn,
+  costUsd,
+  loadBreakdown,
+}: {
+  turn: TurnClock;
+  costUsd?: number;
+  loadBreakdown?: () => Promise<ChatCostBreakdown>;
+}) {
+  return (
+    <span className="flex items-center font-mono text-xs tabular-nums text-muted-foreground">
+      <TurnStatus running={turn.running} startedAt={turn.startedAt} lastMs={turn.lastMs} />
+      {hasTurnFigure(turn) && <span className="text-muted-foreground/50">·</span>}
+      <ChatCost costUsd={costUsd} loadBreakdown={loadBreakdown} />
+    </span>
   );
 }
 

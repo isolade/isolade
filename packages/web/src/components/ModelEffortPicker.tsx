@@ -32,8 +32,11 @@ interface ModelEffortPickerProps {
   align?: "start" | "center" | "end";
 }
 
+// `min-w-0 max-w-full` lets the trigger give way inside a composer row too
+// narrow to hold everything, at which point the model name truncates rather than
+// the row growing past the composer's border.
 const TRIGGER_CLS =
-  "group/trigger inline-flex flex-col items-stretch justify-center rounded-md min-h-8 px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50 disabled:pointer-events-none focus-visible:outline-none w-auto";
+  "group/trigger inline-flex flex-col items-stretch justify-center rounded-md min-h-8 min-w-0 max-w-full px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50 disabled:pointer-events-none focus-visible:outline-none w-auto";
 
 export function ModelEffortPicker({
   models,
@@ -62,12 +65,12 @@ export function ModelEffortPicker({
   return (
     <DropdownMenu open={open} onOpenChange={setOpen}>
       <DropdownMenuTrigger disabled={disabled} className={TRIGGER_CLS} data-demo="model-picker">
-        <span className="inline-flex items-center justify-between gap-1">
-          <span>
+        <span className="inline-flex min-w-0 items-center justify-between gap-1">
+          <span className="truncate">
             {currentModel?.name ?? currentModelId}
             {supportedEfforts.length > 1 && <> {effortLabel(currentEffort)}</>}
           </span>
-          <ChevronDownIcon className="size-3.5 opacity-60" />
+          <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
         </span>
         {belowLabel}
       </DropdownMenuTrigger>

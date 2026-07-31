@@ -175,7 +175,7 @@ function seedV3Db(path: string): { chatId: string; newestOrphanId: string } {
   return { chatId, newestOrphanId };
 }
 
-describe("db migrations 3-15 (tree, attachments, rendering, layout, queue, provider identity, chat costs)", () => {
+describe("db migrations 3-16 (tree, attachments, rendering, layout, queue, provider identity, chat costs, turn timing)", () => {
   it("backfills linear parent chains, the active leaf, and the parent index", () => {
     const path = join(tmpdir(), `isolade-mig3-${randomUUID()}.db`);
     try {
@@ -206,7 +206,7 @@ describe("db migrations 3-15 (tree, attachments, rendering, layout, queue, provi
       const raw = new Database(path);
       const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(15);
+      expect(version).toBe(16);
       const messageColumns = raw
         .query("SELECT name FROM pragma_table_info('chat_messages')")
         .all() as Array<{ name: string }>;
@@ -388,7 +388,7 @@ describe("db migration 7 (panel layout)", () => {
       const version = (
         new Database(path).query("PRAGMA user_version").get() as { user_version: number }
       ).user_version;
-      expect(version).toBe(15);
+      expect(version).toBe(16);
     } finally {
       rmSync(path, { force: true });
       rmSync(`${path}-wal`, { force: true });
@@ -502,7 +502,7 @@ describe("db migration 10 (per-message provider identity)", () => {
       const raw = new Database(path);
       const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(15);
+      expect(version).toBe(16);
       const switchesTable = raw
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'provider_switches'")
         .get() as { name: string } | null;
@@ -582,11 +582,82 @@ describe("db migration 12 (per-chat usage attribution)", () => {
       const raw = new Database(path);
       const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(15);
+      expect(version).toBe(16);
       const index = raw
         .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
         .get("idx_usage_events_chat") as { name: string } | null;
       expect(index?.name).toBe("idx_usage_events_chat");
+      raw.close();
+    } finally {
+      rmSync(path, { force: true });
+      rmSync(`${path}-wal`, { force: true });
+      rmSync(`${path}-shm`, { force: true });
+    }
+  });
+});
+
+// A v15 database for the two columns migration 16 adds: chats without the turn
+// clock. Every other table is installed at the current shape by createSchema.
+function seedV15Db(path: string): { chatId: string } {
+  const sqlite = new Database(path);
+  sqlite.run(`
+    CREATE TABLE chats (
+      id TEXT PRIMARY KEY,
+      instance_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      effort TEXT,
+      fast_mode INTEGER NOT NULL DEFAULT 0,
+      claude_session_id TEXT,
+      codex_thread_id TEXT,
+      input_tokens INTEGER,
+      cached_input_tokens INTEGER,
+      cache_creation_input_tokens INTEGER,
+      output_tokens INTEGER,
+      reasoning_output_tokens INTEGER,
+      last_input_tokens INTEGER,
+      last_cached_input_tokens INTEGER,
+      last_cache_creation_input_tokens INTEGER,
+      last_output_tokens INTEGER,
+      last_reasoning_output_tokens INTEGER,
+      model_context_window INTEGER,
+      compacted INTEGER,
+      cost_usd REAL,
+      active_leaf_id TEXT,
+      in_flight_message_id TEXT,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch())
+    )
+  `);
+  const chatId = randomUUID();
+  sqlite.run(
+    `INSERT INTO chats (id, instance_id, model, provider, cost_usd)
+     VALUES (?, ?, 'claude-opus-5', 'anthropic', 1.25)`,
+    [chatId, randomUUID()],
+  );
+  sqlite.run(`PRAGMA user_version = 15`);
+  sqlite.close();
+  return { chatId };
+}
+
+describe("db migration 16 (turn timing)", () => {
+  it("adds an unknown turn clock to an existing chat without disturbing its spend", () => {
+    const path = join(tmpdir(), `isolade-mig16-${randomUUID()}.db`);
+    try {
+      const { chatId } = seedV15Db(path);
+      const db = createDb(path);
+
+      // A past turn's duration cannot be reconstructed (its start was never
+      // recorded), so the chat reports no time and the composer shows none
+      // until its next turn. What it cost is untouched.
+      const chat = db.select().from(schema.chats).where(eq(schema.chats.id, chatId)).get();
+      expect(chat?.turnStartedAt).toBeNull();
+      expect(chat?.lastTurnMs).toBeNull();
+      expect(chat?.costUsd).toBeCloseTo(1.25, 10);
+
+      const raw = new Database(path);
+      const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
+        .user_version;
+      expect(version).toBe(16);
       raw.close();
     } finally {
       rmSync(path, { force: true });

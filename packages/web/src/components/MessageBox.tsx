@@ -16,7 +16,8 @@ interface MessageBoxProps {
   // purpose: this component decides where the bottom row's pieces sit, so every
   // composer in the app lays out identically instead of each caller choosing.
   modelPicker?: React.ReactNode;
-  // Read-only status text for the send corner (the chat's running cost).
+  // Read-only status for the send corner (the turn indicator and its elapsed
+  // time, then the chat's running cost).
   status?: React.ReactNode;
   // Opens the file picker. When provided, the paperclip button is shown on the
   // bottom-left of the composer.
@@ -57,10 +58,10 @@ function resizeTextarea(el: HTMLTextAreaElement) {
 // The one composer in the app: the new-chat draft box and every chat pane render
 // this, so they stay identical. A single column of the textarea, an optional
 // attachment preview strip, then a control row with the attach button and the
-// model picker on the left and the status text plus the send/stop button on the
-// right. (It used to collapse onto one line with the controls while short; that
-// inline mode is gone so the layout is stable regardless of how much has been
-// typed.)
+// model picker on the left and the status pieces plus the send/stop button on
+// the right. (It used to collapse onto one line with the controls while short.
+// That inline mode is gone so the layout is stable regardless of how much has
+// been typed.)
 export function MessageBox({
   value,
   onChange,
@@ -172,13 +173,13 @@ export function MessageBox({
         className="w-full resize-none bg-transparent py-1 text-base leading-relaxed outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50 md:text-sm"
       />
       {attachments}
-      <div className="flex items-center gap-1">
+      <div className="flex min-w-0 items-center gap-1">
         {onAttachClick && (
           <Button
             type="button"
             size="icon"
             variant="ghost"
-            className="size-8 rounded-full text-muted-foreground"
+            className="size-8 shrink-0 rounded-full text-muted-foreground"
             onClick={onAttachClick}
             disabled={disabled}
             aria-label="Attach files"
@@ -186,8 +187,13 @@ export function MessageBox({
             <Paperclip className="size-4" />
           </Button>
         )}
-        {modelPicker}
-        <div className="ml-auto flex items-center gap-1">
+        {/* The model name is what gives way when a docked panel gets narrow
+            enough that the row cannot hold everything: it truncates (the picker
+            shrinks inside this box) while the figures and the send button keep
+            their size. Without a shrinkable slot here the row grew past the
+            composer's rounded border and pushed the send button outside it. */}
+        <div className="flex min-w-0 flex-1 items-center overflow-hidden">{modelPicker}</div>
+        <div className="flex shrink-0 items-center gap-1">
           {status}
           {showStop ? (
             <Button

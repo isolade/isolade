@@ -1786,6 +1786,63 @@ test.describe("message renderer browser gate", () => {
     await expect(cost).toHaveText("$1.25");
   });
 
+  // The composer's other running figure: whether the agent is working, and for
+  // how long. It has to survive the turn ending, which is the point of it: the
+  // last turn's time stays readable next to what the chat cost while the next
+  // message is typed.
+  test("composer times the turn while it runs and holds the figure once it ends", async ({
+    page,
+  }) => {
+    let releaseTurn!: () => void;
+    const turnHeld = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    await page.route("**/api/instances/*/chats/chat-a/messages", async (route) => {
+      if (route.request().method() !== "POST") {
+        await route.fallback();
+        return;
+      }
+      await turnHeld;
+      await route.fulfill({
+        contentType: "text/event-stream",
+        body:
+          'event: message_id\ndata: "production-clock-assistant"\n\n' +
+          'id: 0\nevent: delta\ndata: "Done"\n\n' +
+          "event: done\ndata: null\n\n",
+      });
+    });
+
+    await openProductionHarness(page, 1, { messages: 2 });
+    // Nothing to report before the chat's first turn: the fixture's chat row
+    // carries no duration, so the slot is empty rather than reading zero.
+    await expect(page.getByLabel(/^(Working|Last turn took)/)).toHaveCount(0);
+
+    await page
+      .getByPlaceholder("Message... (Enter to send, Shift+Enter for newline)")
+      .fill("Take your time");
+    await page.getByRole("button", { name: "Send" }).click();
+
+    const working = page.getByLabel(/^Working/);
+    await expect(working).toBeVisible();
+    await expect(working.locator(".animate-spin")).toBeVisible();
+    // Counting, not frozen at its first frame.
+    await expect(working).toHaveText(/[1-9]s$/, { timeout: 5_000 });
+
+    releaseTurn();
+    const settled = page.getByLabel(/^Last turn took/);
+    await expect(settled).toBeVisible();
+    await expect(settled).toHaveText(/^[0-9]+s$/);
+    await expect(settled.locator(".animate-spin")).toHaveCount(0);
+    // And it sits with the cost, ahead of it in the send corner.
+    const times = await settled.boundingBox();
+    const cost = await page
+      .getByRole("button", {
+        name: "What this chat has cost so far, across every agent it has run on",
+      })
+      .boundingBox();
+    expect(times!.x + times!.width).toBeLessThanOrEqual(cost!.x + 1);
+  });
+
   // The picker stays interactive mid-turn and its edits are local until the next
   // send flushes them. Fast mode has to ride that flush like model and effort do:
   // left out of it, the toggle went on showing a premium rate the server had

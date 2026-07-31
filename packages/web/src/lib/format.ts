@@ -20,3 +20,19 @@ export function formatCost(n: number): string {
   if (n < 1) return `$${n.toFixed(3)}`;
   return `$${n.toFixed(2)}`;
 }
+
+// How long a turn has taken, sized for the composer's status line: whole
+// seconds under a minute ("42s"), then a stopwatch reading ("7:03", "1:12:40")
+// so an hour-long turn stays about as narrow as a short one. Seconds are the
+// finest granularity because this counts up in front of the reader, and a
+// tenths digit spinning next to the cost would be noise. Sub-second and
+// negative figures (a clock nudged backwards mid-turn) read as "0s".
+export function formatDuration(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  if (total < 60) return `${total}s`;
+  const seconds = String(total % 60).padStart(2, "0");
+  const minutes = Math.floor(total / 60) % 60;
+  const hours = Math.floor(total / 3600);
+  if (hours === 0) return `${minutes}:${seconds}`;
+  return `${hours}:${String(minutes).padStart(2, "0")}:${seconds}`;
+}

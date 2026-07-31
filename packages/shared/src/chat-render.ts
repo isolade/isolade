@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { dateLikeSchema } from "./base";
 import {
   chatMessageSchema,
   chatSchema,
@@ -99,6 +100,12 @@ export const inFlightChatRenderSchema = z
     messageId: z.string(),
     lastSeq: z.number().int(),
     chunks: z.array(chatRenderChunkSchema),
+    // When this turn started. A client that reattaches to a turn already
+    // running (a reload, a background turn opened minutes later) times it from
+    // here, so the composer shows the turn's real age rather than how long the
+    // browser has been watching. Optional: a turn begun before the server
+    // recorded turn starts has none to report.
+    startedAt: dateLikeSchema.optional(),
   })
   .nullable();
 export type InFlightChatRender = z.infer<typeof inFlightChatRenderSchema>;
