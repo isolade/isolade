@@ -4,10 +4,14 @@ name = "app"
 # truth: it feeds the bundle metadata, ISOLADE_APP_VERSION, and the update
 # telemetry). This crate is never published, so its version stays at 0.0.0.
 version = "0.0.0"
-description = "A Tauri App"
-authors = ["you"]
-license = ""
-repository = ""
+# These are template defaults no longer: the Linux bundler reads `description`
+# and `authors` straight into the .deb's Description and Maintainer fields, so
+# they show up in `apt show isolade`.
+description = "Run coding agents in sealed, throwaway microVMs"
+authors = ["Isolade"]
+license = "Apache-2.0"
+repository = "https://github.com/isolade/isolade"
+homepage = "https://isolade.com"
 edition = "2024"
 rust-version = "1.85"
 

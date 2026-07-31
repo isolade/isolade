@@ -19,6 +19,11 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Fixed
 
+- The Linux package now describes itself. `apt show isolade` reported "A Tauri
+  App" from a maintainer called "you", both left over from the project template,
+  where it now carries a real description, maintainer, homepage and license.
+- The Linux app now has its own icon in launchers, instead of falling back to
+  whatever your desktop shows for an application with no icon at all.
 - On macOS, the window can now be dragged from the title-bar area while Settings
   is open.
 
