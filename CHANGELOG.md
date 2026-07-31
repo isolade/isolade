@@ -6,6 +6,17 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+### Added
+
+- Isolade now installs on Linux distributions that `apt` does not serve. Releases
+  carry the same payload as a plain tarball beside the `.deb`, and the installer
+  reaches for it when there is no `apt`, unpacking into `/opt/isolade` and wiring
+  up the launcher entry and the `isolade` command. WebKitGTK 4.1 and GTK 3 remain
+  your distribution's to provide, so the installer asks the binary what it is
+  missing and names the package that supplies it. NixOS cannot run either
+  artifact unmodified, and now gets told that along with the two ways around it,
+  rather than an install that fails at launch.
+
 ### Fixed
 
 - On macOS, the window can now be dragged from the title-bar area while Settings
