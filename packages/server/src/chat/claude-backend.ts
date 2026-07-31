@@ -452,6 +452,15 @@ export class ClaudeBackend implements ChatBackend {
       model,
       "--dangerously-skip-permissions",
       "--strict-mcp-config",
+      // On its first user message the CLI fires a background Haiku call to
+      // mint a session title of its own. isolade never reads it (chat titles
+      // come from the titling VM, see title-generator.ts), so it's a stray
+      // Haiku charge on every chat, on top of whatever model the chat runs.
+      // The CLI skips that call when the session already carries a custom
+      // title, and --name sets one. Any non-empty string works (the CLI trims
+      // the value and ignores it when empty), so a bare `-` it is.
+      "--name",
+      "-",
       // Disallowed tools. `--disallowedTools` is variadic (space/comma
       // separated) and is a hard removal, not a permission prompt, so it still
       // takes effect under `--dangerously-skip-permissions` above.
