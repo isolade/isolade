@@ -28,14 +28,21 @@ scripts/build.sh
 
 # Package the bundle into a tarball with CLI tar so nothing acquires a
 # com.apple.quarantine xattr. A `curl | tar` install then bypasses Gatekeeper,
-# and the arm64 build already ad-hoc-signed the bundle so it executes without
-# Developer ID signing or notarization.
+# and build.sh has already sealed the bundle with our own signing identity, so it
+# executes without Developer ID signing or notarization.
+#
+# README.txt rides along for whoever downloads this in a browser instead, which
+# does quarantine it: an extracted Isolade.app then refuses to launch as
+# "damaged", and the file is the only place left to say why and what clears it.
+# The installer extracts the Isolade.app member by name so this never lands in
+# /Applications (see install.sh on the website).
 APP_DIR="app/target/release/bundle/macos"
 OUT="dist/isolade-v${VERSION}-macos-arm64.tar.gz"
 
 echo "==> Packaging ${OUT}..."
 mkdir -p dist
-tar -C "$APP_DIR" -czf "$OUT" Isolade.app
+cp scripts/lib/macos-tarball-readme.txt "$APP_DIR/README.txt"
+tar -C "$APP_DIR" -czf "$OUT" Isolade.app README.txt
 
 echo ""
 echo "Done."

@@ -21,8 +21,12 @@
 
 ## Installation
 
-One command for both macOS and Linux.
+One command for both macOS and Linux, and the same one updates an existing install.
 
 ```bash
 curl -fsSL https://isolade.com/install.sh | sh
 ```
+
+Isolade needs an Apple Silicon Mac, or Debian/Ubuntu with KVM. See the
+[installation docs](https://isolade.com/docs/installation) for the full
+requirements, how to pin a release, and how to install by hand instead.
