@@ -240,6 +240,19 @@ export const chats = sqliteTable("chats", {
   createdAt: integer("created_at", { mode: "timestamp" })
     .notNull()
     .$defaultFn(() => new Date()),
+  // What the chat's most recent turn cost in time rather than money, so the
+  // composer can say how long the agent has been working and, once it stops,
+  // how long it took. `turnStartedAt` is stamped when a turn begins and stays
+  // put afterwards. While `inFlightMessageId` is set it is the running turn's
+  // start, which is how a client that reattaches mid-turn (a reload, a
+  // background turn opened later) learns the turn's real age instead of timing
+  // from the moment it connected. `lastTurnMs` is how long the last turn that
+  // settled took, and is cleared at the start of every turn so a turn the
+  // server never saw finish reports nothing rather than the previous figure.
+  // Millisecond precision (timestamp_ms), unlike createdAt above: seconds
+  // cannot express a turn that took a moment.
+  turnStartedAt: integer("turn_started_at", { mode: "timestamp_ms" }),
+  lastTurnMs: integer("last_turn_ms"),
 });
 
 export const chatMessages = sqliteTable("chat_messages", {

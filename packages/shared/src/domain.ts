@@ -285,6 +285,13 @@ export const chatSchema = z.object({
   // one is pending; the picker shows the target model without claiming the
   // switch completed. Cleared once the switch commits or is invalidated.
   pendingSwitch: pendingSwitchSchema.optional(),
+  // How long the chat's most recent settled turn took, in milliseconds. Lets
+  // the composer still show the last turn's duration after a reload, next to
+  // what the chat has cost. Null while a turn is running (the client times that
+  // one itself, from the start on the transcript's in-flight payload) and on
+  // chats that have not finished a turn since the server began recording it.
+  // Optional so producers that predate it (mocks) still parse.
+  lastTurnMs: z.number().int().nonnegative().nullable().optional(),
   createdAt: dateLikeSchema,
 });
 export const chatArraySchema = z.array(chatSchema);

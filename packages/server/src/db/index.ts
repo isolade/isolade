@@ -92,8 +92,14 @@ function defaultDbPath(): string {
  * mode, and `usage_events.fast`, which records whether a turn was actually
  * billed at those premium rates. Both default to off, so no existing chat starts
  * paying a premium and no past turn is re-costed as though it had.
+ *
+ * Version 16 adds `chats.turn_started_at` and `chats.last_turn_ms`, the wall
+ * clock of the chat's most recent turn, so the composer can show how long the
+ * agent has been working and how long the last turn took. Existing rows stay
+ * null: durations only exist for turns run since upgrading, and the indicator
+ * simply shows nothing until the chat's next turn.
  */
-const SCHEMA_VERSION = 15;
+const SCHEMA_VERSION = 16;
 
 /**
  * The complete, current schema: one CREATE TABLE (plus indexes) per table in
@@ -223,7 +229,9 @@ function createSchema(sqlite: Database): void {
       cost_usd REAL,
       active_leaf_id TEXT,
       in_flight_message_id TEXT,
-      created_at INTEGER NOT NULL DEFAULT (unixepoch())
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      turn_started_at INTEGER,
+      last_turn_ms INTEGER
     )
   `);
 
@@ -714,6 +722,16 @@ const migrations: Record<number, (sqlite: Database) => void> = {
     if (!hasEventColumn) {
       sqlite.run(`ALTER TABLE usage_events ADD COLUMN fast INTEGER NOT NULL DEFAULT 0`);
     }
+  },
+  16: (sqlite) => {
+    const has = (column: string) =>
+      sqlite.query(`SELECT name FROM pragma_table_info('chats') WHERE name = ?`).get(column) !=
+      null;
+    // No backfill: a turn's start was never recorded, and its end (the assistant
+    // row's created_at) is only second-precise, so any duration derived for past
+    // turns would be a guess. They stay unknown.
+    if (!has("turn_started_at")) sqlite.run(`ALTER TABLE chats ADD COLUMN turn_started_at INTEGER`);
+    if (!has("last_turn_ms")) sqlite.run(`ALTER TABLE chats ADD COLUMN last_turn_ms INTEGER`);
   },
 };
 

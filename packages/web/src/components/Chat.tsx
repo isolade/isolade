@@ -79,7 +79,13 @@ import {
   type SessionMessageRow,
 } from "./chat/MessageHistory";
 import { QueuedMessages, reconcileQueuedMessageSnapshot } from "./chat/QueuedMessages";
-import { ChatCost, ContextBar, ContextBreakdownDetail, ContextDetail } from "./chat/UsagePanel";
+import {
+  ComposerStatus,
+  ContextBar,
+  ContextBreakdownDetail,
+  ContextDetail,
+  type TurnClock,
+} from "./chat/UsagePanel";
 import { MessageBox } from "./MessageBox";
 import { ModelEffortPicker } from "./ModelEffortPicker";
 
@@ -310,6 +316,55 @@ function Chat({
   // an agent switch, where the seed above is empty but the chat has already
   // spent money.
   const chatCostUsd = usage?.costUsd ?? chat.costUsd ?? undefined;
+  // How long the agent has been working on this turn, and how long the last one
+  // took. Timed on the browser's clock: a turn this tab sent is timed from the
+  // send, and a turn it reattached to from the start the server recorded, so a
+  // reload in the middle of one shows the turn's real age. Seeded like
+  // `streaming` above, so a chat opened with a bootstrap message counts from its
+  // very first frame, and from the persisted row otherwise, so a reload keeps
+  // showing what the last turn took.
+  const [turnClock, setTurnClock] = useState<TurnClock>(() => ({
+    running: !!initialMessage,
+    startedAt: initialMessage ? Date.now() : null,
+    lastMs: chat.lastTurnMs ?? null,
+  }));
+  // Set just before a resumed turn flips `streaming` on, and consumed by the
+  // effect below. Null at rest, meaning this tab is starting the turn itself and
+  // times it from now. A box means the turn was already running, with a null
+  // `startedAt` inside for one whose start the server no longer knows.
+  const resumedTurnRef = useRef<{ startedAt: number | null } | null>(null);
+  // One place decides when the clock runs, driven by the same `streaming` flag
+  // the rest of the composer reads. That flag deliberately stays true across the
+  // detach/reattach a hidden tab performs, so leaving a chat mid-turn and coming
+  // back does not restart the count. It covers the wait as a whole, VM boot on a
+  // brand-new chat included: what it reports is how long the reply has been
+  // coming, which is the figure someone watching the composer is after. Every
+  // field moves at once so no frame pairs a settled mark with a running turn's
+  // figure, at the cost of the state trailing `streaming` by one frame, which
+  // just means the previous state paints for another 16ms.
+  useEffect(() => {
+    if (!streaming) {
+      setTurnClock((clock) =>
+        !clock.running
+          ? clock
+          : {
+              running: false,
+              startedAt: null,
+              // A turn nobody could time reports nothing, rather than the moment
+              // it took us to notice it had already ended.
+              lastMs: clock.startedAt === null ? clock.lastMs : Date.now() - clock.startedAt,
+            },
+      );
+      return;
+    }
+    const resumed = resumedTurnRef.current;
+    resumedTurnRef.current = null;
+    setTurnClock((clock) =>
+      clock.running
+        ? clock
+        : { ...clock, running: true, startedAt: resumed ? resumed.startedAt : Date.now() },
+    );
+  }, [streaming]);
   // Live context breakdown requested from the persistent Claude process when
   // the model picker opens. Refreshed on every open so the table reflects the
   // current session state.
@@ -796,6 +851,9 @@ function Chat({
         setHasOlder(page.hasMore);
         setActiveLeaf(page.messages.at(-1)?.id ?? chatRef.current.activeLeafId ?? null);
         if (transcriptRequests.accepts(generation, ac) && page.inFlight) {
+          // Time this turn from when the server says it began, not from now: it
+          // may have been running for minutes before this tab opened the chat.
+          resumedTurnRef.current = { startedAt: page.inFlight.startedAt?.getTime() ?? null };
           attachResume(page.inFlight.messageId, page.inFlight.lastSeq, page.inFlight.chunks);
         }
       } catch (err) {
@@ -2595,6 +2653,8 @@ function Chat({
         }
         if (!page.inFlight) return;
         streamingRef.current = true;
+        // The promoted turn started on the server, so its clock does too.
+        resumedTurnRef.current = { startedAt: page.inFlight.startedAt?.getTime() ?? null };
         attachResume(page.inFlight.messageId, page.inFlight.lastSeq, page.inFlight.chunks);
       } catch (error) {
         if (!cancelled) console.warn(`[chat] queue reconciliation failed (chat=${chatId}):`, error);
@@ -2829,7 +2889,13 @@ function Chat({
             attachments={
               <AttachmentStrip items={attachments.items} onRemove={attachments.remove} />
             }
-            status={<ChatCost costUsd={chatCostUsd} loadBreakdown={loadCostBreakdown} />}
+            status={
+              <ComposerStatus
+                turn={turnClock}
+                costUsd={chatCostUsd}
+                loadBreakdown={loadCostBreakdown}
+              />
+            }
             modelPicker={
               <ModelEffortPicker
                 models={pickerModels}

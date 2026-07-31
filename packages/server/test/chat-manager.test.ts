@@ -356,6 +356,92 @@ describe("ChatManager", () => {
     });
   });
 
+  describe("turn clock", () => {
+    it("stamps a start when a turn begins and a duration when it commits", () => {
+      const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
+      expect(cm.get(chat.id)?.turnStartedAt).toBeNull();
+      expect(cm.get(chat.id)?.lastTurnMs).toBeNull();
+
+      const before = Date.now();
+      cm.beginTurn(chat.id, "assistant-1", "hello", null);
+      const startedAt = cm.turnStartedAt(chat.id);
+      expect(startedAt).not.toBeNull();
+      expect(startedAt!.getTime()).toBeGreaterThanOrEqual(before);
+      // Nothing to report while the turn runs: the client times the running one
+      // from the start above.
+      expect(cm.get(chat.id)?.lastTurnMs).toBeNull();
+
+      cm.finalizeTurn(chat.id, "assistant-1", "hi", { parentId: null }, []);
+      const settled = cm.get(chat.id);
+      expect(settled?.lastTurnMs).not.toBeNull();
+      expect(settled!.lastTurnMs!).toBeGreaterThanOrEqual(0);
+      expect(settled!.lastTurnMs!).toBeLessThan(Date.now() - before + 1000);
+    });
+
+    it("times a turn that ended with nothing to commit", () => {
+      const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
+      cm.beginInFlightTurn(chat.id, "assistant-1");
+      cm.clearInFlightTurn(chat.id, "assistant-1");
+
+      expect(cm.get(chat.id)?.lastTurnMs).not.toBeNull();
+      expect(cm.get(chat.id)?.inFlightMessageId).toBeNull();
+    });
+
+    it("drops the last turn's duration when the next one starts", () => {
+      const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
+      cm.beginInFlightTurn(chat.id, "assistant-1");
+      cm.clearInFlightTurn(chat.id, "assistant-1");
+      expect(cm.get(chat.id)?.lastTurnMs).not.toBeNull();
+
+      // A running turn is the only one the composer has anything to say about,
+      // so the previous figure goes rather than sitting there looking current.
+      cm.beginInFlightTurn(chat.id, "assistant-2");
+      expect(cm.get(chat.id)?.lastTurnMs).toBeNull();
+    });
+
+    it("leaves a turn begun without a start stamp unmeasured", () => {
+      const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
+      // What a turn started by a build that predates the column looks like: an
+      // in-flight pointer with no start to measure from. Reporting a duration
+      // here would mean timing from the epoch.
+      db.update(schema.chats)
+        .set({ inFlightMessageId: "assistant-1", turnStartedAt: null })
+        .where(eq(schema.chats.id, chat.id))
+        .run();
+
+      cm.clearInFlightTurn(chat.id, "assistant-1");
+      expect(cm.get(chat.id)?.lastTurnMs).toBeNull();
+    });
+
+    it("hands a client reattaching to a live turn the start it began at", () => {
+      const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
+      cm.beginTurn(chat.id, "assistant-1", "hello", null);
+      cm.appendEvent(chat.id, "assistant-1", 0, "delta", "partial");
+
+      // The snapshot a running producer's hub supplies.
+      const page = cm.getChatViewPage(chat.id, null, 60, {
+        inFlightSnapshot: { messageId: "assistant-1", lastSeq: 0, chunks: [] },
+      });
+      expect(page.inFlight?.startedAt?.getTime()).toBe(cm.turnStartedAt(chat.id)?.getTime());
+
+      cm.finalizeTurn(chat.id, "assistant-1", "partial", { parentId: null }, []);
+      expect(cm.getChatViewPage(chat.id, null, 60).inFlight).toBeNull();
+    });
+
+    it("reports no start for a turn pointer no producer is running", () => {
+      const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");
+      cm.beginTurn(chat.id, "assistant-1", "hello", null);
+      cm.appendEvent(chat.id, "assistant-1", 0, "delta", "partial");
+
+      // A restart leaves the pointer and its start behind while the producer is
+      // long dead. Handing that start out would have the client count the hours
+      // since the restart as time the agent spent working.
+      const page = cm.getChatViewPage(chat.id, null, 60);
+      expect(page.inFlight?.messageId).toBe("assistant-1");
+      expect(page.inFlight?.startedAt).toBeUndefined();
+    });
+  });
+
   describe("persisted render snapshots", () => {
     it("returns compact committed state and only the latest reconnect metadata", () => {
       const chat = cm.create(instanceId, "claude-sonnet-4-5", "anthropic", "high");

@@ -6,6 +6,11 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+### Added
+
+- The composer now shows whether the agent is working and how long the turn has
+  taken, next to what the chat has cost.
+
 ## [0.4.0] - 2026-07-31
 
 ### Added

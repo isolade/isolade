@@ -49,6 +49,15 @@ export interface MessageMeta {
 // default before leaving the manager.
 export type Chat = Omit<ChatRow, "effort"> & { effort: ChatEffort };
 
+// How long a turn that is settling right now took, given the start stamped on
+// the chat row when it began. Null when there is no stamp: a turn begun by a
+// build that predates the column reports an unknown duration rather than one
+// measured from the epoch.
+function turnDurationMs(startedAt: Date | null): number | null {
+  if (!startedAt) return null;
+  return Math.max(0, Date.now() - startedAt.getTime());
+}
+
 function hydrate(row: ChatRow): Chat {
   const model = findChatModel(row.model);
   // An effort the model no longer offers snaps to its default here, at the one
@@ -300,10 +309,18 @@ export class ChatManager {
               chunks: boundChatRenderChunks(compactChatRenderEvents(turn.events)),
             }
           : null);
+      // Only a turn a producer is actually running reports when it began:
+      // `inFlightSnapshot` comes from the live hub, while the fallback above is
+      // reconstructed from the event log, which is exactly what a pointer left
+      // behind by a killed producer looks like. Timing that from its start would
+      // bill the agent for every hour since the restart. Left unset instead, so
+      // the client shows a turn it cannot time as working but untimed for the
+      // instant it takes to settle.
+      const startedAt = options.inFlightSnapshot ? this.turnStartedAt(chatId) : null;
       return {
         ...page,
         chunksByMessage,
-        inFlight,
+        inFlight: inFlight && startedAt ? { ...inFlight, startedAt } : inFlight,
         queuedMessages: this.listQueuedMessages(chatId),
       };
     });
@@ -581,7 +598,7 @@ export class ChatManager {
   beginInFlightTurn(chatId: string, messageId: string) {
     this.db.transaction((tx) => {
       tx.update(schema.chats)
-        .set({ inFlightMessageId: messageId })
+        .set({ inFlightMessageId: messageId, turnStartedAt: new Date(), lastTurnMs: null })
         .where(eq(schema.chats.id, chatId))
         .run();
       tx.insert(schema.chatEvents)
@@ -615,7 +632,15 @@ export class ChatManager {
         .run();
       this.db
         .update(schema.chats)
-        .set({ activeLeafId: userMessage.id, inFlightMessageId: assistantMessageId })
+        .set({
+          activeLeafId: userMessage.id,
+          inFlightMessageId: assistantMessageId,
+          // The turn's clock starts here, and the previous turn's duration is
+          // dropped: from now until this turn settles, the running turn is the
+          // only one the composer has anything to say about.
+          turnStartedAt: new Date(),
+          lastTurnMs: null,
+        })
         .where(eq(schema.chats.id, chatId))
         .run();
       this.db
@@ -754,7 +779,7 @@ export class ChatManager {
   ): ChatMessage | null {
     return this.db.transaction(() => {
       const owner = this.db
-        .select({ id: schema.chats.id })
+        .select({ id: schema.chats.id, turnStartedAt: schema.chats.turnStartedAt })
         .from(schema.chats)
         .where(and(eq(schema.chats.id, chatId), eq(schema.chats.inFlightMessageId, messageId)))
         .get();
@@ -763,7 +788,11 @@ export class ChatManager {
       this.saveMessageRender(chatId, messageId, chunks);
       this.db
         .update(schema.chats)
-        .set({ activeLeafId: messageId, inFlightMessageId: null })
+        .set({
+          activeLeafId: messageId,
+          inFlightMessageId: null,
+          lastTurnMs: turnDurationMs(owner.turnStartedAt),
+        })
         .where(and(eq(schema.chats.id, chatId), eq(schema.chats.inFlightMessageId, messageId)))
         .run();
       return message;
@@ -780,12 +809,36 @@ export class ChatManager {
     );
   }
 
+  // When the chat's most recent turn began. Read alongside inFlightMessageId
+  // this is the running turn's start. On a settled chat it is the last turn's,
+  // whose duration lastTurnMs already holds.
+  turnStartedAt(chatId: string): Date | null {
+    return (
+      this.db
+        .select({ startedAt: schema.chats.turnStartedAt })
+        .from(schema.chats)
+        .where(eq(schema.chats.id, chatId))
+        .get()?.startedAt ?? null
+    );
+  }
+
+  // A turn that ended with nothing to commit still ended, and how long it ran
+  // before giving up is worth as much as a successful turn's duration, so this
+  // stops the clock the same way finalizeTurn does.
   clearInFlightTurn(chatId: string, messageId: string) {
-    this.db
-      .update(schema.chats)
-      .set({ inFlightMessageId: null })
-      .where(and(eq(schema.chats.id, chatId), eq(schema.chats.inFlightMessageId, messageId)))
-      .run();
+    this.db.transaction(() => {
+      const owner = this.db
+        .select({ turnStartedAt: schema.chats.turnStartedAt })
+        .from(schema.chats)
+        .where(and(eq(schema.chats.id, chatId), eq(schema.chats.inFlightMessageId, messageId)))
+        .get();
+      if (!owner) return;
+      this.db
+        .update(schema.chats)
+        .set({ inFlightMessageId: null, lastTurnMs: turnDurationMs(owner.turnStartedAt) })
+        .where(and(eq(schema.chats.id, chatId), eq(schema.chats.inFlightMessageId, messageId)))
+        .run();
+    });
   }
 
   saveMessageRender(chatId: string, messageId: string, chunks: ChatRenderChunk[]) {
