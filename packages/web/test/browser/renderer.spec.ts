@@ -171,7 +171,9 @@ async function gluedDelta(page: Page, tabId: string): Promise<number[] | null> {
 }
 
 test.describe("message renderer browser gate", () => {
-  test("renders the thinking indicator and completed Claude summary", async ({ page }) => {
+  test("renders the thinking indicator and keeps the Claude summary collapsed", async ({
+    page,
+  }) => {
     await openProductionHarness(page, 1, { messages: 2, thoughts: true });
 
     const thought = page.locator('[data-thinking-provider="claude"]');
@@ -182,6 +184,47 @@ test.describe("message renderer browser gate", () => {
     await expect(thought).toContainText(
       "I checked the request, the current state, and the relevant implementation details.",
     );
+
+    // Each separator stands between the two figures it separates rather than
+    // leaning against one of them, so the air on its left matches the air on
+    // its right.
+    const separatorAir = await thought.locator("button").evaluate((row) => {
+      // Every glyph on the row in reading order, so the air around a separator
+      // is measured as drawn, whether the dot is its own element or a character
+      // inside a longer run.
+      const glyphs: { char: string; rect: DOMRect }[] = [];
+      const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        const text = node.textContent ?? "";
+        for (let index = 0; index < text.length; index++) {
+          if (!text[index]?.trim()) continue;
+          const range = document.createRange();
+          range.setStart(node, index);
+          range.setEnd(node, index + 1);
+          glyphs.push({ char: text[index]!, rect: range.getBoundingClientRect() });
+        }
+      }
+      const dot = glyphs.findIndex((glyph) => glyph.char === "·");
+      return {
+        before: glyphs[dot]!.rect.left - glyphs[dot - 1]!.rect.right,
+        after: glyphs[dot + 1]!.rect.left - glyphs[dot]!.rect.right,
+      };
+    });
+    expect(separatorAir.before).toBeGreaterThan(0);
+    expect(Math.abs(separatorAir.before - separatorAir.after)).toBeLessThanOrEqual(1);
+
+    // Reasoning stays folded away until asked for, so the answer sits directly
+    // under the row. Clicking it opens the summary, and the clipped body takes
+    // up no height at all until then.
+    const body = thought.locator("[data-thinking-body]");
+    const toggle = thought.getByRole("button");
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect((await body.boundingBox())?.height).toBe(0);
+
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await expect(body).toHaveAttribute("data-thinking-body", "open");
+    await expect.poll(async () => (await body.boundingBox())?.height ?? 0).toBeGreaterThan(0);
   });
 
   test("keeps expanded-sidebar tabs flush with the panel edge", async ({ page }) => {
@@ -1218,6 +1261,79 @@ test.describe("message renderer browser gate", () => {
     expect(Math.abs(after.anchorTop - before.anchorTop)).toBeLessThanOrEqual(1);
     expect(after.distance).toBeGreaterThan(500);
     await expect(page.getByRole("button", { name: "Jump to latest" })).toBeVisible();
+  });
+
+  test("production Chat lands live reasoning whole while it paces the answer", async ({ page }) => {
+    const messageId = "chat-a-thought-reveal-production";
+    const reasoning =
+      "Reasoning is not the answer, so it arrives in one piece rather than a character at a time. ".repeat(
+        3,
+      );
+    // Long enough that pacing it out takes a couple of seconds even at the
+    // catch-up rate, so the frame this test reads is unambiguously mid-reveal.
+    const answer = "The answer itself is paced out for a reader. ".repeat(30);
+    let releaseTurn!: () => void;
+    const turnRelease = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+
+    await page.route("**/api/instances/*/chats/*/transcript?*", async (route) => {
+      await route.fulfill({ json: transcriptFixture("chat-a", 4) });
+    });
+    await page.route("**/api/instances/*/chats/chat-a/messages", async (route) => {
+      await turnRelease;
+      const userMessage = {
+        id: "chat-a-thought-reveal-user",
+        chatId: "chat-a",
+        role: "user",
+        content: "Think first",
+        parentId: "chat-a-production-m3",
+        createdAt: new Date(20_000).toISOString(),
+      };
+      const thought = { id: "live-thought", provider: "claude" };
+      await route.fulfill({
+        contentType: "text/event-stream",
+        body:
+          `event: user_message\ndata: ${JSON.stringify(userMessage)}\n\n` +
+          `event: message_id\ndata: ${JSON.stringify(messageId)}\n\n` +
+          `id: 0\nevent: thinking_start\ndata: ${JSON.stringify(thought)}\n\n` +
+          `id: 1\nevent: thinking_delta\ndata: ${JSON.stringify({ ...thought, text: reasoning })}\n\n` +
+          `id: 2\nevent: thinking_tokens\ndata: ${JSON.stringify({ ...thought, tokens: 412 })}\n\n` +
+          `id: 3\nevent: delta\ndata: ${JSON.stringify(answer)}\n\n` +
+          "event: done\ndata: null\n\n",
+      });
+    });
+
+    await page.goto("/test/browser/harness/index.html?production=1&chats=1");
+    await page.waitForFunction(
+      () => document.documentElement.dataset.productionHarnessReady === "true",
+    );
+    await page
+      .getByPlaceholder("Message... (Enter to send, Shift+Enter for newline)")
+      .fill("Think first");
+    await page.getByRole("button", { name: "Send" }).click();
+    releaseTurn();
+
+    // As soon as the turn has a thought to show, that thought already carries
+    // every character of the reasoning while the answer under it is still a
+    // prefix of what the provider has already sent. Both are read in one pass
+    // over the DOM so they describe the same frame.
+    const liveRow = page.locator(`[data-message-id="${messageId}"]`);
+    const thoughtRow = liveRow.locator('[data-thinking-provider="claude"]');
+    await thoughtRow.waitFor();
+    const frame = await liveRow.evaluate((row) => ({
+      thought: row.querySelector("[data-thinking-provider]")?.textContent ?? "",
+      whole: row.textContent ?? "",
+    }));
+    expect(frame.thought).toContain(reasoning.trimEnd());
+    expect(frame.whole).not.toContain(answer.trimEnd());
+    await expect(thoughtRow.locator("[data-thinking-body]")).toHaveAttribute(
+      "data-thinking-body",
+      "closed",
+    );
+
+    await expect(liveRow).toContainText(answer.trimEnd());
+    await expect(thoughtRow).toContainText("412 tokens");
   });
 
   test("production Chat reveals newly received visible text and keeps a pinned reader", async ({

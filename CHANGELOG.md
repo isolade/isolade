@@ -11,6 +11,11 @@ _Changes landed on `main` that haven't shipped in a release yet._
 - The composer now shows whether the agent is working and how long the turn has
   taken, next to what the chat has cost.
 
+### Changed
+
+- A turn's thinking now stays collapsed until you open it, so a long stretch of
+  reasoning no longer pushes the answer down the pane.
+
 ## [0.4.0] - 2026-07-31
 
 ### Added
