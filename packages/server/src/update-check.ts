@@ -131,7 +131,6 @@ async function fetchLatest(
     const j = (await res.json()) as Record<string, unknown>;
     return {
       version: typeof j.version === "string" ? j.version : null,
-      download: typeof j.download === "string" ? j.download : null,
       notes: typeof j.notes === "string" ? j.notes : null,
       changes: Array.isArray(j.changes)
         ? j.changes.filter((c): c is string => typeof c === "string").slice(0, 5)
@@ -153,7 +152,6 @@ function toStatus(
     current,
     available,
     latest: latest?.version ?? null,
-    download: latest?.download ?? null,
     notes: latest?.notes ?? null,
     changes: latest?.changes ?? [],
     checkedAt,
@@ -164,7 +162,6 @@ const DISABLED: UpdateStatus = {
   current: "unknown",
   available: false,
   latest: null,
-  download: null,
   notes: null,
   changes: [],
   checkedAt: null,

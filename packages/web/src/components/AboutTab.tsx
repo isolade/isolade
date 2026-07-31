@@ -2,7 +2,7 @@ import logoDark from "@/assets/logo_dark.svg";
 import logoLight from "@/assets/logo_light.svg";
 import { cn } from "@/lib/utils";
 import { hostAppVersion, openExternal } from "../lib/tauri";
-import { useUpdateStatus } from "../lib/useUpdateStatus";
+import { HOW_TO_UPDATE, useUpdateStatus } from "../lib/useUpdateStatus";
 
 function formatChecked(ts: number | null): string {
   if (!ts) return "never";
@@ -74,18 +74,14 @@ export default function AboutTab() {
           ) : status.available ? (
             <span className="text-sm">
               Update available: <span className="tabular-nums">{status.latest}</span>
-              {status.download && (
-                <>
-                  {" · "}
-                  <button
-                    type="button"
-                    onClick={() => void openExternal(status.download ?? status.notes ?? "")}
-                    className="font-medium text-primary underline-offset-2 hover:underline"
-                  >
-                    get it
-                  </button>
-                </>
-              )}
+              {" · "}
+              <button
+                type="button"
+                onClick={() => void openExternal(HOW_TO_UPDATE)}
+                className="font-medium text-primary underline-offset-2 hover:underline"
+              >
+                get it
+              </button>
             </span>
           ) : (
             <span className="text-sm text-muted-foreground">You're up to date.</span>

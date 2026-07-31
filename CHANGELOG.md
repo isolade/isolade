@@ -19,6 +19,12 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Fixed
 
+- The update notice now points at how to update rather than at the release
+  artifact. Downloading the macOS build through a browser is the one route that
+  leaves it quarantined and refusing to launch, so the notice was walking people
+  into it, and on Linux the artifact it offered was a `.deb` that a tarball
+  install has no use for. Both the banner and the About pane now open the
+  installation instructions, where the same one-liner covers every platform.
 - The Linux package now describes itself. `apt show isolade` reported "A Tauri
   App" from a maintainer called "you", both left over from the project template,
   where it now carries a real description, maintainer, homepage and license.
