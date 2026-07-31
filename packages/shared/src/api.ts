@@ -606,8 +606,6 @@ export const updateStatusSchema = z.object({
   available: z.boolean(),
   /** Latest released version tag, or null if it couldn't be resolved. */
   latest: z.string().nullable(),
-  /** Where to get it (the counted /download URL), or null. */
-  download: z.string().nullable(),
   /** Release-notes URL, or null. */
   notes: z.string().nullable(),
   /** A few "what changed" bullets for the latest release. */

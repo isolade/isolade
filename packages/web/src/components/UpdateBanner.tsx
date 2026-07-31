@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { onExternalLinkClick, openExternal } from "../lib/tauri";
-import { useUpdateStatus } from "../lib/useUpdateStatus";
+import { HOW_TO_UPDATE, useUpdateStatus } from "../lib/useUpdateStatus";
 
 // Remember the version a user dismissed, so the bar stays gone for that release
 // but returns when a newer one ships.
@@ -9,9 +9,8 @@ const DISMISS_KEY = "isolade-update-dismissed";
 /**
  * A slim bar shown under the title bar when a newer version is available. The
  * server decides availability (the once-per-day check). This just renders it and
- * routes the download/notes links to the system browser via openExternal. The
- * app is self-signed, so we point the user at the install rather than auto-
- * updating in place.
+ * routes its links to the system browser via openExternal. The app is
+ * self-signed, so there is no in-place update to offer.
  */
 export default function UpdateBanner() {
   const { status } = useUpdateStatus();
@@ -28,7 +27,6 @@ export default function UpdateBanner() {
 
   if (!status?.available || dismissed) return null;
 
-  const target = status.download ?? status.notes;
   const dismiss = () => {
     setDismissed(true);
     try {
@@ -48,15 +46,13 @@ export default function UpdateBanner() {
         {status.changes.length > 0 && <span> · {status.changes[0]}</span>}
       </span>
       <div className="ml-auto flex shrink-0 items-center gap-3">
-        {target && (
-          <button
-            type="button"
-            onClick={() => void openExternal(target)}
-            className="rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground hover:opacity-90"
-          >
-            Get the update
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={() => void openExternal(HOW_TO_UPDATE)}
+          className="rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground hover:opacity-90"
+        >
+          Get the update
+        </button>
         {status.notes && (
           <a
             href={status.notes}

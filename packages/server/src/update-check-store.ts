@@ -19,7 +19,6 @@ const KEY = "update-check";
 
 export interface LatestInfo {
   version: string | null;
-  download: string | null;
   notes: string | null;
   changes: string[];
 }
@@ -39,7 +38,6 @@ function normalizeLatest(value: unknown): LatestInfo | null {
   const v = value as Record<string, unknown>;
   return {
     version: typeof v.version === "string" ? v.version : null,
-    download: typeof v.download === "string" ? v.download : null,
     notes: typeof v.notes === "string" ? v.notes : null,
     changes: Array.isArray(v.changes)
       ? v.changes.filter((c): c is string => typeof c === "string")
