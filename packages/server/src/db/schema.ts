@@ -476,10 +476,6 @@ export const usageEvents = sqliteTable(
     // API-equivalent dollar cost for this turn's share of the model's work
     // (Claude: the provider's own figure. Codex: catalog pricing × tokens).
     costUsd: real("cost_usd").notNull().default(0),
-    // Pricing-weighted input-equivalent for this turn, at the model in effect
-    // for it. Persisted (not recomputed) so it stays correct if catalog pricing
-    // later changes, since it captures the rate at the time. Drives subscription-share.
-    effectiveInputTokens: real("effective_input_tokens").notNull().default(0),
     // Millisecond precision (timestamp_ms): the day bucket is derived from this
     // at read time, and sub-second ordering lets rolling-window queries be exact.
     createdAt: integer("created_at", { mode: "timestamp_ms" })

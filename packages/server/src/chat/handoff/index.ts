@@ -1,6 +1,6 @@
 // The cross-provider handoff service: turns a source transcript into a
 // provider-neutral handoff, estimates the target's capacity for it, and decides
-// how to reduce it when it does not fit. See DESIGN.md for the full design.
+// how to reduce it when it does not fit.
 //
 // These are the pure, host-side building blocks (types, normalization,
 // rendering, estimation, decision policy, chunking). Guest-side native

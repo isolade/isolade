@@ -20,7 +20,7 @@ export type SwitchStatus = ProviderSwitchRow["status"];
 
 // What the caller records at model selection. The lifecycle then advances the
 // status and fills in auxiliary references as source-side compaction or a
-// forked summary is produced (see the switch lifecycle in DESIGN.md).
+// forked summary is produced.
 export interface PendingSwitchInput {
   sourceLeafId: string | null;
   sourceProvider: ChatProvider;

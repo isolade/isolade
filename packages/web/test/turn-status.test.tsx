@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import { ComposerStatus, TurnStatus } from "../src/components/chat/UsagePanel";
+import { TurnStatus } from "../src/components/chat/UsagePanel";
 import { formatDuration } from "../src/lib/format";
 
 describe("formatDuration", () => {
@@ -83,33 +83,26 @@ describe("TurnStatus", () => {
   });
 });
 
-// The send corner has to read as one status line, not as two mono figures that
-// happen to sit next to each other. That means one type context for both (so
-// their digits share a baseline) and a separator between them.
-describe("ComposerStatus", () => {
-  const clock = { running: false, startedAt: null, lastMs: 94_000 };
-
-  it("sets the type once, for both figures", () => {
-    const html = renderToStaticMarkup(<ComposerStatus turn={clock} costUsd={1.5} />);
-    const cluster = html.slice(0, html.indexOf(">"));
-    expect(cluster).toContain("font-mono");
-    expect(cluster).toContain("text-xs");
-    expect(cluster).toContain("tabular-nums");
-  });
-
-  it("separates the turn's time from the cost", () => {
-    const html = renderToStaticMarkup(<ComposerStatus turn={clock} costUsd={1.5} />);
-    expect(html).toContain("1:34");
-    expect(html).toContain("$1.50");
-    expect(html.indexOf("·")).toBeGreaterThan(html.indexOf("1:34"));
-    expect(html.indexOf("·")).toBeLessThan(html.indexOf("$1.50"));
-  });
-
-  it("leaves out the separator when there is no time to separate", () => {
+// It stands alone in the send corner now that the cost has moved to the left of
+// the row, so it carries its own type rather than inheriting a cluster's.
+describe("TurnStatus, alone in the send corner", () => {
+  it("sets its own type, on the send button's centre line", () => {
     const html = renderToStaticMarkup(
-      <ComposerStatus turn={{ running: false, startedAt: null, lastMs: null }} costUsd={1.5} />,
+      <TurnStatus running={false} startedAt={null} lastMs={94_000} />,
     );
-    expect(html).toContain("$1.50");
+    const wrapper = html.slice(0, html.indexOf(">"));
+    expect(wrapper).toContain("font-mono");
+    expect(wrapper).toContain("text-xs");
+    expect(wrapper).toContain("tabular-nums");
+    expect(wrapper).toContain("h-8");
+  });
+
+  it("carries no separator, having nothing left to be separated from", () => {
+    const html = renderToStaticMarkup(
+      <TurnStatus running={false} startedAt={null} lastMs={94_000} />,
+    );
+    expect(html).toContain("1:34");
     expect(html).not.toContain("·");
+    expect(html).not.toContain("$");
   });
 });

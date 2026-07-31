@@ -125,7 +125,6 @@ function LifetimeColumn({
   emphasized?: boolean;
 }) {
   const cls = emphasized ? "text-foreground" : "text-muted-foreground";
-  const share = bucket.subscriptionShare;
   return (
     <div className="flex flex-col gap-1">
       <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</div>
@@ -139,22 +138,6 @@ function LifetimeColumn({
         <Row k="output" v={bucket.outputTokens} />
         {bucket.reasoningOutputTokens > 0 && <Row k="reasoning" v={bucket.reasoningOutputTokens} />}
       </div>
-      {share && (share.fiveHourPct != null || share.sevenDayPct != null) && (
-        <div className="mt-1 pt-1 border-t border-border/50 text-muted-foreground/80 space-y-0.5">
-          <div className="text-[10px] uppercase tracking-wider">Subscription</div>
-          {share.fiveHourPct != null && <ShareRow k="5h window" v={share.fiveHourPct} />}
-          {share.sevenDayPct != null && <ShareRow k="7d window" v={share.sevenDayPct} />}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ShareRow({ k, v }: { k: string; v: number }) {
-  return (
-    <div className="flex justify-between gap-2">
-      <span>{k}</span>
-      <span className="font-mono tabular-nums">{v.toFixed(2)}%</span>
     </div>
   );
 }

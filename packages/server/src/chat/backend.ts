@@ -103,11 +103,6 @@ export type ChatEvent =
       // client. Filled in by the turn service, which is the only party that
       // knows the settled total, since a backend sees just its own session.
       costUsd?: number;
-      // Approximate subscription consumption derived from cumulative
-      // tokens × catalog rate-plan budgets. Optional: omitted when we
-      // can't resolve the plan or pricing. Populated by the turn service
-      // before forwarding, not by the backends themselves.
-      subscriptionShare?: import("./subscription-share").SubscriptionShare;
     }
   | { type: "context_compacted" }
   // The CLI's `system/api_retry` envelope, surfaced as a typed event so the

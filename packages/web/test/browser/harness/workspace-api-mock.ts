@@ -35,13 +35,13 @@ function prsFor(instanceIndex: number, count: number): AttachedPr[] {
     const number = 100 + instanceIndex * 10 + index;
     return {
       host: "github.com",
-      owner: "tenzir",
+      owner: "acme",
       repo: "isolade",
       number,
       title: `Keep the retained workspace out of the rendering path (${number})`,
       state,
       isDraft,
-      url: `https://github.com/tenzir/isolade/pull/${number}`,
+      url: `https://github.com/acme/isolade/pull/${number}`,
     };
   });
 }

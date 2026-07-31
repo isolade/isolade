@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Chat, ChatManager } from "../chats";
-import type { ChatEffort, ChatProvider, ChatRenderChunk, Upload, UsageStats } from "../contracts";
+import type { ChatEffort, ChatProvider, ChatRenderChunk, Upload } from "../contracts";
 import { findChatModel } from "../contracts";
 import type { ChatMessage } from "../db/schema";
 import type { DiffStatsPoller } from "../diff-stats";
@@ -22,7 +22,6 @@ import {
 } from "./handoff";
 import type { ProviderSwitchStore } from "./provider-switch-store";
 import type { ChatStreamHub } from "./stream-hub";
-import { computeSubscriptionShare } from "./subscription-share";
 
 const DEFAULT_DELIVERY_CONFIRMATION_TIMEOUT_MS = 10_000;
 
@@ -59,22 +58,17 @@ export interface ChatTurnDeps {
   codexBackend: ChatBackend;
   // Retire the chat's live Claude process before a cross-provider switch
   // activates, so a Claude target starts a fresh session instead of reusing a
-  // process positioned at an old Claude tip (see DESIGN.md live-process
-  // ownership). No-op when there is no live process. Optional so tests that
-  // don't exercise switching can omit it.
+  // process positioned at an old Claude tip. No-op when there is no live
+  // process. Optional so tests that don't exercise switching can omit it.
   disposeChatProcess?: (chatId: string) => void;
-  // The profile-scoped, 20s-cached upstream usage snapshot. Injected (rather
-  // than fetched here) so the per-turn `usage` enrichment reuses the same
-  // cached numbers /api/usage and the chat list see.
-  profileUsageStats: (profileId: string) => Promise<UsageStats>;
   deliveryConfirmationTimeoutMs?: number;
 }
 
 // Owns the orchestration of a single assistant turn: user-message persistence,
 // auto-titling, environment prelude injection, the backend send loop, usage
-// persistence + subscription-share enrichment, and abort semantics. The HTTP
-// layer (chats router) handles request validation and the SSE pump. Everything
-// between "we've decided to run a turn" and "the turn settled" lives here.
+// persistence, and abort semantics. The HTTP layer (chats router) handles
+// request validation and the SSE pump. Everything between "we've decided to run
+// a turn" and "the turn settled" lives here.
 export class ChatTurnService {
   constructor(private readonly deps: ChatTurnDeps) {}
 
@@ -126,7 +120,6 @@ export class ChatTurnService {
       claudeBackend,
       codexBackend,
       disposeChatProcess,
-      profileUsageStats,
     } = this.deps;
     const {
       instance,
@@ -360,10 +353,6 @@ export class ChatTurnService {
             })
             .map((chunk) => chunk.text)
             .join("") ?? "";
-        const pendingEventWork = new Set<Promise<void>>();
-        const waitForPendingEvents = async () => {
-          await Promise.allSettled([...pendingEventWork]);
-        };
         // Provider-session snapshot for this turn, reported by the backend
         // as facts become known and stamped onto the assistant row on both
         // the success and abort paths, so even an interrupted turn stays
@@ -642,32 +631,6 @@ export class ChatTurnService {
                   last: event.last,
                   modelContextWindow: event.modelContextWindow,
                 });
-                // Publish the durable base snapshot synchronously. Backends
-                // intentionally expose a synchronous callback and do not await
-                // it, so awaiting enrichment here would let `done` overtake the
-                // final usage update.
-                if (instance.profileId) {
-                  const baseEvent = { ...usageEvent };
-                  const work = (async () => {
-                    try {
-                      const subscriptionShare = await computeSubscriptionShare({
-                        provider: turnProvider,
-                        modelId: turnModel,
-                        total: baseEvent.total,
-                        stats: await profileUsageStats(instance.profileId!),
-                        authStore: profiles.auth(instance.profileId!),
-                      });
-                      if (api.signal.aborted) return;
-                      if (subscriptionShare) {
-                        api.publish("usage", { ...baseEvent, subscriptionShare });
-                      }
-                    } catch (error) {
-                      console.warn(`[chat] usage enrichment failed (chat=${chatId}):`, error);
-                    }
-                  })();
-                  pendingEventWork.add(work);
-                  void work.finally(() => pendingEventWork.delete(work));
-                }
                 return;
               }
               api.publish(event.type, event);
@@ -688,7 +651,6 @@ export class ChatTurnService {
           // accepted the request, so commit any pending switch before finalizing.
           commitSwitchIfAccepted();
           assistantContent = result.content || assistantContent;
-          await waitForPendingEvents();
           const renderChunks = api.renderChunks();
           const persistedContent = inTurnEdit
             ? renderChunks
@@ -724,7 +686,6 @@ export class ChatTurnService {
           if (titlePromise) await titlePromise.catch(() => {});
         } catch (err) {
           markUserMessageUncertain(err instanceof Error ? err.message : String(err));
-          await waitForPendingEvents();
           // Persist any partial text for both cancellation and provider
           // failures. The live client commits that same partial before showing
           // an error, so durable history must agree after a reload.

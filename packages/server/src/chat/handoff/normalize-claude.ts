@@ -124,8 +124,8 @@ export function newestCompactSummaryIndex(chain: ClaudeTranscriptEntry[]): numbe
 // context differs from the literal transcript bytes. The guest extractor is
 // responsible for resolving those pointers before handing entries here; this
 // pass is where any additional host-side reconciliation would live. Kept as an
-// explicit identity step so the pipeline shape matches DESIGN.md and the
-// behavior is easy to extend without restructuring.
+// explicit identity step so the behavior is easy to extend without
+// restructuring the pipeline around it.
 function applyContentReplacements(entries: ClaudeTranscriptEntry[]): ClaudeTranscriptEntry[] {
   return entries;
 }

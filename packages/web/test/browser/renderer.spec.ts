@@ -1833,20 +1833,21 @@ test.describe("message renderer browser gate", () => {
     await expect(settled).toBeVisible();
     await expect(settled).toHaveText(/^[0-9]+s$/);
     await expect(settled.locator(".animate-spin")).toHaveCount(0);
-    // And it sits with the cost, ahead of it in the send corner.
+    // And it has the send corner to itself, past everything about the chat
+    // rather than about the moment: the cost sits with the model on the left.
     const times = await settled.boundingBox();
     const cost = await page
       .getByRole("button", {
         name: "What this chat has cost so far, across every agent it has run on",
       })
       .boundingBox();
-    expect(times!.x + times!.width).toBeLessThanOrEqual(cost!.x + 1);
+    expect(cost!.x + cost!.width).toBeLessThanOrEqual(times!.x + 1);
   });
 
-  // The picker stays interactive mid-turn and its edits are local until the next
-  // send flushes them. Fast mode has to ride that flush like model and effort do:
-  // left out of it, the toggle went on showing a premium rate the server had
-  // never been told about, for every turn that followed.
+  // The model controls stay interactive mid-turn and their edits are local until
+  // the next send flushes them. Fast mode has to ride that flush like model and
+  // effort do: left out of it, the bolt went on showing a premium rate the server
+  // had never been told about, for every turn that followed.
   test("flushes a mid-turn fast-mode toggle with the next send", async ({ page }) => {
     const patches: Record<string, unknown>[] = [];
     let releaseTurn!: () => void;
@@ -1889,7 +1890,7 @@ test.describe("message renderer browser gate", () => {
       });
     });
     // Hold the turn open so the composer stays in its streaming state while the
-    // picker is used, which is the case the flush exists for.
+    // bolt is used, which is the case the flush exists for.
     await page.route("**/api/instances/*/chats/chat-a/messages", async (route) => {
       if (route.request().method() !== "POST") {
         await route.fallback();
@@ -1927,7 +1928,6 @@ test.describe("message renderer browser gate", () => {
     await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
 
     const fastToggle = page.getByRole("switch", { name: /Fast mode/ });
-    await page.locator('[data-demo="model-picker"]').click();
     await expect(fastToggle).toHaveAttribute("aria-checked", "false");
     await fastToggle.click();
     // Local only while the turn runs: changing the billing rate under a turn
@@ -1939,8 +1939,7 @@ test.describe("message renderer browser gate", () => {
     await expect.poll(() => patches).toEqual([{ fastMode: true }]);
     await expect.poll(() => queued).not.toBeNull();
 
-    // And the picker still reads on, now backed by the server's own answer.
-    await page.locator('[data-demo="model-picker"]').click();
+    // And the bolt still reads on, now backed by the server's own answer.
     await expect(fastToggle).toHaveAttribute("aria-checked", "true");
     releaseTurn();
   });

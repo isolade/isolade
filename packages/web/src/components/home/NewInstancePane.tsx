@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AttachmentStrip } from "@/components/chat/AttachmentStrip";
+import { FastModeToggle } from "@/components/FastModeToggle";
 import { MessageBox } from "@/components/MessageBox";
 import { ModelEffortPicker } from "@/components/ModelEffortPicker";
 import { beaconDeleteInstance, createInstance, deleteInstance } from "../../lib/api";
@@ -31,6 +32,7 @@ interface NewInstancePaneProps {
     instancePromise: Promise<Instance>;
     modelId: string;
     effort: ChatEffort;
+    fastMode: boolean;
     firstMessage: string;
     uploadIds: string[];
   }) => void;
@@ -52,6 +54,18 @@ export default function NewInstancePane({
   const [effort, setEffort] = useState<ChatEffort>(
     () => readLastEffort() ?? modelDef?.defaultEffort ?? "high",
   );
+  // Unlike the model and the effort, this starts off every time rather than
+  // being read back from the last draft: opting into a premium rate should be a
+  // decision each time, not a setting that follows you (the same reason the
+  // in-chat toggle is never written back as a default).
+  const [fastMode, setFastMode] = useState(false);
+  // A draft left on fast mode and then moved to a model that has no fast rate
+  // card would carry an opt-in nothing on screen is offering, and the server
+  // drops it on create anyway. Turn it off with the model, so what is shown and
+  // what is sent are the same thing.
+  useEffect(() => {
+    if (!modelDef?.fastPricing) setFastMode(false);
+  }, [modelDef]);
   // Persist only deliberate picker selections. Automatic snapping (effort
   // clamp on model change, catalog-fallback model swap) shouldn't overwrite
   // the user's last explicit choice.
@@ -168,6 +182,7 @@ export default function NewInstancePane({
       instancePromise: promise,
       modelId,
       effort,
+      fastMode,
       firstMessage: content,
       uploadIds,
     });
@@ -216,9 +231,11 @@ export default function NewInstancePane({
           onPaste={handlePaste}
           hasAttachments={attachments.items.length > 0}
           attachments={<AttachmentStrip items={attachments.items} onRemove={attachments.remove} />}
-          // No `status`: a draft has no chat behind it, so there is no turn to
-          // time and no spend to report. The slot stays empty rather than
-          // reading zero.
+          // No `status`, `cost` or `context`: a draft has no chat behind it, so
+          // there is no turn to time, no spend to report and nothing in a
+          // context yet. Those slots stay empty rather than reading zero. Fast
+          // mode is different: it is a choice about the chat about to start, and
+          // it rides the create call.
           modelPicker={
             <ModelEffortPicker
               models={chatModels}
@@ -228,6 +245,9 @@ export default function NewInstancePane({
               onModelChange={handlePickModel}
               onEffortChange={handlePickEffort}
             />
+          }
+          fastMode={
+            <FastModeToggle model={modelDef} fastMode={fastMode} onFastModeChange={setFastMode} />
           }
         />
       </div>

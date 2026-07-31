@@ -241,6 +241,33 @@ describe("chat API", () => {
       expect((await patch({ model: DEFAULT_ANTHROPIC_MODEL_ID })).fastMode).toBe(false);
     });
 
+    it("starts a chat fast when the draft asked for it", async () => {
+      // The new-chat composer offers the bolt before there is a chat to PATCH,
+      // so the choice rides the create call rather than being applied a moment
+      // later, which would leave the first turn running at the standard rate.
+      const instanceId = seedInstance();
+      const created = await fetch(`${baseUrl}/api/instances/${instanceId}/chats`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: DEFAULT_ANTHROPIC_MODEL_ID, fastMode: true }),
+      });
+      expect(created.status).toBe(201);
+      expect(((await created.json()) as { fastMode: boolean }).fastMode).toBe(true);
+    });
+
+    it("drops an opt-in the model does not sell", async () => {
+      // Sonnet 5 has no fast rate card, so the composer offers no bolt for it.
+      // Storing the ask anyway would put the chat in a state nothing shows.
+      const instanceId = seedInstance();
+      const created = await fetch(`${baseUrl}/api/instances/${instanceId}/chats`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-5", fastMode: true }),
+      });
+      expect(created.status).toBe(201);
+      expect(((await created.json()) as { fastMode: boolean }).fastMode).toBe(false);
+    });
+
     it("rejects a body that asks for nothing", async () => {
       const instanceId = seedInstance();
       const created = await fetch(`${baseUrl}/api/instances/${instanceId}/chats`, {

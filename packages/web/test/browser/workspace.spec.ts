@@ -300,7 +300,7 @@ test.describe("attached PR badge", () => {
     await expect(badge).toHaveText("#100");
     await badge.click();
     const menu = page.locator('[data-slot="dropdown-menu-content"]');
-    await expect(menu).toContainText("tenzir/isolade#100");
+    await expect(menu).toContainText("acme/isolade#100");
 
     await menu.getByLabel("Detach PR #100").click();
     // The last PR gone takes the badge (and its menu) with it.

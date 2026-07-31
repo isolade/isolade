@@ -35,7 +35,6 @@ import type {
   ChatEffort,
   ChatModelDefinition,
   Chat as ChatRow,
-  ContextBreakdown,
   ModelOverrides,
   PendingSwitch,
   QueuedMessage,
@@ -66,7 +65,6 @@ import {
   revealableLength,
   revealChunks,
   type StreamChunk,
-  type SubscriptionShare,
   type TokenUsage,
   type UsageState,
   usageSeedFromChat,
@@ -79,13 +77,8 @@ import {
   type SessionMessageRow,
 } from "./chat/MessageHistory";
 import { QueuedMessages, reconcileQueuedMessageSnapshot } from "./chat/QueuedMessages";
-import {
-  ComposerStatus,
-  ContextBar,
-  ContextBreakdownDetail,
-  ContextDetail,
-  type TurnClock,
-} from "./chat/UsagePanel";
+import { ChatCost, ContextMeter, type TurnClock, TurnStatus } from "./chat/UsagePanel";
+import { FastModeToggle } from "./FastModeToggle";
 import { MessageBox } from "./MessageBox";
 import { ModelEffortPicker } from "./ModelEffortPicker";
 
@@ -365,12 +358,6 @@ function Chat({
         : { ...clock, running: true, startedAt: resumed ? resumed.startedAt : Date.now() },
     );
   }, [streaming]);
-  // Live context breakdown requested from the persistent Claude process when
-  // the model picker opens. Refreshed on every open so the table reflects the
-  // current session state.
-  const [breakdown, setBreakdown] = useState<ContextBreakdown | null>(null);
-  const [breakdownLoading, setBreakdownLoading] = useState(false);
-  const [breakdownError, setBreakdownError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const messageHistoryRef = useRef<MessageHistoryHandle>(null);
@@ -561,16 +548,14 @@ function Chat({
     [instanceId, chatId],
   );
 
-  const refreshBreakdown = useCallback(() => {
-    setBreakdownLoading(true);
-    setBreakdownError(null);
-    getChatContextBreakdown(instanceId, chatId)
-      .then(setBreakdown)
-      .catch((err: unknown) => {
-        setBreakdownError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => setBreakdownLoading(false));
-  }, [instanceId, chatId]);
+  // Read when the composer's context meter opens, and only when the session has
+  // moved on since the last read: the probe reaches into the VM to ask the live
+  // Claude process. The meter decides when that is (see contextProbeKey), so
+  // this stays a plain fetch.
+  const loadContextBreakdown = useCallback(
+    () => getChatContextBreakdown(instanceId, chatId),
+    [instanceId, chatId],
+  );
 
   // rAF-coalesced scroll. The SSE parser fires events at the rate of
   // the model's token output (hundreds per second for codex), so calling
@@ -1159,7 +1144,7 @@ function Chat({
       if (updated) {
         // Fast mode is read back rather than assumed: the server drops the
         // opt-in when the newly selected model has no fast rate card, and the
-        // picker must not go on showing a premium the chat is not paying.
+        // bolt must not go on showing a premium the chat is not paying.
         appliedFastModeRef.current = updated.fastMode;
         setFastMode(updated.fastMode);
         if (updated.pendingSwitch) {
@@ -1188,10 +1173,10 @@ function Chat({
     [instanceId, chatId],
   );
 
-  // Flush every picker edit the user made while the previous turn was still
+  // Flush every model edit the user made while the previous turn was still
   // streaming, as one PATCH, just before the next turn kicks off. Every send
   // path funnels through here so no field can be left behind on one of them:
-  // fast mode was, which left the picker claiming a premium rate the chat had
+  // fast mode was, which left the composer claiming a premium rate the chat had
   // never been switched to.
   const flushPickerChanges = useCallback(async () => {
     const body: UpdateChatBody = {};
@@ -1446,7 +1431,6 @@ function Chat({
             total: TokenUsage;
             modelContextWindow?: number;
             costUsd?: number;
-            subscriptionShare?: SubscriptionShare;
           };
           setUsage((prev) => ({
             last: usagePayload.last,
@@ -1456,7 +1440,6 @@ function Chat({
             // once the chat has one, and the composer's total must never tick
             // backwards while a fresh session warms up.
             costUsd: usagePayload.costUsd ?? prev?.costUsd,
-            subscriptionShare: usagePayload.subscriptionShare,
             compacted: prev?.compacted,
           }));
           return true;
@@ -2889,13 +2872,7 @@ function Chat({
             attachments={
               <AttachmentStrip items={attachments.items} onRemove={attachments.remove} />
             }
-            status={
-              <ComposerStatus
-                turn={turnClock}
-                costUsd={chatCostUsd}
-                loadBreakdown={loadCostBreakdown}
-              />
-            }
+            status={<TurnStatus {...turnClock} />}
             modelPicker={
               <ModelEffortPicker
                 models={pickerModels}
@@ -2904,32 +2881,24 @@ function Chat({
                 currentEffort={currentEffort}
                 onModelChange={handleModelChange}
                 onEffortChange={handleEffortChange}
-                fastMode={fastMode}
-                onFastModeChange={handleFastModeChange}
-                prepend={
-                  <div className="px-2 pt-2 pb-1.5 space-y-2">
-                    {usage && (
-                      <ContextDetail
-                        usage={usage}
-                        catalogWindow={findChatModel(currentModel)?.contextWindow}
-                      />
-                    )}
-                    <ContextBreakdownDetail
-                      breakdown={breakdown}
-                      loading={breakdownLoading}
-                      error={breakdownError}
-                      onLoad={refreshBreakdown}
-                    />
-                  </div>
-                }
-                belowLabel={
-                  <ContextBar
-                    usage={usage}
-                    catalogWindow={findChatModel(currentModel)?.contextWindow}
-                  />
-                }
               />
             }
+            fastMode={
+              <FastModeToggle
+                model={findChatModel(currentModel)}
+                fastMode={fastMode}
+                onFastModeChange={handleFastModeChange}
+              />
+            }
+            context={
+              <ContextMeter
+                usage={usage}
+                catalogWindow={findChatModel(currentModel)?.contextWindow}
+                running={turnClock.running}
+                loadBreakdown={loadContextBreakdown}
+              />
+            }
+            cost={<ChatCost costUsd={chatCostUsd} loadBreakdown={loadCostBreakdown} />}
           />
         </div>
       </div>

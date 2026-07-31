@@ -11,7 +11,7 @@ import {
 import { randomUUID } from "crypto";
 import { eq } from "drizzle-orm";
 import type { ModelBilling } from "../src/chat/backend";
-import { pricingFor } from "../src/chat/subscription-share";
+import { pricingFor } from "../src/chat/pricing";
 import { ChatManager } from "../src/chats";
 import { createDb, schema } from "../src/db";
 
@@ -545,19 +545,6 @@ describe("ChatManager", () => {
       expect(agg.total.chats).toBe(1);
       expect(agg.total.inputTokens).toBe(1000);
       expect(agg.total.costUsd).toBeCloseTo(0.5);
-    });
-
-    it("derives effective input tokens (pricing-weighted) into the buckets", () => {
-      // A real catalog id so pricingFor resolves (unlike the placeholder id the
-      // other cases use, which has no pricing → effective 0).
-      const chat = cm.create(instanceId, "claude-opus-4-8", "anthropic", "high");
-      setUsage(chat.id, 1000, 100, 0.5);
-      const agg = cm.getAggregateTotals();
-      // effective = input + cacheWrite + cacheRead·ratio + output·outputRatio.
-      // With input+output and real pricing it strictly exceeds the raw input,
-      // a zero here would mean pricing/derivation was lost.
-      expect(agg.anthropic.effectiveInputTokens).toBeGreaterThan(1000);
-      expect(agg.total.effectiveInputTokens).toBeCloseTo(agg.anthropic.effectiveInputTokens);
     });
   });
 

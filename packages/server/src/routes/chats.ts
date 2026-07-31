@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
-import { computeSubscriptionShare } from "../chat/subscription-share";
 import type { ChatModelDefinition, ChatResumeSnapshot } from "../contracts";
 import {
   CHAT_MODELS,
@@ -28,14 +27,12 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     providerSwitchStore,
     uploadStore,
     instances,
-    profiles,
     chatStreamHub,
     claudeBackend,
     codexBackend,
     realClaudeBackend,
     chatTurnService,
     chatQueueService,
-    profileUsageStats,
     archivedError,
   } = ctx;
   const app = new Hono();
@@ -74,8 +71,7 @@ export function createChatsRouter(ctx: RouteContext): Hono {
   };
 
   // Attach the pending-switch view to a chat row for any response that returns
-  // a chat. Kept separate from enrichChat (which is async for usage) so it can
-  // decorate synchronously.
+  // a chat.
   const withPendingSwitch = <T extends { id: string }>(chat: T) => {
     const pendingSwitch = pendingSwitchView(chat.id);
     return pendingSwitch ? { ...chat, pendingSwitch } : chat;
@@ -102,35 +98,6 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     await realClaudeBackend.disposeChat(chatId);
     return !chatManager.inFlightMessageId(chatId) && !chatStreamHub.inFlightFor(chatId);
   };
-
-  // Compute the server-side subscriptionShare for a chat row, if the chat
-  // has a cumulative usage snapshot. Returns the row unchanged when usage
-  // hasn't been recorded yet (fresh chat, legacy row), so the field stays
-  // undefined and the UI omits the row.
-  type ChatRow = ReturnType<typeof chatManager.get>;
-  async function enrichChat(chat: NonNullable<ChatRow>) {
-    if (chat.inputTokens == null) return withPendingSwitch(chat);
-    // Resolve the chat's profile so the share reads that profile's usage/plan.
-    // /api/chats spans every profile, so this can't assume a single active one.
-    // An orphaned chat (instance deleted) has no profile → leave the share off.
-    const profileId = instances.get(chat.instanceId)?.profileId;
-    if (!profileId) return chat;
-    const share = await computeSubscriptionShare({
-      provider: chat.provider,
-      modelId: chat.model,
-      stats: await profileUsageStats(profileId),
-      authStore: profiles.auth(profileId),
-      total: {
-        inputTokens: chat.inputTokens,
-        cachedInputTokens: chat.cachedInputTokens ?? 0,
-        cacheCreationInputTokens: chat.cacheCreationInputTokens ?? 0,
-        outputTokens: chat.outputTokens ?? 0,
-        reasoningOutputTokens: chat.reasoningOutputTokens ?? 0,
-        totalTokens: 0,
-      },
-    });
-    return withPendingSwitch(share ? { ...chat, subscriptionShare: share } : chat);
-  }
 
   // Initial turns and reconnects use the same atomic compact snapshot followed
   // by only later events. Catch-up cost depends on the current render model,
@@ -283,7 +250,7 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     const instance = instances.get(instanceId);
     if (!instance) return c.json({ error: "not found" }, 404);
     if (instance.archived) return archivedError(c);
-    const { model, effort } = createChatBodySchema.parse(await c.req.json());
+    const { model, effort, fastMode } = createChatBodySchema.parse(await c.req.json());
     const modelDef = findModelForInstance(model);
     if (!modelDef) return c.json({ error: "unknown model" }, 400);
     if (effort !== undefined && !modelDef.supportedEfforts.includes(effort)) {
@@ -294,6 +261,10 @@ export function createChatsRouter(ctx: RouteContext): Hono {
       model,
       modelDef.provider,
       effort ?? modelDef.defaultEffort,
+      // Dropped rather than stored on a model that does not sell a faster rate,
+      // for the reason the update route drops it: what is stored and what is
+      // offered have to be the same thing.
+      (fastMode ?? false) && modelDef.fastPricing != null,
     );
     return c.json(chat, 201);
   });
@@ -302,12 +273,12 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     const instanceId = c.req.param("id");
     if (!instances.get(instanceId)) return c.json({ error: "not found" }, 404);
     const chats = chatManager.list(instanceId);
-    return c.json(await Promise.all(chats.map(enrichChat)));
+    return c.json(chats.map(withPendingSwitch));
   });
 
   app.get("/api/chats", async (c) => {
     const chats = chatManager.listAll();
-    return c.json(await Promise.all(chats.map(enrichChat)));
+    return c.json(chats.map(withPendingSwitch));
   });
 
   app.patch("/api/instances/:id/chats/:chatId", async (c) => {
@@ -358,7 +329,7 @@ export function createChatsRouter(ctx: RouteContext): Hono {
       // The chat row itself is untouched: it still runs the source provider
       // until activation. Return it decorated with the pending switch.
       const pending = chatManager.get(chatId);
-      return c.json(pending ? await enrichChat(pending) : pending);
+      return c.json(pending ? withPendingSwitch(pending) : pending);
     }
 
     // Same-provider change (or effort-only). If a pending cross-provider switch
@@ -384,7 +355,7 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     if (fastMode !== undefined && fastOffered) chatManager.updateFastMode(chatId, fastMode);
     else if (!fastOffered && existing.fastMode) chatManager.updateFastMode(chatId, false);
     const updated = chatManager.get(chatId);
-    return c.json(updated ? await enrichChat(updated) : updated);
+    return c.json(updated ? withPendingSwitch(updated) : updated);
   });
 
   app.delete("/api/instances/:id/chats/:chatId", (c) => {

@@ -9,7 +9,21 @@ _Changes landed on `main` that haven't shipped in a release yet._
 ### Added
 
 - The composer now shows whether the agent is working and how long the turn has
-  taken, next to what the chat has cost.
+  taken, in the corner next to the send button.
+
+### Changed
+
+- The composer's bottom row is reorganized. On the left: the model, a bolt for
+  fast mode, what the chat has cost, and a ring for how full the context is, with
+  the tokens behind it (and, on Claude, what is holding them) on hover. Fast mode
+  and the context figures used to be buried in the model picker, and the new-chat
+  box gets the bolt too.
+
+### Removed
+
+- The estimated share of your subscription windows, from both the usage cards and
+  the composer. The providers do not publish how a turn counts against a plan, so
+  the figure was guesswork. The windows they do report are unaffected.
 
 ## [0.4.0] - 2026-07-31
 
