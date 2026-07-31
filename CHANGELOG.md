@@ -6,6 +6,8 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+## [0.4.0] - 2026-07-31
+
 ### Added
 
 - A chat can now switch between Claude and Codex without losing its
