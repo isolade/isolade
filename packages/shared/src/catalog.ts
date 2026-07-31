@@ -1,12 +1,7 @@
 import { z } from "zod";
 import type { ChatEffort } from "./base";
 import type { TokenUsage } from "./chat-render";
-import {
-  type ChatModelDefinition,
-  chatModelSchema,
-  type ModelPricing,
-  type RatePlan,
-} from "./domain";
+import { type ChatModelDefinition, chatModelSchema, type ModelPricing } from "./domain";
 
 // Static catalog for both providers, generated at maintenance time by
 // `bun run refresh-catalog` (see scripts/refresh-catalog.ts) from models.dev:
@@ -342,86 +337,6 @@ export const CHAT_MODELS = [
   // <codex:end>
 ] as const satisfies readonly z.input<typeof chatModelSchema>[];
 
-// Per-plan token budgets, used as the denominator when expressing this
-// chat's consumption as a fraction of the rate-limit window. We can't
-// publish these from a single authoritative source, and Anthropic deliberately
-// doesn't disclose the exact subscription-side conversion, so these are
-// best-effort estimates from public blog posts and Anthropic's own "5x/20x
-// of Pro" framing. The UI labels the resulting share as "approximate".
-//
-// `fiveHourTokens` covers Anthropic's 5h window (and ChatGPT's primary).
-// `sevenDayTokens` covers Anthropic's 7d window. Opus-only weekly cap is
-// represented by an Opus-specific plan row below.
-export const RATE_PLANS: Record<string, RatePlan> = {
-  // Claude plans. Tier strings match what we read from the OAuth secret
-  // (`rateLimitTier`), so keep these spellings aligned with usage.ts.
-  pro: {
-    id: "pro",
-    label: "Claude Pro",
-    fiveHourTokens: 250_000,
-    sevenDayTokens: 4_000_000,
-  },
-  max_5x: {
-    id: "max_5x",
-    label: "Claude Max 5×",
-    fiveHourTokens: 1_250_000,
-    sevenDayTokens: 20_000_000,
-  },
-  max_20x: {
-    id: "max_20x",
-    label: "Claude Max 20×",
-    fiveHourTokens: 5_000_000,
-    sevenDayTokens: 80_000_000,
-  },
-  // ChatGPT plans seen via /wham/usage `plan_type` (lowercased on our side).
-  // Token budgets are calibrated from OpenAI's published per-plan message
-  // ranges on the Codex pricing page (15–80 GPT-5.5 messages / 5h for Plus,
-  // ~14 credits / message, 125 credits / 1M input tokens for GPT-5.5),
-  // which puts Plus at roughly 4M input-equivalent tokens / 5h. Pro 5×/20×
-  // multiply accordingly. OpenAI explicitly bundles Business and Team at
-  // Plus tier. Plus's 5-hour limits "also apply to Business and Team".
-  plus: {
-    id: "plus",
-    label: "ChatGPT Plus",
-    fiveHourTokens: 4_000_000,
-    sevenDayTokens: 30_000_000,
-  },
-  team: {
-    id: "team",
-    label: "ChatGPT Team",
-    fiveHourTokens: 4_000_000,
-    sevenDayTokens: 30_000_000,
-  },
-  business: {
-    id: "business",
-    label: "ChatGPT Business",
-    fiveHourTokens: 4_000_000,
-    sevenDayTokens: 30_000_000,
-  },
-  pro_5x: {
-    id: "pro_5x",
-    label: "ChatGPT Pro 5×",
-    fiveHourTokens: 20_000_000,
-    sevenDayTokens: 150_000_000,
-  },
-  pro_20x: {
-    id: "pro_20x",
-    label: "ChatGPT Pro 20×",
-    fiveHourTokens: 80_000_000,
-    sevenDayTokens: 600_000_000,
-  },
-  // Enterprise: OpenAI doesn't publish concrete Codex caps. "Codex-only
-  // seats have no rate limits" per their docs, but regular Enterprise
-  // seats with Codex bundled do have caps. Use 2× Pro 20× as a
-  // best-effort upper estimate.
-  enterprise: {
-    id: "enterprise",
-    label: "ChatGPT Enterprise",
-    fiveHourTokens: 160_000_000,
-    sevenDayTokens: 1_200_000_000,
-  },
-};
-
 // Anthropic bills a cache write by how long the entry lives: the catalog's
 // `cacheWritePerMTok` is the five-minute rate (1.25× input), and a one-hour
 // write costs twice the input rate instead. Claude Code asks for one-hour
@@ -482,29 +397,6 @@ export function tokenCostBreakdown(
       parts.output +
       parts.reasoningOutput,
   };
-}
-
-// Best-effort mapping from upstream `rateLimitTier` / `planType` strings to
-// our internal plan ids. We accept several spellings because Anthropic and
-// OpenAI haven't promised stable values here.
-export function resolveRatePlan(tierOrPlan: string | null | undefined): RatePlan | undefined {
-  if (!tierOrPlan) return undefined;
-  const k = tierOrPlan.toLowerCase().replace(/[\s-]+/g, "_");
-  if (k.includes("max") && k.includes("20")) return RATE_PLANS.max_20x;
-  if (k.includes("max") && k.includes("5")) return RATE_PLANS.max_5x;
-  if (k.includes("max")) return RATE_PLANS.max_20x;
-  if (k === "pro" || k === "claude_pro") return RATE_PLANS.pro;
-  if (k.includes("pro") && k.includes("20")) return RATE_PLANS.pro_20x;
-  if (k.includes("pro") && k.includes("5")) return RATE_PLANS.pro_5x;
-  if (k === "plus" || k.includes("chatgpt_plus")) return RATE_PLANS.plus;
-  if (k.includes("enterprise")) return RATE_PLANS.enterprise;
-  if (k.includes("business")) return RATE_PLANS.business;
-  // ChatGPT Team appears as `team` from /wham/usage. Claude Team comes
-  // through as `subscriptionType: "team"` and is handled upstream by
-  // preferring `rateLimitTier` (which says max_5x / max_20x). So treat
-  // bare "team" as the ChatGPT plan.
-  if (k === "team" || k.includes("chatgpt_team")) return RATE_PLANS.team;
-  return RATE_PLANS[k];
 }
 
 // Preferred default for new chats. The new-chat picker snaps to a visible

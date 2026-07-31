@@ -98,8 +98,13 @@ function defaultDbPath(): string {
  * agent has been working and how long the last turn took. Existing rows stay
  * null: durations only exist for turns run since upgrading, and the indicator
  * simply shows nothing until the chat's next turn.
+ *
+ * Version 17 drops `usage_events.effective_input_tokens`. It existed only to
+ * weight a turn's tokens for the estimated share of a plan's window, which is
+ * gone, and nothing else ever read it. Dropped rather than left unwritten so a
+ * column that would only ever hold zeros does not outlive its one reader.
  */
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 17;
 
 /**
  * The complete, current schema: one CREATE TABLE (plus indexes) per table in
@@ -322,9 +327,7 @@ function createSchema(sqlite: Database): void {
   // heatmap groups by local day, the "Lifetime" cards sum per provider, and
   // "across N chats" counts the markers, all derived at read time (see
   // getUsageHistory / getAggregateTotals). Append-only and never touched on chat
-  // deletion, so every view survives it. `effective_input_tokens` is the
-  // pricing-weighted input-equivalent for the turn at its model's rate, stored
-  // (not recomputed) so it stays correct if catalog pricing later changes.
+  // deletion, so every view survives it.
   sqlite.run(`
     CREATE TABLE IF NOT EXISTS usage_events (
       id TEXT PRIMARY KEY,
@@ -342,7 +345,6 @@ function createSchema(sqlite: Database): void {
       cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0,
       web_search_requests INTEGER NOT NULL DEFAULT 0,
       cost_usd REAL NOT NULL DEFAULT 0,
-      effective_input_tokens REAL NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER))
     )
   `);
@@ -732,6 +734,20 @@ const migrations: Record<number, (sqlite: Database) => void> = {
     // turns would be a guess. They stay unknown.
     if (!has("turn_started_at")) sqlite.run(`ALTER TABLE chats ADD COLUMN turn_started_at INTEGER`);
     if (!has("last_turn_ms")) sqlite.run(`ALTER TABLE chats ADD COLUMN last_turn_ms INTEGER`);
+  },
+  17: (sqlite) => {
+    // Guarded like the ALTERs above: a database created by a build after the
+    // column was removed never had it, and DROP COLUMN on a missing column is
+    // an error rather than a no-op.
+    const hasColumn =
+      sqlite
+        .query(
+          "SELECT name FROM pragma_table_info('usage_events') WHERE name = 'effective_input_tokens'",
+        )
+        .get() != null;
+    if (hasColumn) {
+      sqlite.run(`ALTER TABLE usage_events DROP COLUMN effective_input_tokens`);
+    }
   },
 };
 

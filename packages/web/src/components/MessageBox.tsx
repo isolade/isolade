@@ -16,8 +16,17 @@ interface MessageBoxProps {
   // purpose: this component decides where the bottom row's pieces sit, so every
   // composer in the app lays out identically instead of each caller choosing.
   modelPicker?: React.ReactNode;
-  // Read-only status for the send corner (the turn indicator and its elapsed
-  // time, then the chat's running cost).
+  // Whether the chat runs at the provider's premium speed. Sits against the
+  // picker, being a setting of the model rather than a figure about the chat.
+  fastMode?: React.ReactNode;
+  // How full the model's context is. Sits with the picker, because the window it
+  // measures is a property of the model chosen there.
+  context?: React.ReactNode;
+  // What the chat has cost. Sits with the model and the context, the other two
+  // facts about the conversation rather than about the moment.
+  cost?: React.ReactNode;
+  // Read-only status for the send corner: whether a turn is running and how long
+  // it has taken.
   status?: React.ReactNode;
   // Opens the file picker. When provided, the paperclip button is shown on the
   // bottom-left of the composer.
@@ -57,11 +66,11 @@ function resizeTextarea(el: HTMLTextAreaElement) {
 
 // The one composer in the app: the new-chat draft box and every chat pane render
 // this, so they stay identical. A single column of the textarea, an optional
-// attachment preview strip, then a control row with the attach button and the
-// model picker on the left and the status pieces plus the send/stop button on
-// the right. (It used to collapse onto one line with the controls while short.
-// That inline mode is gone so the layout is stable regardless of how much has
-// been typed.)
+// attachment preview strip, then a control row with the attach button and what
+// the chat is (model, how fast it runs, cost, context) on the left, and how the
+// turn is going plus the send/stop button on the right. (It used to collapse
+// onto one line with the controls while short. That inline mode is gone so the
+// layout is stable regardless of how much has been typed.)
 export function MessageBox({
   value,
   onChange,
@@ -72,6 +81,9 @@ export function MessageBox({
   autoFocus,
   loading,
   modelPicker,
+  fastMode,
+  context,
+  cost,
   status,
   onAttachClick,
   attachments,
@@ -187,12 +199,22 @@ export function MessageBox({
             <Paperclip className="size-4" />
           </Button>
         )}
-        {/* The model name is what gives way when a docked panel gets narrow
+        {/* What the chat is: the model, what it has cost, how full its context
+            is. The model name is what gives way when a docked panel gets narrow
             enough that the row cannot hold everything: it truncates (the picker
             shrinks inside this box) while the figures and the send button keep
             their size. Without a shrinkable slot here the row grew past the
-            composer's rounded border and pushed the send button outside it. */}
-        <div className="flex min-w-0 flex-1 items-center overflow-hidden">{modelPicker}</div>
+            composer's rounded border and pushed the send button outside it. The
+            figures share the slot but not the shrinking: a percentage or an
+            amount half elided says nothing. Spaced on the same gap as the row
+            around it: each piece carries its own inset for its hover target, and
+            those alone left the four of them reading as one crowded run. */}
+        <div className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
+          {modelPicker}
+          {fastMode}
+          {cost}
+          {context}
+        </div>
         <div className="flex shrink-0 items-center gap-1">
           {status}
           {showStop ? (

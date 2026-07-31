@@ -206,18 +206,6 @@ export const updateInstanceLayoutBodySchema = z.object({
 });
 export type UpdateInstanceLayoutBody = z.infer<typeof updateInstanceLayoutBodySchema>;
 
-// Per-chat subscription-window share. Mirrors the SubscriptionShare interface
-// in server/src/chat/subscription-share.ts, and declared here so it can ride on
-// both the SSE `usage` event and the persisted chat snapshot the GET
-// endpoint returns.
-export const subscriptionShareSchema = z.object({
-  plan: z.object({ id: z.string(), label: z.string() }),
-  fiveHourPct: z.number().nullable(),
-  sevenDayPct: z.number().nullable(),
-  fiveHourCurrentPct: z.number().nullable(),
-  sevenDayCurrentPct: z.number().nullable(),
-});
-
 // A cross-provider switch the user selected but that hasn't activated yet: the
 // chat still runs on its current provider until the next send starts a fresh
 // target session with a provider-neutral handoff (see the handoff service).
@@ -278,9 +266,6 @@ export const chatSchema = z.object({
   // the visible path. Null on legacy rows and fresh chats: resolve to the
   // newest message. Optional so producers that predate it (mocks) still parse.
   activeLeafId: z.string().nullable().optional(),
-  // Server-computed (not stored): derived from the cumulative totals + the
-  // resolved rate plan at GET time. Omitted when we can't make an estimate.
-  subscriptionShare: subscriptionShareSchema.optional(),
   // A selected-but-not-yet-activated cross-provider switch. Present only while
   // one is pending; the picker shows the target model without claiming the
   // switch completed. Cleared once the switch commits or is invalidated.
@@ -460,27 +445,6 @@ export const modelPricingSchema = z.object({
   outputPerMTok: z.number().nonnegative(),
 });
 
-// Static subscription rate-limit budgets, in *input-equivalent tokens*. We
-// express the budget as how many fresh input tokens the plan grants in each
-// window. For cache reads and outputs, the consumer scales their tokens by
-// the API pricing ratio before dividing by this budget. We have to pick a
-// single denominator because Anthropic and OpenAI don't publish per-token
-// rate-limit costs, so the ratio idea folds the unknown into the model's
-// catalog pricing entry.
-//
-// All numbers are best-effort from public docs and third-party blog
-// estimates, deliberately approximate. The UI labels the resulting share as
-// "approximate". `fiveHourTokens` covers Anthropic's 5-hour and ChatGPT's
-// primary window, and `sevenDayTokens` covers Anthropic's 7-day and ChatGPT's
-// secondary window. `null` means the plan doesn't gate that window for this
-// model (e.g. Sonnet has no separate 7-day allowance, which is Opus-only).
-export const ratePlanSchema = z.object({
-  id: z.string(),
-  label: z.string(),
-  fiveHourTokens: z.number().int().positive().nullable(),
-  sevenDayTokens: z.number().int().positive().nullable(),
-});
-
 export const chatModelSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -498,8 +462,7 @@ export const chatModelSchema = z.object({
   supportedEfforts: z.array(chatEffortSchema).min(1),
   defaultEffort: chatEffortSchema,
   // API list pricing. Optional, since Codex models without published pricing
-  // skip the API-$ chip. subscription-share falls back to treating all
-  // tokens equally.
+  // skip the API-$ chip.
   pricing: modelPricingSchema.optional(),
   // The same buckets at the provider's fast-mode rates, where it offers one
   // (models.dev publishes these under `experimental.modes.fast`). Its presence
@@ -597,17 +560,6 @@ export const aggregateTotalsBucketSchema = z.object({
   outputTokens: z.number().nonnegative(),
   reasoningOutputTokens: z.number().nonnegative(),
   costUsd: z.number().nonnegative(),
-  // Lifetime input-equivalent tokens, the same weighting used for the per-chat
-  // subscription share, but summed across all chats in this bucket. Each
-  // chat's tokens are weighted by its own model's pricing ratios so the
-  // sum is consistent even when models differ within a provider.
-  effectiveInputTokens: z.number().nonnegative(),
-  // Lifetime subscription share, expressed as a percentage of the resolved
-  // rate plan's per-window budget. Can exceed 100%, since it's how many windows'
-  // worth of usage you've gotten from your subscription over time. Null on
-  // the cross-provider `total` bucket (no single plan applies) and on
-  // providers where we can't resolve a plan.
-  subscriptionShare: subscriptionShareSchema.nullable(),
 });
 export const aggregateTotalsSchema = z.object({
   total: aggregateTotalsBucketSchema,
@@ -651,7 +603,6 @@ export type PortForward = z.infer<typeof portForwardSchema>;
 export type Instance = z.infer<typeof instanceSchema>;
 export type Terminal = z.infer<typeof terminalSchema>;
 export type Chat = z.infer<typeof chatSchema>;
-export type SubscriptionShare = z.infer<typeof subscriptionShareSchema>;
 export type ChatMessage = z.infer<typeof chatMessageSchema>;
 export type QueuedMessage = z.infer<typeof queuedMessageSchema>;
 export type ChatMessageVersion = z.infer<typeof chatMessageVersionSchema>;
@@ -662,7 +613,6 @@ export type ChatModelsResponse = z.infer<typeof chatModelsResponseSchema>;
 export type ContextBreakdown = z.infer<typeof contextBreakdownSchema>;
 export type ContextBreakdownCategory = z.infer<typeof contextBreakdownCategorySchema>;
 export type ModelPricing = z.infer<typeof modelPricingSchema>;
-export type RatePlan = z.infer<typeof ratePlanSchema>;
 export type UsageWindow = z.infer<typeof usageWindowSchema>;
 export type UsageNamedWindow = z.infer<typeof usageNamedWindowSchema>;
 export type UsageClaude = z.infer<typeof usageClaudeSchema>;

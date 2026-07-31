@@ -3,9 +3,9 @@ import { renderFirstTargetPrompt } from "./render";
 
 // Conservative capacity estimation for the complete first target request. This
 // deliberately uses a byte-ratio estimate rather than staging an exact target
-// session or fabricating provider transcript files (see DESIGN.md). The
-// constants are policy defaults, tuned from rejected requests and observed
-// first-turn usage, not provider guarantees.
+// session or fabricating provider transcript files. The constants are policy
+// defaults, tuned from rejected requests and observed first-turn usage, not
+// provider guarantees.
 export interface HandoffEstimateConstants {
   // utf8 bytes per token. The estimate is ceil(bytes / bytesPerToken).
   bytesPerToken: number;
@@ -128,7 +128,7 @@ export function estimateFirstTargetRequest(
 }
 
 // The action for a switch given the candidate size and each side's
-// availability, exactly as the availability matrix in DESIGN.md prescribes.
+// availability. See `decideHandoffAction` below for the matrix itself.
 export type HandoffAction =
   | "transfer-direct"
   | "transfer-raw"

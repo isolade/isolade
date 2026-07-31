@@ -4,7 +4,8 @@ import type { ChatProvider } from "../../contracts";
 // from the source transcript and injected into the first target turn. This is
 // the one shape both directions (Claude→Codex, Codex→Claude) produce and the
 // target consumes. Provider-specific reasoning and protocol data never appear
-// here (see the excluded-content list in DESIGN.md).
+// here: see the excluded-content checks in normalize-claude.ts and
+// normalize-isolade.ts, which are what enforce it.
 
 // A piece of a tool result. Text is the common case. Image/binary results are
 // materialized as files in the VM and referenced by guest path. A result that

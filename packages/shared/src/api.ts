@@ -129,6 +129,10 @@ export const createChatBodySchema = z.object({
   model: z.string().min(1),
   // Omitted → server picks the model's declared defaultEffort.
   effort: chatEffortSchema.optional(),
+  // Start the chat in the provider's fast mode. Set from the new-chat draft,
+  // where the choice is made before there is a chat to PATCH. Ignored on a
+  // model with no fast rate card, the same as on update.
+  fastMode: z.boolean().optional(),
 });
 
 export const updateChatBodySchema = z

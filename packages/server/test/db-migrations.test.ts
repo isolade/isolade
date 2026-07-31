@@ -206,7 +206,7 @@ describe("db migrations 3-16 (tree, attachments, rendering, layout, queue, provi
       const raw = new Database(path);
       const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(16);
+      expect(version).toBe(17);
       const messageColumns = raw
         .query("SELECT name FROM pragma_table_info('chat_messages')")
         .all() as Array<{ name: string }>;
@@ -388,7 +388,7 @@ describe("db migration 7 (panel layout)", () => {
       const version = (
         new Database(path).query("PRAGMA user_version").get() as { user_version: number }
       ).user_version;
-      expect(version).toBe(16);
+      expect(version).toBe(17);
     } finally {
       rmSync(path, { force: true });
       rmSync(`${path}-wal`, { force: true });
@@ -502,7 +502,7 @@ describe("db migration 10 (per-message provider identity)", () => {
       const raw = new Database(path);
       const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(16);
+      expect(version).toBe(17);
       const switchesTable = raw
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'provider_switches'")
         .get() as { name: string } | null;
@@ -582,7 +582,7 @@ describe("db migration 12 (per-chat usage attribution)", () => {
       const raw = new Database(path);
       const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(16);
+      expect(version).toBe(17);
       const index = raw
         .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
         .get("idx_usage_events_chat") as { name: string } | null;
@@ -657,7 +657,79 @@ describe("db migration 16 (turn timing)", () => {
       const raw = new Database(path);
       const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(16);
+      expect(version).toBe(17);
+      raw.close();
+    } finally {
+      rmSync(path, { force: true });
+      rmSync(`${path}-wal`, { force: true });
+      rmSync(`${path}-shm`, { force: true });
+    }
+  });
+});
+
+// A v16 database whose usage log still carries the weighted-token column that
+// only the estimated plan share ever read. Everything else is at the current
+// shape, installed by createSchema.
+function seedV16Db(path: string): { eventId: string } {
+  const sqlite = new Database(path);
+  sqlite.run(`
+    CREATE TABLE usage_events (
+      id TEXT PRIMARY KEY,
+      profile_id TEXT,
+      chat_id TEXT,
+      kind TEXT NOT NULL DEFAULT 'usage',
+      provider TEXT NOT NULL,
+      model TEXT NOT NULL,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+      fast INTEGER NOT NULL DEFAULT 0,
+      cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0,
+      web_search_requests INTEGER NOT NULL DEFAULT 0,
+      cost_usd REAL NOT NULL DEFAULT 0,
+      effective_input_tokens REAL NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER))
+    )
+  `);
+  const eventId = randomUUID();
+  sqlite.run(
+    `INSERT INTO usage_events (id, provider, model, input_tokens, cost_usd, effective_input_tokens)
+     VALUES (?, 'anthropic', 'claude-opus-5', 1000, 0.5, 4200)`,
+    [eventId],
+  );
+  sqlite.run(`PRAGMA user_version = 16`);
+  sqlite.close();
+  return { eventId };
+}
+
+describe("db migration 17 (weighted token column)", () => {
+  it("drops the column without touching what the turn actually used or cost", () => {
+    const path = join(tmpdir(), `isolade-mig17-${randomUUID()}.db`);
+    try {
+      const { eventId } = seedV16Db(path);
+      const db = createDb(path);
+
+      // The weighting was only ever a denominator for the plan-share estimate.
+      // The tokens and the dollars it was derived from are the record, and they
+      // survive it.
+      const existing = db
+        .select()
+        .from(schema.usageEvents)
+        .where(eq(schema.usageEvents.id, eventId))
+        .get();
+      expect(existing?.inputTokens).toBe(1000);
+      expect(existing?.costUsd).toBeCloseTo(0.5, 10);
+
+      const raw = new Database(path);
+      const column = raw
+        .query("SELECT name FROM pragma_table_info('usage_events') WHERE name = ?")
+        .get("effective_input_tokens");
+      expect(column).toBeNull();
+      const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
+        .user_version;
+      expect(version).toBe(17);
       raw.close();
     } finally {
       rmSync(path, { force: true });

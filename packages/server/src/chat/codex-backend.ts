@@ -1096,8 +1096,8 @@ function codexToolInput(item: CodexItem): Record<string, unknown> {
 // prompt with `cachedInputTokens` a subset of it, and `outputTokens` is the
 // FULL completion with `reasoningOutputTokens` a subset of it. Our schema
 // follows Anthropic's convention where every bucket is disjoint (they sum to
-// the total, and cost/weighting add them up — see computeApiCost and
-// subscription-share's effectiveInputTokens). So we subtract each subset out on
+// the total, and cost adds them up — see computeApiCost). So we subtract each
+// subset out on
 // the way in: without it, cached tokens would double-count in the context
 // pressure metric, and — because `reasoningOutputTokens > 0` for reasoning
 // models — reasoning tokens would be billed twice in the API-$ estimate.

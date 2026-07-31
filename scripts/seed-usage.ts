@@ -61,9 +61,8 @@ const DOLLARS_PER_TOKEN = 4 / 1_000_000;
 
 type Provider = "anthropic" | "openai";
 
-// Real catalog ids so the Lifetime card can resolve pricing for the
-// token-weighting / subscription-share columns; a couple per provider so
-// per-model views have variety.
+// Real catalog ids so the Lifetime card can resolve pricing; a couple per
+// provider so per-model views have variety.
 const MODELS: Record<Provider, string[]> = {
   anthropic: ["claude-sonnet-5", "claude-opus-5"],
   openai: ["gpt-5.4", "gpt-5.3-codex"],
@@ -101,19 +100,6 @@ function tokensFromCost(cost: number, provider: Provider): TokenBreakdown {
     outputTokens,
     reasoningOutputTokens,
   };
-}
-
-// Pricing-weighted input-equivalent for a turn, mirroring the real recorder's
-// `effectiveInputTokens`: output is the dominant cost driver, cache writes cost
-// a premium, cache reads are cheap. Rough weights are fine for demo data — it
-// only feeds the Lifetime card's subscription-share estimate.
-function effectiveInput(t: TokenBreakdown): number {
-  return Math.round(
-    t.inputTokens +
-      t.cachedInputTokens * 0.1 +
-      t.cacheCreationInputTokens * 1.25 +
-      t.outputTokens * 5,
-  );
 }
 
 function generate(days: number, today: Date): UsageRow[] {
@@ -209,7 +195,6 @@ function main() {
     outputTokens: r.outputTokens,
     reasoningOutputTokens: r.reasoningOutputTokens,
     costUsd: r.costUsd,
-    effectiveInputTokens: effectiveInput(r),
     createdAt: r.date,
   }));
 

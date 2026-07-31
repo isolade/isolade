@@ -13,7 +13,6 @@ import { CodexBackend } from "./chat/codex-backend";
 import { CodexManager } from "./chat/codex-manager";
 import { ProviderSwitchStore } from "./chat/provider-switch-store";
 import { ChatStreamHub } from "./chat/stream-hub";
-import { annotateAggregateShares } from "./chat/subscription-share";
 import { ChatManager } from "./chats";
 import { type AggregateTotals, sandboxStatsSchema } from "./contracts";
 import { createDb } from "./db";
@@ -458,8 +457,7 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
 
   // The per-profile upstream usage snapshot (Claude + Codex), scoped and 20s-
   // cached by profile. Claude reads the profile's own credentials. Codex flows
-  // through the profile's warm-VM app-server. Shared by /api/usage and the
-  // per-chat subscriptionShare so both see the same profile-scoped numbers.
+  // through the profile's warm-VM app-server.
   const profileUsageStats = (profileId: string, ensureWarm = false) =>
     getUsageStats({
       authStore: profiles.auth(profileId),
@@ -477,10 +475,6 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
     let aggregate: AggregateTotals | null = null;
     try {
       aggregate = chatManager.getAggregateTotals(profile);
-      // Annotates each per-provider bucket with `subscriptionShare`,
-      // expressed as a lifetime % of the resolved rate plan's window
-      // budget. Uses the already-fetched (cached) usage stats.
-      await annotateAggregateShares(aggregate, stats, profiles.auth(profile));
     } catch (err) {
       console.warn("[usage] aggregate totals failed", err);
     }
@@ -533,7 +527,6 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
     // the real backend's job, so route the callback through it even when a fake
     // backend drives turns in tests.
     disposeChatProcess: (chatId: string) => realClaudeBackend.disposeChat(chatId),
-    profileUsageStats: (profileId: string) => profileUsageStats(profileId),
     deliveryConfirmationTimeoutMs: opts.deliveryConfirmationTimeoutMs,
   });
   const chatQueueService = new ChatQueueService({

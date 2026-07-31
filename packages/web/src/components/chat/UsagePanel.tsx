@@ -1,7 +1,6 @@
 // The composer bar's usage surfaces: whether the agent is working and for how
-// long, the running chat cost beside it in the composer's bottom row, the
-// context-pressure bar under the model picker, and the token/cost/subscription
-// breakdowns shown in the picker dropdown. Data comes from Chat.tsx's UsageState
+// long, the running chat cost, the context meter beside them, and the token and
+// cost breakdowns each of those opens on hover. Data comes from Chat.tsx's UsageState
 // (persisted-row seed + live SSE usage events) and its turn clock.
 import { Check, Loader2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -14,15 +13,69 @@ import {
   type ContextBreakdown,
   findChatModel,
 } from "../../lib/contracts";
-import type { SubscriptionShare, UsageState } from "./chunks";
+import type { TokenUsage, UsageState } from "./chunks";
 
-// Rich token-usage breakdown shown both in the composer-bar tooltip and inside
-// the model-picker dropdown. The denominator prefers the provider-reported
-// value (codex sends it on every usage update) and falls back to the catalog
-// entry. The numerator is the most recent turn's input + cached input, the
-// size of the prompt packed into the model on the last turn, which is the
-// most faithful "context pressure" signal we can show without per-block
-// tokenization.
+// How full the model's context is, and against what. The denominator prefers
+// the provider-reported value (codex sends it on every usage update) and falls
+// back to the catalog entry. The numerator is the most recent turn's input,
+// cached input and cache writes: every part of the prompt that was packed into
+// the model, however each part was billed. Output is left out, being what came
+// back rather than what was sent. It is the most faithful "context pressure"
+// signal we can show without tokenizing every block ourselves.
+interface ContextFill {
+  used: number;
+  window?: number;
+  /** Percent of the window filled, or null when no window is known. */
+  pct: number | null;
+}
+
+function contextFill(usage: UsageState, catalogWindow?: number): ContextFill {
+  const window = usage.modelContextWindow ?? catalogWindow;
+  const used =
+    usage.last.inputTokens + usage.last.cachedInputTokens + usage.last.cacheCreationInputTokens;
+  return { used, window, pct: window ? Math.min(100, (used / window) * 100) : null };
+}
+
+// What a chat that has not run a turn has put in the model: nothing. Stands in
+// for the usage snapshot a chat has yet to receive, so the meter can read an
+// honest zero from the moment the chat opens rather than waiting for the first
+// usage event to exist at all.
+const NO_TOKENS: TokenUsage = {
+  inputTokens: 0,
+  cachedInputTokens: 0,
+  cacheCreationInputTokens: 0,
+  outputTokens: 0,
+  reasoningOutputTokens: 0,
+  totalTokens: 0,
+};
+const EMPTY_USAGE: UsageState = { last: NO_TOKENS, total: NO_TOKENS };
+
+// The session state a context probe's answer belongs to. What is holding the
+// context only moves when the model is sent something or the thread is
+// compacted, so two opens that agree on this key would get the same answer back,
+// and the second one is not worth asking for: the probe reaches into the VM and
+// resumes the CLI process (spawning one if the session has since been let go) to
+// produce it.
+//
+// A turn in flight is a key of its own rather than the figures underneath it,
+// which tick with every usage event the turn streams: the server declines to
+// probe a running turn, and being told so once per turn is enough.
+export function contextProbeKey(usage: UsageState | null, running?: boolean): string {
+  if (running) return "running";
+  const { last, total, compacted } = usage ?? EMPTY_USAGE;
+  return [
+    last.inputTokens,
+    last.cachedInputTokens,
+    last.cacheCreationInputTokens,
+    total.totalTokens,
+    compacted ? 1 : 0,
+  ].join(":");
+}
+
+// Rich token breakdown, shown when the composer's context meter is hovered.
+// Tokens only: what the chat has cost lives in the cost card next to it, so
+// each figure in the composer opens the detail for itself rather than both
+// opening most of the same card.
 export function ContextDetail({
   usage,
   catalogWindow,
@@ -30,10 +83,11 @@ export function ContextDetail({
   usage: UsageState;
   catalogWindow?: number;
 }) {
-  const window = usage.modelContextWindow ?? catalogWindow;
-  const usedNow =
-    usage.last.inputTokens + usage.last.cachedInputTokens + usage.last.cacheCreationInputTokens;
-  const pct = window ? Math.min(100, (usedNow / window) * 100) : null;
+  const { used: usedNow, window, pct } = contextFill(usage, catalogWindow);
+  // A chat between its first message and its first usage event has a window and
+  // nothing in it. Saying so is the point of the card being open, but the turn
+  // and total rows would just be a column of zeros, so they wait for a turn.
+  const ran = usedNow > 0 || usage.total.totalTokens > 0;
   return (
     <div className="space-y-1 font-mono text-xs">
       <div className="font-sans text-[10px] uppercase tracking-wider text-muted-foreground">
@@ -48,100 +102,49 @@ export function ContextDetail({
         </span>
       </div>
       {usage.compacted && <div className="text-amber-500/80 text-[10px]">thread compacted</div>}
-      <div className="font-sans text-[10px] uppercase tracking-wider text-muted-foreground pt-1">
-        Last turn
-      </div>
-      <UsageRow label="input" n={usage.last.inputTokens} />
-      <UsageRow label="cached" n={usage.last.cachedInputTokens} />
-      {usage.last.cacheCreationInputTokens > 0 && (
-        <UsageRow label="cache write" n={usage.last.cacheCreationInputTokens} />
+      {ran ? (
+        <>
+          <div className="font-sans text-[10px] uppercase tracking-wider text-muted-foreground pt-1">
+            Last turn
+          </div>
+          <UsageRow label="input" n={usage.last.inputTokens} />
+          <UsageRow label="cached" n={usage.last.cachedInputTokens} />
+          {usage.last.cacheCreationInputTokens > 0 && (
+            <UsageRow label="cache write" n={usage.last.cacheCreationInputTokens} />
+          )}
+          <UsageRow label="output" n={usage.last.outputTokens} />
+          {usage.last.reasoningOutputTokens > 0 && (
+            <UsageRow label="reasoning" n={usage.last.reasoningOutputTokens} />
+          )}
+          <div className="font-sans text-[10px] uppercase tracking-wider text-muted-foreground pt-1">
+            Total
+          </div>
+          <UsageRow label="all turns" n={usage.total.totalTokens} />
+        </>
+      ) : (
+        <div className="text-[10px] text-muted-foreground">Nothing sent to the model yet.</div>
       )}
-      <UsageRow label="output" n={usage.last.outputTokens} />
-      {usage.last.reasoningOutputTokens > 0 && (
-        <UsageRow label="reasoning" n={usage.last.reasoningOutputTokens} />
-      )}
-      <div className="font-sans text-[10px] uppercase tracking-wider text-muted-foreground pt-1">
-        Total
-      </div>
-      <UsageRow label="all turns" n={usage.total.totalTokens} />
-      {/* The token rows are the live session's, but cost spans the whole chat,
-          agent switches included. It is the same figure the composer shows, to
-          more decimal places. */}
-      {usage.costUsd != null && (
-        <UsageRow label="cost" n={usage.costUsd} suffix="$" precision={4} />
-      )}
-      {usage.subscriptionShare && <SubscriptionShareRows share={usage.subscriptionShare} />}
-    </div>
-  );
-}
-
-// Renders the per-chat subscription-window share under the existing
-// Context/Last/Total breakdown. Numbers are deliberately labeled as
-// "approximate". See subscription-share.ts on the server for the
-// underlying math and its caveats.
-function SubscriptionShareRows({ share }: { share: SubscriptionShare }) {
-  const showFiveHour = share.fiveHourPct != null;
-  const showSevenDay = share.sevenDayPct != null;
-  if (!showFiveHour && !showSevenDay) return null;
-  return (
-    <>
-      <div className="font-sans text-[10px] uppercase tracking-wider text-muted-foreground pt-1">
-        Subscription
-      </div>
-      {showFiveHour && <ShareRow label="5h window" chatPct={share.fiveHourPct!} />}
-      {showSevenDay && <ShareRow label="7d window" chatPct={share.sevenDayPct!} />}
-    </>
-  );
-}
-
-function ShareRow({ label, chatPct }: { label: string; chatPct: number }) {
-  return (
-    <div className="flex justify-between gap-4">
-      <span className="text-muted-foreground">{label}</span>
-      <span className="tabular-nums">{chatPct.toFixed(2)}%</span>
     </div>
   );
 }
 
 // Per-category breakdown from Claude's structured `get_context_usage`
 // response. Anthropic-only. Codex chats render the unavailable hint. Each row
-// mirrors a category reported by the live CLI process.
+// mirrors a category reported by the live CLI process. Read when the meter's
+// card opens, so `breakdown` and `error` both being empty means the read is
+// still in flight. Reopening the card retries a failed read.
 export function ContextBreakdownDetail({
   breakdown,
-  loading,
   error,
-  onLoad,
 }: {
   breakdown: ContextBreakdown | null;
-  loading: boolean;
   error: string | null;
-  onLoad: () => void;
 }) {
-  if (loading) {
-    return (
-      <div className="font-mono text-[10px] text-muted-foreground">Loading context breakdown…</div>
-    );
-  }
-  if (error) {
-    return (
-      <button
-        type="button"
-        onClick={onLoad}
-        className="font-mono text-[10px] text-destructive/80 hover:text-destructive text-left"
-      >
-        Context breakdown: {error} (retry)
-      </button>
-    );
-  }
   if (!breakdown) {
     return (
-      <button
-        type="button"
-        onClick={onLoad}
-        className="font-mono text-[10px] text-muted-foreground hover:text-foreground text-left"
-      >
-        Show context breakdown
-      </button>
+      <div className="font-mono text-[10px] text-muted-foreground">
+        {error ? `Context breakdown: ${error}` : "Loading context breakdown…"}
+      </div>
     );
   }
   if (!breakdown.available) {
@@ -171,35 +174,155 @@ export function ContextBreakdownDetail({
   );
 }
 
-// Thin context-pressure bar that sits underneath the model selector in the
-// composer toolbar. The detailed breakdown lives in the model-picker dropdown.
-export function ContextBar({
+// Where the meter stops being quiet metadata and starts being a warning. The
+// same two thresholds the pressure bar under the model name used before it.
+const CONTEXT_WARN_PCT = 75;
+const CONTEXT_DANGER_PCT = 90;
+
+// The arc's geometry, in the units of its viewBox. Radius and stroke are set so
+// the ring's outer edge lands exactly on the box, leaving no padding to align
+// away when the meter sits beside type.
+const RING_R = 8;
+const RING_C = 2 * Math.PI * RING_R;
+
+// The fill, drawn as a ring. Both arcs take their color from the text around
+// them, so the meter warms with the rest of the chip rather than being colored
+// twice, and the track is the same color held back to a hint of itself.
+function ContextRing({ pct }: { pct: number }) {
+  return (
+    <svg viewBox="0 0 20 20" className="size-3.5 shrink-0 -rotate-90" aria-hidden>
+      <circle
+        cx="10"
+        cy="10"
+        r={RING_R}
+        fill="none"
+        strokeWidth="4"
+        className="stroke-current opacity-20"
+      />
+      <circle
+        cx="10"
+        cy="10"
+        r={RING_R}
+        fill="none"
+        strokeWidth="4"
+        strokeDasharray={`${(pct / 100) * RING_C} ${RING_C}`}
+        className="stroke-current transition-[stroke-dasharray] duration-200"
+      />
+    </svg>
+  );
+}
+
+// How full the context is, as a ring and a percentage, at the end of the
+// composer's left cluster. It reads as a share rather than as a token count
+// because that is the question being asked of it ("how much room is left"), and
+// because the same 420k is comfortable on one model and nearly full on another,
+// so a percentage survives a model switch where a raw figure would have to be
+// re-read against a new denominator. The tokens themselves, and what is holding
+// them, are one hover away.
+//
+// It sits with the model rather than in the send corner because the window it
+// measures is the model's: switching models moves this number.
+export function ContextMeter({
   usage,
   catalogWindow,
+  running,
+  loadBreakdown,
 }: {
   usage: UsageState | null;
   catalogWindow?: number;
+  /** Whether a turn is in flight, which the probe cannot see past. */
+  running?: boolean;
+  loadBreakdown?: () => Promise<ContextBreakdown>;
 }) {
-  const window = usage?.modelContextWindow ?? catalogWindow;
-  const usedNow = usage
-    ? usage.last.inputTokens + usage.last.cachedInputTokens + usage.last.cacheCreationInputTokens
-    : 0;
-  const pct = window ? Math.min(100, (usedNow / window) * 100) : null;
-  const color =
-    pct == null
-      ? "bg-muted-foreground/40"
-      : pct >= 90
-        ? "bg-red-500"
-        : pct >= 75
-          ? "bg-amber-500"
-          : "bg-muted-foreground/60";
+  const [breakdown, setBreakdown] = useState<ContextBreakdown | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // Read on open, like the cost card beside it: the categories come from the
+  // live CLI process, so they are only worth asking for when someone is looking.
+  // Unlike the cost card, the read is not cheap (it resumes, and can spawn, a
+  // CLI process inside the VM to ask), so what came back is kept and reused
+  // until the session it describes has moved on. `readAt` is the probe key that
+  // produced what is in state, and null when nothing usable is.
+  const request = useRef(0);
+  const readAt = useRef<string | null>(null);
+  // Any turn that ran leaves the context changed, so a settled one drops what
+  // the last probe returned. The figures in the key normally say so by
+  // themselves, but a turn stopped before it reported any usage still put a
+  // message into the session while leaving every figure where it was.
+  const wasRunning = useRef(running);
+  useEffect(() => {
+    if (wasRunning.current && !running) readAt.current = null;
+    wasRunning.current = running;
+  }, [running]);
+  const onOpenChange = (open: boolean) => {
+    if (!open || !loadBreakdown) return;
+    const key = contextProbeKey(usage, running);
+    if (readAt.current === key) return;
+    const generation = ++request.current;
+    setBreakdown(null);
+    setError(null);
+    void (async () => {
+      try {
+        const next = await loadBreakdown();
+        // A card closed and reopened while a read was in flight must not be
+        // filled in by the read it no longer wants.
+        if (request.current !== generation) return;
+        setBreakdown(next);
+        readAt.current = key;
+      } catch (err) {
+        if (request.current !== generation) return;
+        setError(err instanceof Error ? err.message : String(err));
+        // A failed read is not worth keeping. Most of them are a VM that was
+        // busy or waking, so the next hover should try again rather than show
+        // the same message until the next turn.
+        readAt.current = null;
+      }
+    })();
+  };
+
+  // A chat that has yet to run a turn reads 0%, so the meter is part of the
+  // composer from the moment the chat opens rather than appearing partway
+  // through, the same way the cost beside it starts at $0.00. An empty context
+  // is empty whatever the window, so this holds even before a window is known,
+  // which is what a codex chat looks like until its first usage event (the
+  // catalog leaves those windows to the provider to report). Once something has
+  // been sent, though, a share of an unknown denominator is not a fact, and a
+  // ring nobody can read says less than no ring at all.
+  const fill = contextFill(usage ?? EMPTY_USAGE, catalogWindow);
+  const pct = fill.used === 0 ? 0 : fill.pct;
+  if (pct === null) return null;
+  // A prompt that exists but rounds to nothing still reads as 1%: on a
+  // million-token window an opening turn is a rounding error, and rounding it
+  // away would leave the meter reading empty on a chat that is under way. An
+  // empty context is the one thing that may read 0%.
+  const shown = fill.used === 0 ? 0 : Math.max(1, Math.round(pct));
+  const label = `Context ${shown}% full${
+    fill.window ? `, ${formatTokens(fill.used)} of ${formatTokens(fill.window)} tokens` : ""
+  }`;
   return (
-    <div className="h-0.5 mt-0.5 bg-muted rounded-full overflow-hidden pointer-events-none">
-      <div
-        className={cn("h-full transition-[width] duration-200", color)}
-        style={{ width: `${pct ?? 0}%` }}
-      />
-    </div>
+    <HoverCard openDelay={150} closeDelay={80} onOpenChange={onOpenChange}>
+      <HoverCardTrigger asChild>
+        <button
+          type="button"
+          className={cn(
+            "flex h-8 shrink-0 cursor-default items-center gap-1 rounded-md px-1.5 font-mono text-xs tabular-nums focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50",
+            pct >= CONTEXT_DANGER_PCT
+              ? "text-red-500"
+              : pct >= CONTEXT_WARN_PCT
+                ? "text-amber-500"
+                : "text-muted-foreground hover:text-foreground",
+          )}
+          aria-label={label}
+          data-demo="context-meter"
+        >
+          <ContextRing pct={pct} />
+          <span className="select-none">{shown}%</span>
+        </button>
+      </HoverCardTrigger>
+      <HoverCardContent side="top" align="start" className="space-y-2">
+        <ContextDetail usage={usage ?? EMPTY_USAGE} catalogWindow={catalogWindow} />
+        {loadBreakdown && <ContextBreakdownDetail breakdown={breakdown} error={error} />}
+      </HoverCardContent>
+    </HoverCard>
   );
 }
 
@@ -379,24 +502,19 @@ function useElapsed(startedAt: number | null): number {
   return startedAt === null ? 0 : now - startedAt;
 }
 
-// Whether the turn clock has anything to put on screen. The separator between
-// this readout and the cost depends on the answer, so it is decided once here
-// rather than inferred again by whoever draws the separator.
+// Whether the turn clock has anything to put on screen.
 function hasTurnFigure({ running, lastMs }: TurnClock): boolean {
   return running || lastMs !== null;
 }
 
-// Whether the agent is working, and how long the turn has taken. Sits beside the
-// running cost in the composer's bottom row, because "is it still going" and
-// "what is it costing me" are one glance. A running turn spins and counts up. A
-// settled one swaps the spinner for a tick and holds the final figure, so the
-// last turn's duration is still there to read while the next message is typed. A
-// chat between turns with nothing to report renders nothing rather than a zero.
-//
-// Type comes from the ComposerStatus cluster below rather than being set here, so
-// this and the cost figure share one strut and their digits sit on the same
-// baseline. Sized on its own the 12px text made a 16px line box next to the
-// cost's inherited 24px one, and the two readouts landed a pixel apart.
+// Whether the agent is working, and how long the turn has taken. The composer's
+// send corner, and the only thing in it: it is the one readout that is about
+// right now rather than about the chat, so it sits where you look when you are
+// waiting, while what the chat is made of and what it has cost stay together on
+// the left. A running turn spins and counts up. A settled one swaps the spinner
+// for a tick and holds the final figure, so the last turn's duration is still
+// there to read while the next message is typed. A chat between turns with
+// nothing to report renders nothing rather than a zero.
 export function TurnStatus({ running, startedAt, lastMs }: TurnClock) {
   const elapsed = useElapsed(running ? startedAt : null);
   const ms = running ? (startedAt === null ? null : elapsed) : lastMs;
@@ -409,7 +527,9 @@ export function TurnStatus({ running, startedAt, lastMs }: TurnClock) {
     : `Last turn took ${shown}`;
   return (
     <span
-      className="flex select-none items-center gap-1 px-1"
+      // Sets its own type now that it stands alone. The 12px figure in a 24px
+      // line box is what keeps it on the send button's centre line.
+      className="flex h-8 select-none items-center gap-1 px-1 font-mono text-xs tabular-nums text-muted-foreground"
       title={label}
       aria-label={label}
       // Deliberately not a live region: the label above is read when focus
@@ -426,34 +546,13 @@ export function TurnStatus({ running, startedAt, lastMs }: TurnClock) {
   );
 }
 
-// The composer's send corner: how the turn is going, then what the chat has
-// spent. One readout in one type, separated the way the rest of the app separates
-// quiet metadata on a line, because two mono figures set side by side with only a
-// gap between them read as two unrelated numbers competing for the corner rather
-// than as one status line. The type is set once here so both figures share a
-// strut and sit on the same baseline, and each figure carries its own inset so
-// the separator is evenly spaced between them.
-export function ComposerStatus({
-  turn,
-  costUsd,
-  loadBreakdown,
-}: {
-  turn: TurnClock;
-  costUsd?: number;
-  loadBreakdown?: () => Promise<ChatCostBreakdown>;
-}) {
-  return (
-    <span className="flex items-center font-mono text-xs tabular-nums text-muted-foreground">
-      <TurnStatus running={turn.running} startedAt={turn.startedAt} lastMs={turn.lastMs} />
-      {hasTurnFigure(turn) && <span className="text-muted-foreground/50">·</span>}
-      <ChatCost costUsd={costUsd} loadBreakdown={loadBreakdown} />
-    </span>
-  );
-}
-
-// The chat's running total cost, sitting in the composer's bottom row. Each
-// usage event nudges it up and it counts its way there rather than jumping, so
-// spend reads as something accruing while the agent works. A chat that has yet
+// The chat's running total cost, between the model picker and the context meter
+// on the left of the composer's bottom row. It is a fact about the chat rather
+// than about the moment, which is what it has in common with the model it ran on
+// and the context it filled, and what the turn clock in the send corner does not
+// share.
+// Each usage event nudges it up and it counts its way there rather than jumping,
+// so spend reads as something accruing while the agent works. A chat that has yet
 // to spend anything reads "$0.00", so the figure is part of the composer from
 // the first message rather than appearing partway through.
 // Always cents, never more: this is an ambient figure, and a digit count that
@@ -491,22 +590,27 @@ export function ChatCost({
     })();
   };
 
+  // Struck to the same height and inset as the context meter next to it, so the
+  // two figures on the left of the row sit on one line and present the same
+  // target however each of them is hovered.
   const total = (
     <span className="select-none font-mono text-xs tabular-nums">{`$${shown.toFixed(2)}`}</span>
   );
-  if (!loadBreakdown) return <span className="px-1 text-muted-foreground">{total}</span>;
+  if (!loadBreakdown) {
+    return <span className="flex h-8 items-center px-1.5 text-muted-foreground">{total}</span>;
+  }
   return (
     <HoverCard openDelay={150} closeDelay={80} onOpenChange={onOpenChange}>
       <HoverCardTrigger asChild>
         <button
           type="button"
-          className="cursor-default rounded px-1 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
+          className="flex h-8 shrink-0 cursor-default items-center rounded-md px-1.5 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
           aria-label="What this chat has cost so far, across every agent it has run on"
         >
           {total}
         </button>
       </HoverCardTrigger>
-      <HoverCardContent align="end">
+      <HoverCardContent side="top" align="start">
         {detail ? (
           // Whatever the composer is showing beyond the settled bill belongs to
           // the turn in flight. Derived here rather than plumbed through,

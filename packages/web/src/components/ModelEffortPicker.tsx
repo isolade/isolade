@@ -1,5 +1,5 @@
 import { CheckIcon, ChevronDownIcon } from "lucide-react";
-import { type ReactNode, useState } from "react";
+import { useState } from "react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -20,15 +20,7 @@ interface ModelEffortPickerProps {
   currentEffort: ChatEffort;
   onModelChange: (id: string) => void;
   onEffortChange: (effort: ChatEffort) => void;
-  /** Whether this chat runs in the provider's fast mode. Omit the handler on
-   *  surfaces where the choice has nowhere to be stored (the new-chat draft). */
-  fastMode?: boolean;
-  onFastModeChange?: (fast: boolean) => void;
   disabled?: boolean;
-  /** Optional content rendered at the top of the dropdown (e.g. context usage detail). */
-  prepend?: ReactNode;
-  /** Optional content rendered inside the trigger button, below the label. */
-  belowLabel?: ReactNode;
   align?: "start" | "center" | "end";
 }
 
@@ -36,7 +28,7 @@ interface ModelEffortPickerProps {
 // narrow to hold everything, at which point the model name truncates rather than
 // the row growing past the composer's border.
 const TRIGGER_CLS =
-  "group/trigger inline-flex flex-col items-stretch justify-center rounded-md min-h-8 min-w-0 max-w-full px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50 disabled:pointer-events-none focus-visible:outline-none w-auto";
+  "inline-flex h-8 w-auto min-w-0 max-w-full items-center justify-between gap-1 rounded-md px-2 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50 disabled:pointer-events-none focus-visible:outline-none";
 
 export function ModelEffortPicker({
   models,
@@ -45,11 +37,7 @@ export function ModelEffortPicker({
   currentEffort,
   onModelChange,
   onEffortChange,
-  fastMode = false,
-  onFastModeChange,
   disabled,
-  prepend,
-  belowLabel,
   align = "end",
 }: ModelEffortPickerProps) {
   const currentModel = models.find((m) => m.id === currentModelId);
@@ -65,22 +53,13 @@ export function ModelEffortPicker({
   return (
     <DropdownMenu open={open} onOpenChange={setOpen}>
       <DropdownMenuTrigger disabled={disabled} className={TRIGGER_CLS} data-demo="model-picker">
-        <span className="inline-flex min-w-0 items-center justify-between gap-1">
-          <span className="truncate">
-            {currentModel?.name ?? currentModelId}
-            {supportedEfforts.length > 1 && <> {effortLabel(currentEffort)}</>}
-          </span>
-          <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
+        <span className="truncate">
+          {currentModel?.name ?? currentModelId}
+          {supportedEfforts.length > 1 && <> {effortLabel(currentEffort)}</>}
         </span>
-        {belowLabel}
+        <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
       </DropdownMenuTrigger>
       <DropdownMenuContent className="min-w-[16rem]" align={align} sideOffset={4}>
-        {prepend && (
-          <>
-            {prepend}
-            <DropdownMenuSeparator />
-          </>
-        )}
         <div role="radiogroup" aria-label="Model">
           {frontier.map((m) => (
             <ModelRow
@@ -167,45 +146,9 @@ export function ModelEffortPicker({
             </div>
           </>
         )}
-        {onFastModeChange && currentModel?.fastPricing && (
-          <>
-            <DropdownMenuSeparator />
-            <button
-              type="button"
-              role="switch"
-              aria-checked={fastMode}
-              onClick={(ev) => {
-                ev.preventDefault();
-                onFastModeChange(!fastMode);
-                setOpen(false);
-              }}
-              className="flex w-full items-center justify-between gap-4 rounded-sm px-2 py-1.5 text-left text-sm outline-none hover:bg-accent hover:text-accent-foreground"
-            >
-              <span className="flex flex-col">
-                <span>Fast mode</span>
-                {/* The multiplier, not the raw rate: what it costs relative to
-                    what this model already costs is the decision being made. */}
-                <span className="text-[10px] text-muted-foreground">
-                  {fastRateLabel(currentModel)} the usual rate
-                </span>
-              </span>
-              {fastMode && <CheckIcon className="size-3.5 opacity-80" />}
-            </button>
-          </>
-        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );
-}
-
-// How much dearer fast mode is for this model, from the two rate cards rather
-// than a hardcoded number, so it tracks the catalog.
-function fastRateLabel(model: ChatModelDefinition): string {
-  const base = model.pricing?.inputPerMTok;
-  const fast = model.fastPricing?.inputPerMTok;
-  if (!base || !fast) return "a premium on";
-  const ratio = fast / base;
-  return `${Number.isInteger(ratio) ? ratio : ratio.toFixed(1)}×`;
 }
 
 function ModelRow({

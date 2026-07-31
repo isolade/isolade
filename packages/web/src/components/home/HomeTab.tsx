@@ -367,8 +367,8 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     refreshChats();
     // Instances poll fast: they carry the per-VM diff stats, which the
     // server refreshes within ~1s of agent activity, and listing them is a
-    // trivial DB read. Chats stay on the slower cadence, and their listing
-    // does per-chat subscription-share math server-side.
+    // trivial DB read. Chats stay on the slower cadence, since what changes
+    // about an open one arrives on its own stream rather than through here.
     const ti = setInterval(refreshInstances, 1000);
     const tc = setInterval(refreshChats, 3000);
     return () => {
@@ -531,12 +531,14 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     instancePromise,
     modelId,
     effort,
+    fastMode = false,
     firstMessage,
     uploadIds = [],
   }: {
     instancePromise: Promise<Instance>;
     modelId: string;
     effort: ChatEffort;
+    fastMode?: boolean;
     firstMessage: string;
     uploadIds?: string[];
   }) => {
@@ -566,7 +568,11 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
       model: modelId,
       provider: modelDef?.provider ?? "anthropic",
       effort,
-      fastMode: false,
+      // What the draft asked for, so the composer the user lands in shows the
+      // same bolt they just lit rather than blinking off until the real row
+      // arrives. The server drops it if the model has no fast rate card, and
+      // that row replaces this one.
+      fastMode: fastMode && modelDef?.fastPricing != null,
       claudeSessionId: null,
       codexThreadId: null,
       inputTokens: null,
@@ -619,7 +625,7 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
       }
       let chat: Chat;
       try {
-        chat = await createChat(instance.id, { model: modelId, effort });
+        chat = await createChat(instance.id, { model: modelId, effort, fastMode });
       } catch (err) {
         void removeInstance(instance.id).catch(() => {});
         if (sid !== submissionIdRef.current) return;

@@ -1,7 +1,7 @@
 import { randomUUID } from "crypto";
 import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import { type ModelBilling, type TokenUsage, usageTokenCount } from "./chat/backend";
-import { effectiveInputTokens, pricingFor } from "./chat/subscription-share";
+import { pricingFor } from "./chat/pricing";
 import type {
   AggregateTotals,
   AggregateTotalsBucket,
@@ -75,9 +75,18 @@ function hydrate(row: ChatRow): Chat {
 export class ChatManager {
   constructor(private db: Db) {}
 
-  create(instanceId: string, model: string, provider: ChatProvider, effort: ChatEffort) {
+  create(
+    instanceId: string,
+    model: string,
+    provider: ChatProvider,
+    effort: ChatEffort,
+    fastMode = false,
+  ) {
     const id = randomUUID();
-    this.db.insert(schema.chats).values({ id, instanceId, model, provider, effort }).run();
+    this.db
+      .insert(schema.chats)
+      .values({ id, instanceId, model, provider, effort, fastMode })
+      .run();
     // Log a chat-creation event now so the "across N chats" figure (a count of
     // these markers in the usage log) survives the chat (or its instance) being
     // deleted later.
@@ -1352,12 +1361,7 @@ export class ChatManager {
     const provider = chat.provider as ChatProvider;
     let billed = 0;
     for (const entry of models) {
-      // Pricing-weighted input-equivalent for this model's share of the turn,
-      // at its own rates, so the subscription-share % stays right across a
-      // mid-chat model swap and across a turn that ran a sub-agent elsewhere.
-      const pricing = pricingFor(provider, entry.model, entry.fast);
-      const effective = pricing ? effectiveInputTokens(entry.usage, pricing) : 0;
-      this.recordUsageEvent(profileId, chatId, provider, entry.model, entry, effective);
+      this.recordUsageEvent(profileId, chatId, provider, entry.model, entry);
       billed += entry.costUsd;
     }
     if (billed > 0) {
@@ -1393,7 +1397,6 @@ export class ChatManager {
     provider: ChatProvider,
     model: string,
     billing: ModelBilling,
-    effective: number,
   ) {
     if (usageTokenCount(billing.usage) === 0 && billing.costUsd === 0) return;
 
@@ -1415,7 +1418,6 @@ export class ChatManager {
         cacheWrite1hTokens: billing.cacheWrite1hTokens,
         webSearchRequests: billing.webSearchRequests,
         costUsd: billing.costUsd,
-        effectiveInputTokens: effective,
       })
       .run();
   }
@@ -1591,12 +1593,6 @@ export class ChatManager {
       outputTokens: 0,
       reasoningOutputTokens: 0,
       costUsd: 0,
-      effectiveInputTokens: 0,
-      // Per-provider buckets get filled in by computeAggregateSubscriptionShare
-      // (lives in chat/subscription-share.ts because it needs upstream
-      // usage stats). The `total` bucket stays null, since there's no single
-      // plan that spans providers.
-      subscriptionShare: null,
     });
     const total = empty();
     const anthropic = empty();
@@ -1610,7 +1606,7 @@ export class ChatManager {
       const bucket = r.provider === "anthropic" ? anthropic : openai;
       const add = (b: AggregateTotalsBucket) => {
         // chat_created markers count toward the chat total, and usage events carry
-        // the token/cost/effective deltas (markers have all-zero token fields).
+        // the token/cost deltas (markers have all-zero token fields).
         if (r.kind === "chat_created") b.chats += 1;
         b.inputTokens += r.inputTokens;
         b.cachedInputTokens += r.cachedInputTokens;
@@ -1618,7 +1614,6 @@ export class ChatManager {
         b.outputTokens += r.outputTokens;
         b.reasoningOutputTokens += r.reasoningOutputTokens;
         b.costUsd += r.costUsd;
-        b.effectiveInputTokens += r.effectiveInputTokens;
       };
       add(bucket);
       add(total);

@@ -6,7 +6,6 @@ import {
   applyChatRenderEvent,
   type ChatRenderChunk,
   type Chat as ChatRow,
-  type SubscriptionShare,
   summarizeChatToolInput,
   TOOL_INPUT_PREVIEW_CHARS,
   TOOL_OUTPUT_PREVIEW_CHARS,
@@ -14,7 +13,7 @@ import {
   type ToolRenderChunk,
 } from "../../lib/contracts";
 
-export type { SubscriptionShare, TokenUsage };
+export type { TokenUsage };
 
 export interface UsageState {
   last: TokenUsage;
@@ -24,7 +23,6 @@ export interface UsageState {
   // here that is not scoped to the live session, and so the one that outlives an
   // agent switch.
   costUsd?: number;
-  subscriptionShare?: SubscriptionShare;
   compacted?: boolean;
 }
 
@@ -224,7 +222,6 @@ export function usageSeedFromChat(chat: ChatRow): UsageState | null {
     total,
     modelContextWindow: chat.modelContextWindow ?? undefined,
     costUsd: chat.costUsd ?? undefined,
-    subscriptionShare: chat.subscriptionShare,
     compacted: chat.compacted ?? undefined,
   };
 }
