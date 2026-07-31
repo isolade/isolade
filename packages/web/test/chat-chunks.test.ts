@@ -185,20 +185,24 @@ describe("live reveal projection", () => {
     expect(revealChunks(chunks, 10)).not.toBe(chunks);
   });
 
-  it("reveals thought summaries as readable content", () => {
+  it("treats reasoning as structural, so a collapsed thought never animates in", () => {
+    const thought = {
+      kind: "thought",
+      id: "thought-1",
+      provider: "claude",
+      text: "summary",
+      tokens: 100,
+      status: "done",
+    } as const;
     const chunks = [
-      {
-        kind: "thought",
-        id: "thought-1",
-        provider: "claude",
-        text: "summary",
-        tokens: 100,
-        status: "done",
-      },
+      thought,
+      { kind: "thinking", text: "earlier reasoning" },
+      { kind: "text", text: "answer" },
     ] satisfies StreamChunk[];
 
-    expect(revealableLength(chunks)).toBe(7);
-    expect(revealChunks(chunks, 3)).toEqual([{ ...chunks[0], text: "sum" }]);
+    expect(revealableLength(chunks)).toBe(6);
+    expect(revealChunks(chunks, 0)).toEqual([thought, chunks[1]]);
+    expect(revealChunks(chunks, 3)).toEqual([thought, chunks[1], { kind: "text", text: "ans" }]);
   });
 
   it("does not expose half of a surrogate pair", () => {

@@ -163,7 +163,11 @@ const ThoughtBlock = memo(function ThoughtBlock({
   cacheKey?: string;
 }) {
   const active = chunk.status === "thinking";
-  const [open, setOpen] = useState(chunk.provider === "claude");
+  // Collapsed until asked for, whichever provider it came from. Reasoning is
+  // the agent's own bookkeeping, not part of its answer, and expanded by
+  // default it pushes the answer off screen. The row still says the turn is
+  // thinking, how many tokens it spent, and what it is on right now.
+  const [open, setOpen] = useState(false);
   const tokens = useAnimatedInteger(chunk.tokens);
   const displayText = thoughtDisplayText(chunk);
   const preview = thoughtPreview(displayText);
@@ -188,19 +192,36 @@ const ThoughtBlock = memo(function ThoughtBlock({
             active ? "text-foreground/80" : "text-muted-foreground",
           )}
         />
-        <span
-          className={cn("shrink-0 font-medium", active ? "text-shimmer" : "text-muted-foreground")}
-        >
-          {label}
-        </span>
-        {tokens !== undefined && (
-          <span className="shrink-0 tabular-nums text-muted-foreground/80">
-            · {tokens.toLocaleString()} tokens
+        {/* One run of text, so its separators are spaced like the separators
+            everywhere else in the app: a space's worth of air on each side (see
+            ComposerStatus). Sitting directly in the row instead, each dot took
+            the row's icon-sized gap on its left and only a space on its right,
+            which read as a dot belonging to the figure after it rather than
+            standing between the two. */}
+        <span className="flex min-w-0 items-center gap-1">
+          <span
+            className={cn(
+              "shrink-0 font-medium",
+              active ? "text-shimmer" : "text-muted-foreground",
+            )}
+          >
+            {label}
           </span>
-        )}
-        {preview && !open && (
-          <span className="min-w-0 truncate text-muted-foreground/80">· {preview}</span>
-        )}
+          {tokens !== undefined && (
+            <>
+              <span className="shrink-0 text-muted-foreground/80">·</span>
+              <span className="shrink-0 tabular-nums text-muted-foreground/80">
+                {tokens.toLocaleString()} tokens
+              </span>
+            </>
+          )}
+          {preview && !open && (
+            <>
+              <span className="shrink-0 text-muted-foreground/80">·</span>
+              <span className="min-w-0 truncate text-muted-foreground/80">{preview}</span>
+            </>
+          )}
+        </span>
         {canExpand && (
           <ChevronDown
             className={cn(
@@ -211,6 +232,7 @@ const ThoughtBlock = memo(function ThoughtBlock({
         )}
       </button>
       <div
+        data-thinking-body={open && canExpand ? "open" : "closed"}
         className={cn(
           "grid transition-[grid-template-rows] duration-200 ease-out",
           open && canExpand ? "grid-rows-[1fr]" : "grid-rows-[0fr]",

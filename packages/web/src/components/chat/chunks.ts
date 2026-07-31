@@ -130,13 +130,16 @@ export function replaceChunksFromSnapshot(
 
 /** Number of readable UTF-16 code units in a live chunk stream. Structural
  * chunks have no reveal cost and appear after the readable content before
- * them has become visible. */
+ * them has become visible.
+ *
+ * Reasoning is structural here even though it is text: a thought block is
+ * collapsed until the reader opens it, so pacing its body out character by
+ * character would animate something nobody is looking at, and would hold the
+ * answer that follows behind a reveal budget spent on hidden content. */
 export function revealableLength(chunks: readonly StreamChunk[]): number {
   let length = 0;
   for (const chunk of chunks) {
-    if (chunk.kind === "text" || chunk.kind === "thought" || chunk.kind === "thinking") {
-      length += chunk.text.length;
-    }
+    if (chunk.kind === "text") length += chunk.text.length;
   }
   return length;
 }
@@ -158,7 +161,7 @@ export function revealChunks(chunks: readonly StreamChunk[], budget: number): St
   const revealed: StreamChunk[] = [];
   let remaining = Math.max(0, budget);
   for (const chunk of chunks) {
-    if (chunk.kind !== "text" && chunk.kind !== "thought" && chunk.kind !== "thinking") {
+    if (chunk.kind !== "text") {
       revealed.push(chunk);
       continue;
     }

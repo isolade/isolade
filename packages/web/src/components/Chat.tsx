@@ -1730,12 +1730,11 @@ function Chat({
           }
           if ((ev.type === "thinking" || ev.type === "raw") && !showDebugRef.current) return;
           applyEvent(chunks, toolIndex, ev.type, ev.payload);
-          if (
-            ev.type === "delta" ||
-            ev.type === "thinking_delta" ||
-            ev.type === "thinking_done" ||
-            ev.type === "thinking"
-          ) {
+          // Only the answer is paced out at a readable cadence. Reasoning
+          // arrives whole, like a tool call: its block is collapsed until the
+          // reader opens it, so there is nothing on screen for a character
+          // cadence to reveal (see revealableLength).
+          if (ev.type === "delta") {
             if (canAnimateLive()) pumpReveal();
             else settleRevealWithoutAnimation(canRenderLive());
           } else if (revealRafRef.current === null) {
