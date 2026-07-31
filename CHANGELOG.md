@@ -35,6 +35,13 @@ _Changes landed on `main` that haven't shipped in a release yet._
 - Claude chats no longer pay for an extra Haiku call on their first message,
   spent on a session title Isolade never used.
 
+### Fixed
+
+- A chat no longer runs out of disk part-way through a large checkout or build.
+  Its writable disk was 4 GiB and is now 64 GiB, which the host still only
+  fills as the chat writes to it. Chats created before this keep the size they
+  were made with.
+
 ## [0.4.0] - 2026-07-31
 
 ### Added
