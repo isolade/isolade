@@ -12,6 +12,9 @@ describe("buildTitleCommand", () => {
     expect(cmd).not.toContain("whoami");
     expect(cmd).toContain("claude -p");
     expect(cmd).toContain("--no-session-persistence");
+    // A custom title keeps the CLI from minting an AI title of its own, which
+    // would mean a second Haiku call per title.
+    expect(cmd).toContain("--name '-'");
   });
 
   it("fences the message as untrusted data and round-trips its bytes", () => {

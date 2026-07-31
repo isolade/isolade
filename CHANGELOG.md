@@ -16,6 +16,11 @@ _Changes landed on `main` that haven't shipped in a release yet._
 - A turn's thinking now stays collapsed until you open it, so a long stretch of
   reasoning no longer pushes the answer down the pane.
 
+### Fixed
+
+- Claude chats no longer pay for an extra Haiku call on their first message,
+  spent on a session title Isolade never used.
+
 ## [0.4.0] - 2026-07-31
 
 ### Added

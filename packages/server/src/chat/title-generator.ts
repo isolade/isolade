@@ -83,6 +83,14 @@ export function buildTitleCommand(model: string, firstMessage: string): string {
   //                        the context.)
   //   --no-session-persistence  keep this throwaway call out of the chat's JSONL.
   //   --strict-mcp-config       load no MCP servers.
+  //   --name '-'           suppress the CLI's OWN title. On its first user
+  //                        message `claude -p` fires a background Haiku call to
+  //                        mint a session title, so without this a titling call
+  //                        gets itself titled and every title costs two Haiku
+  //                        calls. The CLI skips it when the session already
+  //                        carries a custom title, and --name sets one. Any
+  //                        non-empty string works (the CLI trims the value and
+  //                        ignores it when empty), so a bare `-` it is.
   // Both the system prompt and the user-turn prompt are base64-encoded and
   // decoded in-guest, so arbitrary content can't break out of the command, and
   // the message is piped over stdin so a long message can't overflow ARG_MAX.
@@ -91,7 +99,7 @@ export function buildTitleCommand(model: string, firstMessage: string): string {
     `printf %s '${promptB64}' | base64 -d | ` +
     `claude -p --output-format json --model ${model} ` +
     `--system-prompt "$SP" --tools '' --setting-sources '' ` +
-    `--no-session-persistence --strict-mcp-config`
+    `--no-session-persistence --strict-mcp-config --name '-'`
   );
 }
 
@@ -112,16 +120,17 @@ export function cleanTitle(raw: string): string | null {
 // round-trip with no per-call CLI startup (the dominant cost otherwise, a cold
 // one-shot is ~3-5s, a warm turn ~1.6s). Same lean flags as buildTitleCommand
 // (--tools '' is what keeps it a single-turn summarizer instead of the full
-// agent). The system prompt is fixed at launch. Each title's message is pushed
-// onto stdin as a user turn by ClaudeSession. `--output-format stream-json`
-// requires `--verbose`.
+// agent, and --name '-' keeps the CLI from titling the titling session). The
+// system prompt is fixed at launch. Each title's message is pushed onto stdin
+// as a user turn by ClaudeSession. `--output-format stream-json` requires
+// `--verbose`.
 export function buildTitleSessionCommand(model: string): string {
   const sysB64 = Buffer.from(TITLE_SYSTEM, "utf8").toString("base64");
   return (
     `SP="$(printf %s '${sysB64}' | base64 -d)"; ` +
     `claude -p --input-format stream-json --output-format stream-json --verbose ` +
     `--model ${model} --system-prompt "$SP" --tools '' --setting-sources '' ` +
-    `--strict-mcp-config --no-session-persistence`
+    `--strict-mcp-config --no-session-persistence --name '-'`
   );
 }
 

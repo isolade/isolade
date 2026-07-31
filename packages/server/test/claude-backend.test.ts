@@ -615,6 +615,9 @@ describe("ClaudeBackend stream-json parsing", () => {
     expect(proc.command).toContain("--input-format stream-json");
     expect(proc.command).toContain("--resume s");
     expect(proc.command).not.toContain("/context");
+    // A custom title stops the CLI from spending a Haiku call on a session
+    // title isolade never reads.
+    expect(proc.command).toContain("--name -");
     backend.disposeChat("chat");
     proc.exit(0);
     await tick();
@@ -718,6 +721,7 @@ describe("ClaudeBackend stream-json parsing", () => {
     // The persistent path runs stream-json with the lean flags, not a one-shot.
     expect(commands[0]).toContain("--input-format stream-json");
     expect(commands[0]).toContain("--tools ''");
+    expect(commands[0]).toContain("--name '-'");
     backend.disposeForVm("vm"); // close the warm process so the fake stream ends
   });
 
