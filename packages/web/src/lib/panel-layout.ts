@@ -248,6 +248,32 @@ export function moveTabToIndex(
   });
 }
 
+// Rewrite the backing resource ids of chat/terminal tabs in place. A submitted
+// draft builds its workspace against client-side stand-in ids, before the
+// server rows exist; when the real ones land, remapping lets each tab keep its
+// position (and its body its slot) instead of being dropped by `reconcile` and
+// re-added at the end. Returns the same tree when nothing matched, so callers
+// can apply it unconditionally without invalidating a memoized subtree.
+export function remapResourceIds(layout: Layout, remap: Record<string, string>): Layout {
+  const walk = (node: LayoutNode): LayoutNode => {
+    if (node.type === "panel") {
+      let touched = false;
+      const tabs = node.tabs.map((tab) => {
+        const next = tab.resourceId == null ? undefined : remap[tab.resourceId];
+        if (next === undefined || next === tab.resourceId) return tab;
+        touched = true;
+        return { ...tab, resourceId: next };
+      });
+      return touched ? { ...node, tabs } : node;
+    }
+    const first = walk(node.children[0]);
+    const second = walk(node.children[1]);
+    if (first === node.children[0] && second === node.children[1]) return node;
+    return { ...node, children: [first, second] };
+  };
+  return walk(layout);
+}
+
 // Drop tabs from panels for which `keep` returns false, fixing each panel's
 // active tab, without collapsing emptied panels (the caller prunes).
 function filterTabs(node: LayoutNode, keep: (tab: PanelTab) => boolean): LayoutNode {

@@ -71,6 +71,7 @@ import {
   moveTab,
   moveTabToIndex,
   reconcile,
+  remapResourceIds,
   setActiveTab,
   setSplitSizes,
   topEdgePanelIds,
@@ -101,6 +102,8 @@ const UTILITY_KINDS: { kind: Exclude<TabKind, "chat">; label: string }[] = [
   { kind: "browser", label: "Browser" },
   { kind: "ports", label: "Ports" },
 ];
+
+const EMPTY_REMAP: Record<string, string> = {};
 
 type Rect = { left: number; top: number; width: number; height: number };
 // Where a tab's keep-alive body belongs: the panel whose slot it covers, and
@@ -135,6 +138,7 @@ interface WorkspaceCtx {
   chromeInset: number;
   sidebarCollapsed: boolean;
   isTauri: boolean;
+  pending: boolean;
   onSelect: (panelId: string, tabId: string) => void;
   onClose: (tab: PanelTab) => void;
   onAdd: (panelId: string, kind: TabKind) => void;
@@ -200,6 +204,18 @@ interface PanelWorkspaceProps {
   chatModels: ChatModelDefinition[];
   modelOverrides: ModelOverrides;
   pendingFirstMessage: { chatId: string; content: string; uploadIds?: string[] } | null;
+  // A submitted draft is rendered through here before its instance and chat
+  // exist on the server, so the user lands in the real workspace rather than a
+  // chrome-less stand-in view. While `pending`, there is nothing to load a
+  // layout from and nothing to save one to, and the tab kinds that need a live
+  // VM to create (chat, terminal) are unavailable. `creationError` reports a
+  // failed spawn through the chat body, exactly as it did before.
+  pending?: boolean;
+  creationError?: string | null;
+  // Server ids that replaced this workspace's client-side stand-ins, applied to
+  // the live tree so the tabs the draft opened survive the hand-off. Must be
+  // referentially stable between hand-offs.
+  resourceIdRemap?: Record<string, string>;
   visible: boolean;
   sidebarCollapsed: boolean;
   // Rendered width of the window-chrome cluster, used to inset the top-left
@@ -225,6 +241,9 @@ export default function PanelWorkspace({
   chatModels,
   modelOverrides,
   pendingFirstMessage,
+  pending = false,
+  creationError = null,
+  resourceIdRemap = EMPTY_REMAP,
   visible,
   sidebarCollapsed,
   chromeInset,
@@ -236,8 +255,16 @@ export default function PanelWorkspace({
   onTerminalDeleted,
 }: PanelWorkspaceProps) {
   if (RENDER_METRICS_ENABLED) recordRenderMetric("retainedWorkspaceRenders");
-  const [layout, setLayout] = useState<Layout | null>(null);
-  const [hydrated, setHydrated] = useState(false);
+  // A pending instance has no saved layout to wait for, so its tree is built
+  // synchronously: the whole point of rendering a draft through here is that
+  // the tab strip is there from the first frame.
+  const [layout, setLayout] = useState<Layout | null>(() =>
+    pending ? defaultLayout(chats.map((chat) => chat.id)) : null,
+  );
+  // Only gates persistence, so a pending workspace starts hydrated: the persist
+  // effect below holds it back until the instance exists, and once it does the
+  // tree the user built is saved as-is rather than reloaded over.
+  const [hydrated, setHydrated] = useState(pending);
   const [drag, setDrag] = useState<DragState | null>(null);
   const [focusedPanelId, setFocusedPanelId] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -258,24 +285,34 @@ export default function PanelWorkspace({
   const terminalIds = useMemo(() => terminals.map((t) => t.id), [terminals]);
   const chatKey = chatIds.join(",");
   const terminalKey = terminalIds.join(",");
-  // Live snapshots read by the load effect without making it depend on them.
+  // Live snapshots read by the (mount-only) load effect without making it
+  // depend on them.
   const idsRef = useRef({ chatIds, terminalIds });
   idsRef.current = { chatIds, terminalIds };
+  const instanceIdRef = useRef(instanceId);
+  instanceIdRef.current = instanceId;
+  const pendingRef = useRef(pending);
+  pendingRef.current = pending;
 
   // Persistence bookkeeping: the JSON we last committed to the server, so the
   // debounced save skips unchanged layouts and the initial load doesn't echo
   // straight back.
   const lastPersistedRef = useRef<string>("");
 
-  // Load (or build) the layout when the instance changes.
+  // Load (or build) the layout, once. A workspace belongs to one instance for
+  // its whole life — HomeTab keys one pane per instance — so the only time
+  // `instanceId` changes underneath it is when a submitted draft's client-side
+  // stand-in is replaced by the server's row. That is an adoption, not a
+  // navigation: the freshly created instance has nothing saved anyway, and
+  // reloading would blank the panels the user is already working in.
   useEffect(() => {
+    // Nothing to load for a stand-in instance; the layout was built up front.
+    if (pendingRef.current) return;
     let cancelled = false;
-    setHydrated(false);
-    setLayout(null);
     void (async () => {
       let loaded: Layout | null = null;
       try {
-        loaded = await getInstanceLayout(instanceId);
+        loaded = await getInstanceLayout(instanceIdRef.current);
       } catch {
         // No saved layout (or the request failed) → fall back to a default.
       }
@@ -293,7 +330,20 @@ export default function PanelWorkspace({
     return () => {
       cancelled = true;
     };
-  }, [instanceId]);
+    // Deliberately mount-only; see above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Adopt the server's ids for this workspace's stand-ins during the render
+  // they arrive in, rather than in an effect. An effect would leave one
+  // committed frame in which a tab still points at a chat that has already left
+  // `chats`, and that tab's body would blank — the very flicker rendering a
+  // draft through here is meant to remove.
+  const appliedRemapRef = useRef(resourceIdRemap);
+  if (appliedRemapRef.current !== resourceIdRemap) {
+    appliedRemapRef.current = resourceIdRemap;
+    setLayout((prev) => (prev ? remapResourceIds(prev, resourceIdRemap) : prev));
+  }
 
   // Keep the tree in sync with the live resource set: drop dead chat/terminal
   // tabs, surface chats that appeared elsewhere. Runs only when the id-set
@@ -306,9 +356,11 @@ export default function PanelWorkspace({
   }, [chatKey, terminalKey]);
 
   // Persist layout changes (debounced). Skipped until hydrated so the load
-  // itself never triggers a save-back, and skipped when unchanged.
+  // itself never triggers a save-back, skipped while the instance exists only
+  // on the client (there is nothing to save to yet — the first save lands right
+  // after the server row does), and skipped when unchanged.
   useEffect(() => {
-    if (!hydrated || !layout) return;
+    if (pending || !hydrated || !layout) return;
     const json = JSON.stringify(layout);
     if (json === lastPersistedRef.current) return;
     const t = setTimeout(() => {
@@ -316,7 +368,7 @@ export default function PanelWorkspace({
       void updateInstanceLayout(instanceId, layout).catch(() => {});
     }, 400);
     return () => clearTimeout(t);
-  }, [layout, hydrated, instanceId]);
+  }, [layout, hydrated, pending, instanceId]);
 
   const applyLayout = useCallback((fn: (l: Layout) => Layout) => {
     setLayout((prev) => (prev ? fn(prev) : prev));
@@ -348,6 +400,9 @@ export default function PanelWorkspace({
 
   const onAdd = useCallback(
     (panelId: string, kind: TabKind) => {
+      // Creating a chat or a terminal needs the VM the draft is still waiting
+      // on. The menu disables both until then, so this is only a backstop.
+      if (pending && (kind === "chat" || kind === "terminal")) return;
       if (kind === "chat") {
         const model = readLastModelId() ?? DEFAULT_CHAT_MODEL_ID;
         const modelDefinition =
@@ -375,7 +430,7 @@ export default function PanelWorkspace({
         applyLayout((l) => addTab(l, panelId, makeTab(kind)));
       }
     },
-    [applyLayout, chatModels, instanceId, onChatCreated, onTerminalCreated],
+    [applyLayout, chatModels, instanceId, pending, onChatCreated, onTerminalCreated],
   );
 
   const onResizeSplit = useCallback(
@@ -429,8 +484,8 @@ export default function PanelWorkspace({
               visible={visible && active}
               initialMessage={initialMessage}
               initialUploadIds={initialUploadIds}
-              pending={false}
-              creationError={null}
+              pending={pending}
+              creationError={creationError}
               onTitle={handleTitle}
             />
           );
@@ -472,6 +527,8 @@ export default function PanelWorkspace({
       chatModels,
       modelOverrides,
       pendingFirstMessage,
+      pending,
+      creationError,
       visible,
       handleTitle,
     ],
@@ -734,6 +791,7 @@ export default function PanelWorkspace({
       chromeInset,
       sidebarCollapsed,
       isTauri,
+      pending,
       onSelect,
       onClose,
       onAdd,
@@ -752,6 +810,7 @@ export default function PanelWorkspace({
       chromeInset,
       sidebarCollapsed,
       isTauri,
+      pending,
       onSelect,
       onClose,
       onAdd,
@@ -1236,7 +1295,7 @@ function TabButton({
 }
 
 function AddTabMenu({ panelId, align }: { panelId: string; align: "start" | "end" }) {
-  const { onAdd } = useWorkspace();
+  const { onAdd, pending } = useWorkspace();
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -1251,7 +1310,14 @@ function AddTabMenu({ panelId, align }: { panelId: string; align: "start" | "end
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align={align}>
-        <DropdownMenuItem data-demo="panel-add-chat" onClick={() => onAdd(panelId, "chat")}>
+        {/* A chat and a terminal are created on the VM, so they wait for a
+            just-submitted draft's instance to come up. Everything else is a
+            view onto the instance and can be opened straight away. */}
+        <DropdownMenuItem
+          data-demo="panel-add-chat"
+          disabled={pending}
+          onClick={() => onAdd(panelId, "chat")}
+        >
           <Bot className="size-3.5" />
           Chat
         </DropdownMenuItem>
@@ -1261,6 +1327,7 @@ function AddTabMenu({ panelId, align }: { panelId: string; align: "start" | "end
             <DropdownMenuItem
               key={kind}
               data-demo={`panel-add-${kind}`}
+              disabled={pending && kind === "terminal"}
               onClick={() => onAdd(panelId, kind)}
             >
               <Icon className="size-3.5" />

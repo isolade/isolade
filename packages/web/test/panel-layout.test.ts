@@ -12,6 +12,7 @@ import {
   moveTab,
   moveTabToIndex,
   reconcile,
+  remapResourceIds,
   setActiveTab,
   setSplitSizes,
   topEdgePanelIds,
@@ -224,5 +225,44 @@ describe("reconcile", () => {
       .filter((t) => t.kind === "terminal")
       .map((t) => t.resourceId);
     expect(termIds).toEqual(["t2"]);
+  });
+});
+
+describe("remapResourceIds", () => {
+  it("rewrites a chat tab's resource id without moving the tab", () => {
+    const start = asPanel(defaultLayout(["stand-in", "c2"]));
+    const next = asPanel(remapResourceIds(start, { "stand-in": "real" }));
+    expect(chatIdsOf(next)).toEqual(["real", "c2"]);
+    // Same tab, so the body it owns keeps its slot through the hand-off.
+    expect(next.tabs[0]?.id).toBe(start.tabs[0]?.id);
+    expect(next.activeTabId).toBe(start.activeTabId);
+  });
+
+  it("reaches tabs on both sides of a split", () => {
+    const start = asPanel(defaultLayout(["c1", "c2"]));
+    const split = asSplit(moveTab(start, start.tabs[1]!.id, start.id, "right"));
+    const next = remapResourceIds(split, { c1: "c1-real", c2: "c2-real" });
+    expect(chatIdsOf(next)).toEqual(["c1-real", "c2-real"]);
+  });
+
+  it("returns the same tree when nothing matches, so memoized subtrees survive", () => {
+    const start = defaultLayout(["c1"]);
+    expect(remapResourceIds(start, { other: "x" })).toBe(start);
+    expect(remapResourceIds(start, {})).toBe(start);
+  });
+
+  it("leaves utility tabs alone", () => {
+    const start = asPanel(defaultLayout([]));
+    const withPorts = asPanel(addTab(start, start.id, makeTab("ports")));
+    expect(remapResourceIds(withPorts, { c1: "c1-real" })).toBe(withPorts);
+  });
+
+  // A chat tab and a terminal tab can carry the same id space only by accident;
+  // the remap is keyed by resource id, so a terminal id maps too.
+  it("rewrites terminal tabs as well", () => {
+    const start = asPanel(defaultLayout([]));
+    const withTerm = asPanel(addTab(start, start.id, makeTab("terminal", "t1")));
+    const next = remapResourceIds(withTerm, { t1: "t1-real" });
+    expect(collectTabs(next)[0]?.resourceId).toBe("t1-real");
   });
 });

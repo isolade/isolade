@@ -35,7 +35,6 @@ import type {
   Terminal,
 } from "../../lib/contracts";
 import { DEFAULT_CHAT_MODEL_ID } from "../../lib/contracts";
-import ChatView from "../Chat";
 import SettingsPane, {
   DEFAULT_SETTINGS_SECTION,
   isSettingsSection,
@@ -47,26 +46,36 @@ import NewInstancePane from "./NewInstancePane";
 import RetainedInstancePane from "./RetainedInstancePane";
 import WindowChrome from "./WindowChrome";
 
-type View =
-  | { kind: "drafting" }
-  | {
-      kind: "creating";
-      // Stable client-side stand-ins for the instance + chat that haven't
-      // landed on the server yet. They drive the same InstanceView/Chat
-      // render path as a real instance. Once the real ones arrive we
-      // transition to `instance` and the chat tab re-mounts seamlessly
-      // (Chat's useState initializer rebuilds the same optimistic state).
-      synth: Instance;
-      synthChat: Chat;
-      firstMessage: string;
-      firstUploadIds: string[];
-      error: string | null;
-    }
-  | {
-      kind: "instance";
-      id: string;
-      pendingFirstMessage?: { chatId: string; content: string; uploadIds?: string[] };
-    };
+type View = { kind: "drafting" } | { kind: "instance"; id: string };
+
+/**
+ * A chat started from the empty-state composer, from the moment the user
+ * presses send until they navigate away from it.
+ *
+ * Sending has to feel instant, but the instance behind it is a VM that takes
+ * seconds to come up, so the workspace is rendered against client-side stand-in
+ * rows first. It is the *real* workspace from the first frame — the same
+ * retained pane, panel tree and tab strip an established chat gets — so there
+ * is no chrome-less intermediate view to blink out of.
+ *
+ * When the server rows land they are adopted in place rather than swapped in:
+ * the pane keeps its React key (see `paneKeysRef`) and the workspace remaps its
+ * stand-in chat id onto the real one, so every tab, split, draft and scroll
+ * position the user has already touched survives the hand-off untouched.
+ */
+interface Draft {
+  standInInstanceId: string;
+  standInChatId: string;
+  // Rendered until the server's own rows arrive through the usual state.
+  instance: Instance;
+  chats: Chat[];
+  // Null until the create round-trip lands.
+  instanceId: string | null;
+  chatId: string | null;
+  firstMessage: string;
+  uploadIds: string[];
+  error: string | null;
+}
 
 function apiValueEqual(left: unknown, right: unknown): boolean {
   if (Object.is(left, right)) return true;
@@ -125,6 +134,14 @@ function reconcileChatGroups(
 
 const EMPTY_CHATS: Chat[] = [];
 const EMPTY_TERMINALS: Terminal[] = [];
+const EMPTY_REMAP: Record<string, string> = {};
+
+// The stand-in row a draft renders `id` from, while it has no server row yet.
+function draftInstance(draft: Draft | null, id: string): Instance | null {
+  return draft && draft.instanceId === null && draft.standInInstanceId === id
+    ? draft.instance
+    : null;
+}
 
 // Pathname-based routing: /c/<id> deep-links to a specific instance. Relies
 // on Vite's built-in SPA fallback in dev and Tauri's webview serving index.html
@@ -195,6 +212,22 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
   const [view, setView] = useState<View>(
     () => pathToView(window.location.pathname) ?? { kind: "drafting" },
   );
+  const [draft, setDraft] = useState<Draft | null>(null);
+  // Instance id → the React key of the pane that renders it. A draft's pane is
+  // created before the server row exists, so it is keyed by its stand-in id and
+  // keeps that key once the real instance adopts it; anything else is keyed by
+  // its own id. Session-lifetime, because a key that changes under a pane would
+  // rebuild the very workspace the adoption exists to preserve.
+  const paneKeysRef = useRef<Map<string, string>>(new Map());
+  // Stable, append-only pane order. Panes are absolutely positioned so their
+  // order is invisible, but reordering them would move their subtrees in the
+  // DOM, which reloads any browser-preview <iframe> inside. The recency-sorted
+  // instance list reorders constantly, and an adopted draft's pane would jump
+  // from the end of the list to the front, so the order is pinned to when each
+  // pane first appeared instead. (Same trick as the body layer in
+  // PanelWorkspace, for the same reason.)
+  const paneOrderRef = useRef<Map<string, number>>(new Map());
+  const paneOrderSeqRef = useRef(0);
   // Settings overlay, orthogonal to `view`. Non-null while open. Kept separate
   // so opening settings never tears down the background workspace.
   const [settingsSection, setSettingsSection] = useState<SettingsSection | null>(() =>
@@ -363,9 +396,12 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
   // cached on the environments row after each rebuild. Effective scope: the
   // active instance's profile when one is open, else the active profile (where
   // new chats start).
+  // A just-submitted draft has no server row yet, and its stand-in carries the
+  // active profile, so it resolves to the same scope either way.
   const effectiveProfileId =
     view.kind === "instance"
-      ? (instances.find((c) => c.id === view.id)?.profileId ?? null)
+      ? ((instances.find((c) => c.id === view.id) ?? draftInstance(draft, view.id))?.profileId ??
+        null)
       : activeProfileId;
   // The model catalog is static (Claude + Codex), so fetch it once. Per-profile
   // visibility/tier overrides are layered on below.
@@ -405,14 +441,20 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     };
   }, [effectiveProfileId, settingsSection]);
 
+  // A draft whose server rows haven't landed. Its pane renders from stand-ins,
+  // so anything that talks to the server about it has to wait.
+  const draftPending = draft !== null && draft.instanceId === null;
+  const viewingPendingDraft =
+    draftPending && view.kind === "instance" && view.id === draft.standInInstanceId;
+
   // Whenever the active instance changes, refresh its terminal list.
   useEffect(() => {
-    if (view.kind !== "instance") return;
+    if (view.kind !== "instance" || viewingPendingDraft) return;
     void refreshTerminalsFor(view.id);
-  }, [view, refreshTerminalsFor]);
+  }, [view, viewingPendingDraft, refreshTerminalsFor]);
 
   // Monotonic id for the in-flight draft submission. Bumped whenever the user
-  // navigates away from a `creating` view so the still-resolving createInstance
+  // navigates away from a submitted draft so the still-resolving createInstance
   // + createChat chain can detect it's been orphaned and clean up.
   const submissionIdRef = useRef(0);
 
@@ -427,9 +469,10 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
       applyingPopRef.current = false;
       return;
     }
-    // During draft creation we keep the pre-submit URL until the real instance
-    // id lands, but the settings overlay is orthogonal and must still sync.
-    if (settingsSection === null && view.kind === "creating") return;
+    // A submitted draft keeps the pre-submit URL until the real instance id
+    // lands (a stand-in id is not a route), but the settings overlay is
+    // orthogonal and must still sync.
+    if (settingsSection === null && viewingPendingDraft) return;
     const target = settingsSection ? `/settings/${settingsSection}` : viewToPath(view);
     if (window.location.pathname === target) return;
     // Switching sections within settings replaces the entry rather than
@@ -438,7 +481,7 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
       settingsSection !== null && window.location.pathname.startsWith("/settings");
     if (stayingInSettings) window.history.replaceState(null, "", target);
     else window.history.pushState(null, "", target);
-  }, [view, settingsSection]);
+  }, [view, viewingPendingDraft, settingsSection]);
 
   // URL → view/settings (browser back/forward). A /settings/* path only toggles
   // the overlay. pathToView returns null for it, so the background view (and its
@@ -449,9 +492,10 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
       const nextView = pathToView(path);
       applyingPopRef.current = true;
       // Only orphan an in-flight draft when the background view actually
-      // changes. A pure settings toggle leaves a creating draft running.
+      // changes. A pure settings toggle leaves a submitted draft running.
       if (nextView) {
         submissionIdRef.current++;
+        setDraft(null);
         setView(nextView);
       }
       setSettingsSection(parseSettingsSection(path));
@@ -462,13 +506,18 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
 
   // Everything the sidebar is handed is a stable identity, so a poll that
   // touches one instance re-renders that one row rather than the whole list.
+  // Navigating releases the current draft: one still being created is orphaned
+  // by the submissionId bump, and one already adopted has nothing left to hand
+  // over — its pane is an ordinary instance pane from here on.
   const handleNew = useCallback(() => {
     submissionIdRef.current++;
+    setDraft(null);
     setView({ kind: "drafting" });
   }, []);
 
   const handleSelect = useCallback((id: string) => {
     submissionIdRef.current++;
+    setDraft(null);
     setView({ kind: "instance", id });
   }, []);
 
@@ -493,7 +542,7 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
   }) => {
     const sid = ++submissionIdRef.current;
     const now = new Date();
-    const synth: Instance = {
+    const standIn: Instance = {
       id: `local-${crypto.randomUUID()}`,
       vmId: "",
       title: null,
@@ -511,9 +560,9 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
       updatedAt: now,
     };
     const modelDef = chatModels.find((m) => m.id === modelId);
-    const synthChat: Chat = {
+    const standInChat: Chat = {
       id: `local-${crypto.randomUUID()}`,
-      instanceId: synth.id,
+      instanceId: standIn.id,
       model: modelId,
       provider: modelDef?.provider ?? "anthropic",
       effort,
@@ -535,14 +584,25 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
       compacted: null,
       createdAt: now,
     };
-    setView({
-      kind: "creating",
-      synth,
-      synthChat,
+    // The pane that renders this draft is keyed by the stand-in's id (see the
+    // pane list), and keeps that key when the real instance adopts it below.
+    setDraft({
+      standInInstanceId: standIn.id,
+      standInChatId: standInChat.id,
+      instance: standIn,
+      chats: [standInChat],
+      instanceId: null,
+      chatId: null,
       firstMessage,
-      firstUploadIds: uploadIds,
+      uploadIds,
       error: null,
     });
+    setView({ kind: "instance", id: standIn.id });
+
+    const fail = (err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      setDraft((d) => (d && d.standInInstanceId === standIn.id ? { ...d, error: msg } : d));
+    };
 
     (async () => {
       let instance: Instance;
@@ -550,10 +610,7 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
         instance = await instancePromise;
       } catch (err) {
         if (sid !== submissionIdRef.current) return;
-        const msg = err instanceof Error ? err.message : String(err);
-        setView((v) =>
-          v.kind === "creating" && v.synth.id === synth.id ? { ...v, error: msg } : v,
-        );
+        fail(err);
         return;
       }
       if (sid !== submissionIdRef.current) {
@@ -566,23 +623,28 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
       } catch (err) {
         void removeInstance(instance.id).catch(() => {});
         if (sid !== submissionIdRef.current) return;
-        const msg = err instanceof Error ? err.message : String(err);
-        setView((v) =>
-          v.kind === "creating" && v.synth.id === synth.id ? { ...v, error: msg } : v,
-        );
+        fail(err);
         return;
       }
       if (sid !== submissionIdRef.current) {
         void removeInstance(instance.id).catch(() => {});
         return;
       }
+      // The eager spawn may already have surfaced this instance through the
+      // poll, in which case it has a pane of its own. Pointing its key at the
+      // draft's pane hands the workspace the user is already in over to it and
+      // discards the untouched one.
+      paneKeysRef.current.set(instance.id, standIn.id);
+      // Adoption, in one commit: the real rows, the id remap the workspace
+      // applies to its tabs, and the view that follows the instance's route.
       setInstances((prev) => [instance, ...prev.filter((c) => c.id !== instance.id)]);
       setAllChats((prev) => [...prev.filter((c) => c.id !== chat.id), chat]);
-      setView({
-        kind: "instance",
-        id: instance.id,
-        pendingFirstMessage: { chatId: chat.id, content: firstMessage, uploadIds },
-      });
+      setDraft((d) =>
+        d && d.standInInstanceId === standIn.id
+          ? { ...d, instanceId: instance.id, chatId: chat.id }
+          : d,
+      );
+      setView({ kind: "instance", id: instance.id });
       void refreshInstances();
     })();
   };
@@ -806,8 +868,6 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
   };
 
   const activeInstanceId = view.kind === "instance" ? view.id : null;
-  const activeInstance =
-    activeInstanceId != null ? (instances.find((c) => c.id === activeInstanceId) ?? null) : null;
   // Written during render on purpose: it only carries the previous grouping so
   // unchanged groups can keep their identity. A discarded render leaves behind
   // groups holding the same chat rows, so the next one still reconciles
@@ -831,6 +891,73 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
       ),
     [activeInstanceId, activeProfileId, instances],
   );
+  // What actually gets rendered: one pane per retained instance, plus the pane
+  // of a submitted draft the server hasn't caught up with yet. Once it has, the
+  // draft's instance is retained like any other and simply keeps the pane it
+  // already had (`paneKeysRef`), so the hand-off costs nothing on screen.
+  const panes = useMemo(() => {
+    const paneKeys = paneKeysRef.current;
+    const rows = retainedInstances.map((instance) => ({
+      key: paneKeys.get(instance.id) ?? instance.id,
+      instance,
+      pending: false,
+      chats: chatsByInstance.get(instance.id) ?? EMPTY_CHATS,
+      terminals: terminalsByInstance[instance.id] ?? EMPTY_TERMINALS,
+    }));
+    if (draft && draft.instanceId === null) {
+      rows.push({
+        key: draft.standInInstanceId,
+        instance: draft.instance,
+        pending: true,
+        chats: draft.chats,
+        terminals: EMPTY_TERMINALS,
+      });
+    }
+    for (const row of rows) {
+      if (!paneOrderRef.current.has(row.key)) {
+        paneOrderRef.current.set(row.key, paneOrderSeqRef.current++);
+      }
+    }
+    rows.sort(
+      (a, b) => (paneOrderRef.current.get(a.key) ?? 0) - (paneOrderRef.current.get(b.key) ?? 0),
+    );
+    return rows;
+  }, [retainedInstances, chatsByInstance, terminalsByInstance, draft]);
+
+  // Retire the bookkeeping of panes that are gone, so neither map grows for the
+  // lifetime of the window. After commit rather than during render, so a
+  // discarded render can't drop a live pane's order slot and re-append it.
+  useEffect(() => {
+    const live = new Set(panes.map((pane) => pane.key));
+    for (const key of paneOrderRef.current.keys()) {
+      if (!live.has(key)) paneOrderRef.current.delete(key);
+    }
+    for (const [instanceId, key] of paneKeysRef.current) {
+      if (!live.has(key)) paneKeysRef.current.delete(instanceId);
+    }
+  }, [panes]);
+
+  const activePane = panes.find((pane) => pane.instance.id === activeInstanceId) ?? null;
+  // The first message is handed to the chat tab that has to send it, under
+  // whichever id that chat currently has.
+  const draftFirstMessage = useMemo(
+    () =>
+      draft
+        ? {
+            chatId: draft.chatId ?? draft.standInChatId,
+            content: draft.firstMessage,
+            uploadIds: draft.uploadIds,
+          }
+        : null,
+    [draft],
+  );
+  // Handed to the adopted workspace so its stand-in chat tab picks up the real
+  // chat in place, instead of being dropped and re-added at the end of the strip.
+  const draftRemap = useMemo(
+    () => (draft?.chatId ? { [draft.standInChatId]: draft.chatId } : EMPTY_REMAP),
+    [draft],
+  );
+
   // Sidebar only shows instances whose title has landed (either the
   // auto-generated one or the server-side truncation fallback). Untitled
   // rows include pre-submit drafts and the brief window between submit and
@@ -923,20 +1050,20 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
                 </div>
               )}
 
-              {retainedInstances.map((instance) => {
-                const isActive = instance.id === activeInstanceId;
+              {panes.map((pane) => {
+                const isActive = pane.instance.id === activeInstanceId;
+                const isDraft = pane.key === draft?.standInInstanceId;
                 return (
                   <RetainedInstancePane
-                    key={instance.id}
-                    instance={instance}
-                    chats={chatsByInstance.get(instance.id) ?? EMPTY_CHATS}
-                    terminals={terminalsByInstance[instance.id] ?? EMPTY_TERMINALS}
+                    key={pane.key}
+                    instance={pane.instance}
+                    chats={pane.chats}
+                    terminals={pane.terminals}
                     active={isActive}
-                    pendingFirstMessage={
-                      isActive && view.kind === "instance"
-                        ? (view.pendingFirstMessage ?? null)
-                        : null
-                    }
+                    pendingFirstMessage={isActive && isDraft ? draftFirstMessage : null}
+                    pending={pane.pending}
+                    creationError={isDraft ? (draft?.error ?? null) : null}
+                    resourceIdRemap={isDraft ? draftRemap : EMPTY_REMAP}
                     chatModels={chatModels}
                     modelOverrides={modelOverrides}
                     sidebarCollapsed={sidebarCollapsed}
@@ -952,26 +1079,7 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
                 );
               })}
 
-              {view.kind === "creating" && (
-                <div className="absolute inset-0 flex min-h-0">
-                  <ChatView
-                    instanceId={view.synth.id}
-                    chatId={view.synthChat.id}
-                    model={view.synthChat.model}
-                    effort={view.synthChat.effort}
-                    chat={view.synthChat}
-                    chatModels={chatModels}
-                    modelOverrides={modelOverrides}
-                    visible
-                    initialMessage={view.firstMessage}
-                    initialUploadIds={view.firstUploadIds}
-                    pending
-                    creationError={view.error}
-                  />
-                </div>
-              )}
-
-              {view.kind === "instance" && !activeInstance && (
+              {view.kind === "instance" && !activePane && (
                 <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
                   Chat not found
                 </div>
