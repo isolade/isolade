@@ -51,7 +51,35 @@ echo "==> Packaging ${OUT}..."
 mkdir -p dist
 cp "$DEB" "$OUT"
 
+# Repack the same payload as a plain tarball, for the distributions apt does not
+# serve. rpm and AppImage would each solve part of this, and neither covers
+# everything: an rpm needs its own dependency names per distribution, and an
+# AppImage is built against the runner's glibc. The payload is relocatable as it
+# stands, because Tauri resolves bundled resources relative to the executable, so
+# `bin/Isolade` plus `lib/Isolade/` runs from any prefix.
+#
+# The two libraries the .deb declares (WebKitGTK and GTK) stay the user's to
+# install, which install.sh checks for and names per package manager.
+TAR_OUT="dist/isolade-v${VERSION}-linux-${DIST_ARCH}.tar.gz"
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
+
+echo "==> Packaging ${TAR_OUT}..."
+dpkg-deb -x "$DEB" "$STAGE/payload"
+# One top-level directory, so extracting into /opt yields /opt/isolade.
+mkdir -p "$STAGE/isolade"
+mv "$STAGE/payload/usr/bin" "$STAGE/isolade/bin"
+mv "$STAGE/payload/usr/lib" "$STAGE/isolade/lib"
+# The desktop entry ships alongside rather than pre-installed, since where it
+# belongs depends on whether the install is for one user or the machine.
+mv "$STAGE/payload/usr/share/applications/Isolade.desktop" "$STAGE/isolade/"
+if [ -d "$STAGE/payload/usr/share/icons" ]; then
+  mv "$STAGE/payload/usr/share/icons" "$STAGE/isolade/icons"
+fi
+tar -C "$STAGE" -czf "$TAR_OUT" isolade
+
 echo ""
 echo "Done."
 echo "  deb:     ${OUT}"
 echo "  install: sudo apt install ./${OUT##*/}"
+echo "  tarball: ${TAR_OUT}"
