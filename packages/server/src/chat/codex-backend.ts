@@ -298,10 +298,24 @@ export class CodexBackend implements ChatBackend {
         cleanup();
         reject(new DOMException("aborted", "AbortError"));
       };
+      // Codex says what it has to say as agentMessage items, one per utterance:
+      // a preamble before it runs something, then the reply once the work is
+      // done. Marking where each begins is what lets the transcript tell those
+      // apart. Sightings are deduped by item id because item/started and the
+      // item's own deltas race across app-server versions, and either may be
+      // the first to name it.
+      const repliesStarted = new Set<string>();
+      const startReply = (itemId: string) => {
+        if (repliesStarted.has(itemId)) return;
+        repliesStarted.add(itemId);
+        opts.onEvent?.({ type: "reply_start" });
+      };
       const offDelta = conn.on("item/agentMessage/delta", (params) => {
         if (!belongsToTurn(params)) return;
-        const delta = (params as { delta?: string } | null)?.delta ?? "";
+        const p = params as { itemId?: unknown; delta?: string } | null;
+        const delta = p?.delta ?? "";
         if (delta) {
+          if (typeof p?.itemId === "string") startReply(p.itemId);
           fullContent += delta;
           opts.onDelta(delta);
         }
@@ -447,13 +461,17 @@ export class CodexBackend implements ChatBackend {
       // these on the tool-call path avoids phantom "Calling AgentMessage"
       // cards in the UI.
       const isMessage = (item: CodexItem) => /^(agent|assistant|user)?_?message$/i.test(item.type);
+      const isAgentMessage = (item: CodexItem) => /^(agent|assistant)_?message$/i.test(item.type);
 
       const handleItemStart = (item: CodexItem) => {
         if (isReasoning(item)) {
           ensureReasoning(item.id);
           return;
         }
-        if (isMessage(item)) return;
+        if (isMessage(item)) {
+          if (isAgentMessage(item)) startReply(item.id);
+          return;
+        }
         if (seenTools.has(item.id)) return;
         seenTools.add(item.id);
         opts.onEvent?.({

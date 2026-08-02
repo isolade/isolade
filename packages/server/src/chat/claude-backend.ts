@@ -686,9 +686,11 @@ export class ClaudeBackend implements ChatBackend {
       return changed;
     };
     // Top-level message envelope events from the CLI (message_start/delta/
-    // stop, content_block_start/stop for text) and the echoed `assistant`
-    // record are protocol scaffolding. Text comes through deltas, tool
-    // results come through `user` blocks. Suppress them entirely.
+    // stop, content_block_stop for text) and the echoed `assistant` record are
+    // protocol scaffolding. Text comes through deltas, tool results come
+    // through `user` blocks. Suppress them entirely. The one envelope event
+    // that does carry meaning is a text block opening, which is handled above
+    // as the start of an utterance and never reaches here.
     const isEnvelopeNoise = (inner: { type?: unknown; content_block?: unknown }) => {
       if (
         inner.type === "message_start" ||
@@ -796,6 +798,13 @@ export class ClaudeBackend implements ChatBackend {
           typeof inner.index === "number"
         ) {
           thinkingBuffers.set(inner.index, { id: ensureThinking(), text: "" });
+          handled = true;
+        } else if (inner?.type === "content_block_start" && inner?.content_block?.type === "text") {
+          // A text block is the unit Claude itself calls the answer: the CLI's
+          // terminal `result` is the last one of the turn (see QueryEngine's
+          // `last(result.message.content)`). Marking each one keeps our
+          // transcript's idea of the reply the same as the CLI's.
+          opts.onEvent?.({ type: "reply_start" });
           handled = true;
         } else if (
           inner?.type === "content_block_delta" &&

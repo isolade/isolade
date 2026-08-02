@@ -253,6 +253,81 @@ describe("MessageHistory", () => {
     expect(html).not.toContain('aria-label="Edit message" disabled=""');
   });
 
+  it("offers a copy button under a settled message on either side", () => {
+    const user = message("asked");
+    const assistant = message("answered", "assistant");
+    const html = renderToStaticMarkup(
+      <MessageHistory
+        instanceId="instance-test"
+        pages={[
+          {
+            key: "page",
+            messages: [user, assistant],
+            chunksByMessage: {
+              [assistant.id]: [{ kind: "text", text: "The answer." }],
+            },
+          },
+        ]}
+        sessionRows={[]}
+        live={null}
+        scrollElementRef={createRef<HTMLDivElement>()}
+        showDebug={false}
+        userFontFamily="sans-serif"
+        agentFontFamily="sans-serif"
+        editingId={null}
+        actionsDisabled
+        visible
+        hasOlder={false}
+        onStartEdit={() => {}}
+        onCancelEdit={() => {}}
+        onSubmitEdit={() => {}}
+        onNavigateVersion={() => {}}
+        onRequestToolDetails={() => {}}
+        onLoadOlder={() => {}}
+        onLayoutChange={() => {}}
+      />,
+    );
+
+    expect(html.match(/aria-label="Copy message"/g)).toHaveLength(2);
+    // Copying reads the transcript, so it is not one of the actions a running
+    // turn takes away.
+    expect(html).not.toMatch(/data-chat-action[^>]*>\s*<button type="button" aria-label="Copy/);
+  });
+
+  it("waits for the turn to finish before offering its answer to the clipboard", () => {
+    const html = renderToStaticMarkup(
+      <MessageHistory
+        instanceId="instance-test"
+        pages={[]}
+        sessionRows={[]}
+        live={{
+          renderKey: "live",
+          message: message("live", "assistant"),
+          chunks: [{ kind: "text", text: "Half an ans" }],
+          streaming: true,
+        }}
+        scrollElementRef={createRef<HTMLDivElement>()}
+        showDebug={false}
+        userFontFamily="sans-serif"
+        agentFontFamily="sans-serif"
+        editingId={null}
+        actionsDisabled
+        visible
+        hasOlder={false}
+        onStartEdit={() => {}}
+        onCancelEdit={() => {}}
+        onSubmitEdit={() => {}}
+        onNavigateVersion={() => {}}
+        onRequestToolDetails={() => {}}
+        onLoadOlder={() => {}}
+        onLayoutChange={() => {}}
+      />,
+    );
+
+    expect(html).toContain("Half an ans");
+    expect(html).not.toContain('aria-label="Copy message"');
+  });
+
   it("shows thinking progress and Claude's final summary without debug mode", () => {
     const assistant = message("thought", "assistant");
     const html = renderToStaticMarkup(

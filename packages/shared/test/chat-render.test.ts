@@ -39,6 +39,31 @@ describe("applyChatRenderEvent", () => {
       },
     ]);
   });
+
+  it("records where one utterance ends and the next begins", () => {
+    const chunks: ChatRenderChunk[] = [];
+    const toolIndex = new Map<string, number>();
+    const apply = (type: string, payload?: unknown) =>
+      applyChatRenderEvent(chunks, toolIndex, type, payload ?? null);
+
+    // Nothing precedes the turn's first utterance, so it needs no marker.
+    apply("reply_start");
+    apply("delta", "I'll run the tests.");
+    apply("tool_call_start", { id: "t1", name: "Bash" });
+    apply("tool_call_result", { id: "t1", output: "ok" });
+    // Two in a row would mean an utterance that never said anything, which is
+    // not a division worth recording.
+    apply("reply_start");
+    apply("reply_start");
+    apply("delta", "They pass.");
+
+    expect(chunks).toEqual([
+      { kind: "text", text: "I'll run the tests." },
+      { kind: "tool", id: "t1", name: "Bash", status: "done", output: "ok", isError: undefined },
+      { kind: "reply_start" },
+      { kind: "text", text: "They pass." },
+    ]);
+  });
 });
 
 describe("summarizeChatToolInput", () => {

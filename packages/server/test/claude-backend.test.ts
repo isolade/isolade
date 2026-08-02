@@ -94,6 +94,40 @@ describe("ClaudeBackend stream-json parsing", () => {
     expect(result.content).toBe("Hello, world");
   });
 
+  // A text block is the unit the CLI itself calls the answer: its terminal
+  // `result` is the last one of the turn. Marking each opening is what lets the
+  // transcript pick the reply out of a turn that also talked its way there.
+  it("marks each text block as the start of an utterance", async () => {
+    const textBlockStart = {
+      type: "stream_event",
+      event: { type: "content_block_start", index: 0, content_block: { type: "text" } },
+    };
+    const { events, deltas, result } = await run([
+      { type: "system", subtype: "init", session_id: "s" },
+      textBlockStart,
+      textDelta("Let me check the tests."),
+      {
+        type: "stream_event",
+        event: {
+          type: "content_block_start",
+          index: 1,
+          content_block: { type: "tool_use", id: "tool-1", name: "Bash" },
+        },
+      },
+      textBlockStart,
+      textDelta("They pass."),
+      { type: "result", result: "They pass." },
+    ]);
+
+    // Usage rides along on the result frame and says nothing about structure.
+    const structure = events.map((event) => event.type).filter((type) => type !== "usage");
+    expect(structure).toEqual(["reply_start", "tool_call_start", "reply_start"]);
+    expect(deltas).toEqual(["Let me check the tests.", "They pass."]);
+    // The CLI's own verdict on where the reply starts, which is the line we
+    // are drawing: everything before the last text block is not it.
+    expect(result.content).toBe("They pass.");
+  });
+
   it("assembles a tool call: start, streamed JSON input, and result", async () => {
     const { events } = await run([
       { type: "system", subtype: "init", session_id: "s" },

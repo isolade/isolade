@@ -43,6 +43,30 @@ export type StreamChunk = ChatRenderChunk;
 // Per-id tool index passed in so callers can keep state across events.
 export const applyEvent = applyChatRenderEvent;
 
+/** The turn's reply, as Markdown, for the clipboard: the text of its last
+ * utterance, bounded by the `reply_start` markers the providers draw
+ * themselves. The remarks it made between the tool calls above are left out,
+ * along with the calls and the reasoning themselves. An utterance that has not
+ * said anything yet is not what the reader means by the reply, so the search
+ * carries on past it. Falls back to the stored message body, which is what a
+ * row we hold no chunks for renders from (a client-side error bubble). */
+export function finalReplyMarkdown(
+  chunks: readonly StreamChunk[] | undefined,
+  content: string,
+): string {
+  const parts: string[] = [];
+  for (let index = (chunks?.length ?? 0) - 1; index >= 0; index--) {
+    const chunk = chunks?.[index];
+    if (chunk?.kind === "text") {
+      const text = chunk.text.trim();
+      if (text) parts.unshift(text);
+    } else if (chunk?.kind === "reply_start" && parts.length > 0) {
+      break;
+    }
+  }
+  return parts.length > 0 ? parts.join("\n\n") : content.trim();
+}
+
 /** Merge a focused full-detail response into a live reducer without replacing
  * text or tool state that may have advanced while the request was in flight. */
 export interface ToolDetailsMergeResult {

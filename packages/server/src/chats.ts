@@ -522,6 +522,7 @@ export class ChatManager {
     if (messageIds.length === 0) return [];
     const renderTypes = [
       "delta",
+      "reply_start",
       "thinking_start",
       "thinking_delta",
       "thinking_tokens",
@@ -574,6 +575,10 @@ export class ChatManager {
   // JSON-parses its potentially thousands of persisted delta rows.
   getRenderableEventMessageIds(chatId: string, messageIds: string[], includeDebug: boolean) {
     if (messageIds.length === 0) return [];
+    // `reply_start` is deliberately absent: every turn opens with one, so
+    // counting it as structure would drag every pure-text turn in the page
+    // through the fold this query exists to skip. A turn that only ever said
+    // one thing folds to plain text anyway, and renders from the message body.
     const structuralTypes = [
       "thinking_start",
       "thinking_delta",
@@ -1036,6 +1041,7 @@ export class ChatManager {
     if (!last) return null;
     const renderTypes = [
       "delta",
+      "reply_start",
       "thinking_start",
       "thinking_delta",
       "thinking_tokens",
