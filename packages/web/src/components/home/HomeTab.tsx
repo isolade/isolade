@@ -34,7 +34,7 @@ import type {
   ModelOverrides,
   Terminal,
 } from "../../lib/contracts";
-import { DEFAULT_CHAT_MODEL_ID, provisionalTitle } from "../../lib/contracts";
+import { CHAT_MODELS, DEFAULT_CHAT_MODEL_ID, provisionalTitle } from "../../lib/contracts";
 import SettingsPane, {
   DEFAULT_SETTINGS_SECTION,
   isSettingsSection,
@@ -205,7 +205,11 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
   // closed), plus a flag set while that delete is in flight.
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
-  const [chatModels, setChatModels] = useState<ChatModelDefinition[]>([]);
+  // Seeded from the catalog compiled into this bundle so the pickers are never
+  // empty, not even on the first frame or when the server is still coming up
+  // (the app's window opens before its sidecar listens, and the sidecar
+  // restarts on every backend edit in dev). The fetch below refreshes it.
+  const [chatModels, setChatModels] = useState<ChatModelDefinition[]>(() => [...CHAT_MODELS]);
   const [modelOverrides, setModelOverrides] = useState<ModelOverrides>({});
   const [allChats, setAllChats] = useState<Chat[]>([]);
   const [terminalsByInstance, setTerminalsByInstance] = useState<Record<string, Terminal[]>>({});
@@ -403,7 +407,10 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
       ? ((instances.find((c) => c.id === view.id) ?? draftInstance(draft, view.id))?.profileId ??
         null)
       : activeProfileId;
-  // The model catalog is static (Claude + Codex), so fetch it once. Per-profile
+  // The model catalog is static (Claude + Codex), so fetch it once. It only ever
+  // confirms what the bundled catalog this state starts from already says (the
+  // route serves the very same CHAT_MODELS, from the same build), so a failed
+  // fetch is a no-op rather than a picker with nothing in it. Per-profile
   // visibility/tier overrides are layered on below.
   useEffect(() => {
     let cancelled = false;

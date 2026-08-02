@@ -58,6 +58,13 @@ _Changes landed on `main` that haven't shipped in a release yet._
 - A new chat appears in the sidebar as soon as you send, under the start of your
   message, and takes its generated title once that lands.
 
+### Fixed
+
+- The model picker no longer ends up naming the raw model id with an empty menu
+  behind it. It happened when the window opened before Isolade's server was
+  answering, and lasted the rest of the session. The picker now reads the model
+  catalog that ships inside the app, so it is right from the first frame.
+
 ## [0.4.0] - 2026-07-31
 
 ### Added

@@ -96,6 +96,7 @@ export function WorkspaceHarness() {
       split: parameters.get("split") === "1",
       prsPerInstance: Number(parameters.get("prs") ?? 0),
       profileId: "profile-test",
+      catalogDown: parameters.get("catalogDown") === "1",
     }),
   );
 
