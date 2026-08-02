@@ -11,16 +11,21 @@ import {
 } from "./profile-config";
 import { shellQuote } from "./shell";
 
-// Guest user the agent layer creates and runs as. Matches the layer fragment
-// below. If the user's base image already has a user named differently, the
-// agent fragment fails. That is out of scope.
+// Guest user the agent layer runs as, and the home the CLIs install into.
 const AGENT_USER = "agent";
 const AGENT_HOME = "/home/agent";
 
 // Apt + node + agent-CLI fragment appended to every workspace image after the
 // user's last stage. Cache mounts (--mount=type=cache) live on the builder's
-// virtio-blk ext4 disk and survive across builds. The agent user must exist
-// in the base image, and the fragment chowns /workspace to them.
+// virtio-blk ext4 disk and survive across builds.
+//
+// The fragment creates the agent user when the image has none, then chowns
+// /workspace to them. It used to require the base image to supply that user and
+// failed with `chown: invalid user: 'agent'` otherwise, which is a hard error
+// naming nothing a reader could act on, in a layer they did not write. A
+// Dockerfile that creates the user itself is unaffected, and still should: only
+// it can `COPY --chown=agent:agent`, since the user has to exist before the COPY
+// runs for the workspace contents to arrive writable.
 //
 // `skills` lists packages to install via `npx skills add` for both codex and
 // claude-code (workspace config's `skills = [...]`). Empty array → no skills step.
@@ -53,6 +58,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \\
        esac \\
     && curl -fsSL -o /usr/local/bin/ttyd "https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.\${ttyd_arch}" \\
     && chmod +x /usr/local/bin/ttyd \\
+    && (id -u ${AGENT_USER} >/dev/null 2>&1 \\
+        || useradd --user-group --create-home --shell /bin/bash ${AGENT_USER}) \\
     && mkdir -p /workspace \\
     && chown ${AGENT_USER} /workspace
 
