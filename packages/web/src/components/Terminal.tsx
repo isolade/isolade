@@ -131,6 +131,35 @@ function tryEnableWebgl(term: XTerm, onLost: () => void): WebglAddon | null {
   }
 }
 
+/** Whether a container has a layout box, so its size is something we can
+ * measure rather than invent. Gates both fitting the grid and reporting a size
+ * to the PTY; see fitToContainer for what goes wrong without it. */
+export function isMeasurable(box: { clientWidth: number; clientHeight: number } | null): boolean {
+  return !!box && box.clientWidth > 0 && box.clientHeight > 0;
+}
+
+// Fit the grid to the container, but only when the container actually has boxes.
+//
+// FitAddon sizes the grid off getComputedStyle(container), and inside a
+// display:none subtree that resolves to the *computed* value ("100%" from
+// h-full/w-full) rather than a used pixel length. Its parseInt reads that back
+// as 100px, so it happily proposes a 14x9 grid for a hidden terminal. That
+// number does not stay in the browser: term.onResize forwards it to the PTY, so
+// a shell sitting behind a tab that is merely off screen gets SIGWINCH'd down to
+// 14 columns and redraws itself at that width. Opening the tab resizes
+// everything back, but readline's model of the screen no longer matches what is
+// on it, and from then on recalling history with the up arrow paints over the
+// prompt and leaves debris behind.
+//
+// Every terminal tab that is not the selected one mounts hidden (a restored
+// layout, an off-screen instance pane), so this fires on nearly every app start.
+// A container with no boxes cannot be measured at all, so don't try: the
+// ResizeObserver below fits as soon as it has boxes again.
+function fitToContainer(container: HTMLElement | null, fitAddon: FitAddon | null): void {
+  if (!fitAddon || !isMeasurable(container)) return;
+  fitAddon.fit();
+}
+
 export default function Terminal({ wsUrl, active }: TerminalProps) {
   const isMacLike =
     typeof navigator !== "undefined" &&
@@ -180,7 +209,7 @@ export default function Terminal({ wsUrl, active }: TerminalProps) {
     webglRef.current = tryEnableWebgl(term, () => {
       webglRef.current = null;
     });
-    fitAddon.fit();
+    fitToContainer(containerRef.current, fitAddon);
     termRef.current = term;
     fitAddonRef.current = fitAddon;
 
@@ -199,7 +228,13 @@ export default function Terminal({ wsUrl, active }: TerminalProps) {
     term.write("\x1b[90mConnecting to VM...\x1b[0m\r\n");
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ type: "resize", rows: term.rows, cols: term.cols }));
+      // Only claim a size the container could actually be measured for. A
+      // terminal that mounted hidden is still at xterm's 80x24 default, and
+      // reporting that would shrink a shell the previous session left running
+      // at the real size. Revealing the tab fits and sends the true size.
+      if (isMeasurable(containerRef.current)) {
+        ws.send(JSON.stringify({ type: "resize", rows: term.rows, cols: term.cols }));
+      }
       term.focus();
     };
 
@@ -236,14 +271,16 @@ export default function Terminal({ wsUrl, active }: TerminalProps) {
     });
 
     const handleWindowResize = () => {
-      if (activeRef.current) fitAddon.fit();
+      if (activeRef.current) fitToContainer(containerRef.current, fitAddon);
     };
     window.addEventListener("resize", handleWindowResize);
 
     // Refit when the container itself changes size without a window resize,
-    // e.g. dragging the sidebar splitter or collapsing the left sidebar.
+    // e.g. dragging the sidebar splitter or collapsing the left sidebar. This
+    // is also what sizes a terminal that mounted hidden: revealing its tab
+    // takes the container from no boxes to real ones.
     const resizeObserver = new ResizeObserver(() => {
-      if (activeRef.current) fitAddon.fit();
+      if (activeRef.current) fitToContainer(containerRef.current, fitAddon);
     });
     resizeObserver.observe(containerRef.current!);
 
@@ -272,9 +309,11 @@ export default function Terminal({ wsUrl, active }: TerminalProps) {
         webglRef.current = null;
       });
     }
-    fitAddon.fit();
+    fitToContainer(containerRef.current, fitAddon);
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "resize", rows: term.rows, cols: term.cols }));
+      if (isMeasurable(containerRef.current)) {
+        ws.send(JSON.stringify({ type: "resize", rows: term.rows, cols: term.cols }));
+      }
       term.focus();
     }
   }, [active]);
