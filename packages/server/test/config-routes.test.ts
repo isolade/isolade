@@ -77,3 +77,39 @@ describe("profile config routes", () => {
     expect(res.status).toBe(404);
   });
 });
+
+describe("deleting profiles", () => {
+  let baseUrl: string;
+  let cleanup: () => Promise<void>;
+
+  beforeAll(() => {
+    const server = createTestServer();
+    baseUrl = server.baseUrl;
+    cleanup = server.cleanup;
+  });
+  afterAll(async () => {
+    await cleanup();
+  });
+
+  const list = async () =>
+    (await (await fetch(`${baseUrl}/api/profiles`)).json()) as { id: string }[];
+
+  it("deletes the last profile, leaving an install with none", async () => {
+    // The route used to refuse this to keep one profile alive at all times. An
+    // install with none is now ordinary: the workspace and the profile-scoped
+    // settings sections say so, and the guided setup creates the next one.
+    const before = await list();
+    expect(before.length).toBeGreaterThan(0);
+
+    for (const p of before) {
+      const res = await fetch(`${baseUrl}/api/profiles/${p.id}`, { method: "DELETE" });
+      expect(res.status).toBe(200);
+    }
+    expect(await list()).toEqual([]);
+  });
+
+  it("still 404s an unknown profile", async () => {
+    const res = await fetch(`${baseUrl}/api/profiles/nope`, { method: "DELETE" });
+    expect(res.status).toBe(404);
+  });
+});

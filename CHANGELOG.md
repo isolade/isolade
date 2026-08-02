@@ -8,6 +8,19 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Added
 
+- A new install now offers to set itself up, rather than opening onto an empty
+  profile with six unexplained steps between you and a working agent. It asks
+  first whether you want the ready-made Excalidraw demo or your own code. Your own
+  code means naming the profile, pointing it at the repositories the work touches
+  (paths or URLs, as many as you like, or none at all), and saying which base and
+  toolchains the image should carry. It writes the Dockerfile from your answers,
+  which is the step people gave up on, and shows it beside the questions as you
+  answer them. Then it builds, honestly slow and leaving the build running if you
+  close the card, and signs you in at the end, which is where it has to be since
+  signing in runs the provider's CLI inside a VM built from that image. It stops
+  at a built profile rather than steering you further, and the same guided setup
+  is available any time from Settings, Profiles, since setting up a second profile
+  is the same work as the first.
 - Profile seeding into nested instances can now be switched off with
   `ISOLADE_SEED=0`. Instances created with it set ignore their profile's
   `seed_profiles` and start with no profiles at all, which is what you want when
@@ -19,6 +32,13 @@ _Changes landed on `main` that haven't shipped in a release yet._
 - Agent messages are now set in a sans-serif face by default. If you had picked
   serif, that sticks, and Settings still offers serif and any font on your
   machine.
+- A fresh install now has no profiles at all, where it used to be given an empty
+  "Default" that existed in the list and could not do anything. Guided setup
+  creates the first one. The last profile can also be deleted now, which the
+  seeded one had made impossible, and the places you would meet an install with
+  none say so: the workspace offers to set one up rather than showing a composer
+  that cannot create anything, and a settings section that configures a profile
+  tells you there is nothing to configure yet.
 - A profile's instructions are now part of the system prompt rather than being
   prepended to a chat's first message, so they hold for the whole chat and
   outrank the rest of it. You can also pick the prompt they join: Isolade's own,

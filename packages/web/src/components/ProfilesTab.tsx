@@ -1,4 +1,4 @@
-import { Check, Copy, Pencil, Plus, Trash2 } from "lucide-react";
+import { Check, Copy, Pencil, Plus, Trash2, Wand2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -19,7 +19,13 @@ import type { ProfileSummary } from "../lib/contracts";
 // its environment(s). Switching the active profile re-skins the whole app, so a
 // switch reloads the webview, and the boot path re-reads everything for the new
 // profile.
-export default function ProfilesTab({ activeProfileId }: { activeProfileId: string | null }) {
+export default function ProfilesTab({
+  activeProfileId,
+  onOpenWizard,
+}: {
+  activeProfileId: string | null;
+  onOpenWizard?: () => void;
+}) {
   const [profiles, setProfiles] = useState<ProfileSummary[]>([]);
   const [activeId, setActiveId] = useState<string | null>(activeProfileId);
   const [newName, setNewName] = useState("");
@@ -157,7 +163,7 @@ export default function ProfilesTab({ activeProfileId }: { activeProfileId: stri
                     size="icon-xs"
                     variant="ghost"
                     title="Delete"
-                    disabled={busy || profiles.length <= 1}
+                    disabled={busy}
                     onClick={() => setPendingDelete(p)}
                   >
                     <Trash2 className="size-3.5" />
@@ -190,10 +196,18 @@ export default function ProfilesTab({ activeProfileId }: { activeProfileId: stri
           <Plus className="size-3.5" />
           Create
         </Button>
+        {onOpenWizard && (
+          <Button type="button" size="sm" variant="secondary" onClick={onOpenWizard}>
+            <Wand2 className="size-3.5" />
+            Guided setup
+          </Button>
+        )}
       </form>
       <p className="max-w-2xl text-xs text-muted-foreground">
-        A new profile starts empty and signed-out. Clone an existing profile to copy its environment
-        and appearance (sign-in and secrets are never copied).
+        A new profile starts empty and signed-out. Guided setup points at a repository and writes
+        its Dockerfile for you, which is the same work whether it is your first profile or your
+        fifth. Cloning an existing profile copies its environment and appearance instead (sign-in
+        and secrets are never copied).
       </p>
 
       <ConfirmDialog
@@ -209,7 +223,18 @@ export default function ProfilesTab({ activeProfileId }: { activeProfileId: stri
         onConfirm={() => {
           const target = pendingDelete;
           if (!target) return;
-          void run(() => deleteProfile(target.id)).then(() => setPendingDelete(null));
+          void run(() => deleteProfile(target.id)).then(() => {
+            setPendingDelete(null);
+            // Deleting the profile this window is scoped to leaves it pointed at
+            // something that no longer exists, and every profile-scoped request
+            // would 400 until the next launch. Drop the pointer and re-resolve,
+            // which lands on another profile, or on the empty state when that
+            // was the last one.
+            if (getStoredProfileId() === target.id) {
+              setStoredProfileId(null);
+              window.location.reload();
+            }
+          });
         }}
       />
     </div>

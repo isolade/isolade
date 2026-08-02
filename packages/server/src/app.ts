@@ -28,6 +28,7 @@ import { createFilesRouter } from "./routes/files";
 import { createGitRouter } from "./routes/git";
 import { createInstancesRouter } from "./routes/instances";
 import { createNetworkRouter } from "./routes/network";
+import { createOnboardingRouter } from "./routes/onboarding";
 import { createProfilesRouter } from "./routes/profiles";
 import { createPromptRouter } from "./routes/prompt";
 import { createRuntimeRouter } from "./routes/runtime";
@@ -222,9 +223,6 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
   const profiles = new ProfileManager(db, sandboxClient, {
     skipBootSandboxWork: opts.skipResync,
   });
-  // Guarantee at least one profile exists so a fresh install has something to
-  // select (and to sign into before authoring a config.toml).
-  if (profiles.list().length === 0) profiles.ensureDefault();
   const instances = new InstanceManager(db, sandboxClient, profiles, secretsStore, prAttachments, {
     sandboxSocketPath: opts.sandboxSocketPath,
   });
@@ -583,6 +581,7 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
   app.route("/", createGitRouter(routeContext));
   app.route("/", createNetworkRouter(routeContext));
   app.route("/", createRuntimeRouter(routeContext));
+  app.route("/", createOnboardingRouter(routeContext));
   app.route("/", createPromptRouter(routeContext));
 
   return {
