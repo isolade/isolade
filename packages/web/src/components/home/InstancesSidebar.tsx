@@ -40,6 +40,10 @@ interface InstancesSidebarProps {
   // Archived chats (same filtering). Collapsed under an "Archived" disclosure
   // that only appears when this is non-empty.
   archivedInstances: Instance[];
+  // The stand-in row of a chat that was just sent and whose server row hasn't
+  // landed yet, if one is in the active list. Rendered like any other row, but
+  // without the context menu (see InstanceRow).
+  pendingId?: string | null;
   selectedId: string | null;
   isDrafting: boolean;
   // Top padding (px) that clears the floating window-chrome cluster, which sits
@@ -77,7 +81,8 @@ interface RowActions {
 // One chat row, with the context menu it owns. `activity` enables the
 // working/unread treatments: on for the active list, off for archived rows
 // (their VM is stopped, so they're quiescent). Archived rows get the
-// unarchive/delete menu instead of the live one.
+// unarchive/delete menu instead of the live one. `pending` marks the stand-in
+// row of a just-sent chat, which gets no menu at all.
 //
 // Memoized, and given only stable props, because each row carries a Radix
 // context menu (a Root, a Trigger and a portalled Content, several components
@@ -90,6 +95,7 @@ const InstanceRow = memo(function InstanceRow({
   conv,
   isActive,
   activity,
+  pending = false,
   age,
   demo,
   actions,
@@ -97,6 +103,7 @@ const InstanceRow = memo(function InstanceRow({
   conv: Instance;
   isActive: boolean;
   activity: boolean;
+  pending?: boolean;
   age: string;
   demo: string;
   actions: RowActions;
@@ -113,6 +120,70 @@ const InstanceRow = memo(function InstanceRow({
   // the unselected rows: working → shimmer, unread → bold, otherwise → plain.
   const showWorking = activity && conv.working && !isActive;
   const showUnread = activity && conv.unread && !isActive && !conv.working;
+  const row = (
+    <button
+      type="button"
+      data-demo={demo}
+      onClick={() => actions.onSelect(conv.id)}
+      // Two overrides on the shared row style, both because these rows are
+      // two lines (title, then the metadata strip) where it is one:
+      // `items-start` so the status icon aligns with the title rather than
+      // with the middle of the pair (`mt-1` centres it on the title's 20px
+      // line), and the split padding so the row looks evenly inset. The
+      // shared py-1 measures from the line boxes, which leaves 7px of air
+      // above the title's cap height but only 5px below the metadata line's
+      // descenders; 3/5 evens the two out at 6px without making the row any
+      // taller.
+      className={cn(sidebarRowClass(isActive), "items-start pt-[3px] pb-[5px]")}
+    >
+      {(isRestarting || isInitializing) && (
+        <RotateCw
+          className="mt-1 size-3 shrink-0 animate-spin text-muted-foreground"
+          aria-label={isInitializing ? "Preparing environment" : "Restarting"}
+        />
+      )}
+      {isErrored && (
+        <AlertTriangle
+          className="mt-1 size-3 shrink-0 text-destructive"
+          aria-label={conv.lastError ?? "VM error"}
+        />
+      )}
+      <span className="min-w-0 flex-1">
+        <span
+          className={cn(
+            "block truncate",
+            // Working: a bright glint sweeps across the dimmed title (see
+            // .text-shimmer, shared with in-flight tool calls). Unread: bold,
+            // full strength.
+            showWorking && "text-shimmer",
+            showUnread && "font-semibold",
+          )}
+          title={isErrored && conv.lastError ? conv.lastError : undefined}
+        >
+          {rowLabel(conv)}
+        </span>
+        {/* Metadata strip under the title: when this chat last did
+            something, and the unpushed diff. Deliberately quiet (10px,
+            muted) so a wall of rows still reads as a list of titles. */}
+        <span className="flex items-center gap-1.5 text-[10px] leading-[14px] text-muted-foreground tabular-nums">
+          <span className="truncate" title={formatAbsoluteTime(conv.updatedAt)}>
+            {age}
+          </span>
+          {((conv.diffAdded ?? 0) > 0 || (conv.diffDeleted ?? 0) > 0) && (
+            <span className="shrink-0 inline-flex gap-1">
+              <span className="text-emerald-600 dark:text-emerald-500">+{conv.diffAdded ?? 0}</span>
+              <span className="text-red-600 dark:text-red-500">&minus;{conv.diffDeleted ?? 0}</span>
+            </span>
+          )}
+        </span>
+      </span>
+    </button>
+  );
+  // A just-sent chat's stand-in row: the server knows nothing about its id yet,
+  // so every menu action would address a chat that doesn't exist. It's replaced
+  // by the real row within a moment, so it goes without a menu rather than with
+  // a disabled one.
+  if (pending) return row;
   // `activity` doubles as "this row's VM is live", which is exactly the set of
   // rows whose menu offers the VM-bound actions.
   const menu = activity ? (
@@ -167,69 +238,7 @@ const InstanceRow = memo(function InstanceRow({
   );
   return (
     <ContextMenu>
-      <ContextMenuTrigger asChild>
-        <button
-          type="button"
-          data-demo={demo}
-          onClick={() => actions.onSelect(conv.id)}
-          // Two overrides on the shared row style, both because these rows are
-          // two lines (title, then the metadata strip) where it is one:
-          // `items-start` so the status icon aligns with the title rather than
-          // with the middle of the pair (`mt-1` centres it on the title's 20px
-          // line), and the split padding so the row looks evenly inset. The
-          // shared py-1 measures from the line boxes, which leaves 7px of air
-          // above the title's cap height but only 5px below the metadata line's
-          // descenders; 3/5 evens the two out at 6px without making the row any
-          // taller.
-          className={cn(sidebarRowClass(isActive), "items-start pt-[3px] pb-[5px]")}
-        >
-          {(isRestarting || isInitializing) && (
-            <RotateCw
-              className="mt-1 size-3 shrink-0 animate-spin text-muted-foreground"
-              aria-label={isInitializing ? "Preparing environment" : "Restarting"}
-            />
-          )}
-          {isErrored && (
-            <AlertTriangle
-              className="mt-1 size-3 shrink-0 text-destructive"
-              aria-label={conv.lastError ?? "VM error"}
-            />
-          )}
-          <span className="min-w-0 flex-1">
-            <span
-              className={cn(
-                "block truncate",
-                // Working: a bright glint sweeps across the dimmed title (see
-                // .text-shimmer, shared with in-flight tool calls). Unread: bold,
-                // full strength.
-                showWorking && "text-shimmer",
-                showUnread && "font-semibold",
-              )}
-              title={isErrored && conv.lastError ? conv.lastError : undefined}
-            >
-              {rowLabel(conv)}
-            </span>
-            {/* Metadata strip under the title: when this chat last did
-                something, and the unpushed diff. Deliberately quiet (10px,
-                muted) so a wall of rows still reads as a list of titles. */}
-            <span className="flex items-center gap-1.5 text-[10px] leading-[14px] text-muted-foreground tabular-nums">
-              <span className="truncate" title={formatAbsoluteTime(conv.updatedAt)}>
-                {age}
-              </span>
-              {((conv.diffAdded ?? 0) > 0 || (conv.diffDeleted ?? 0) > 0) && (
-                <span className="shrink-0 inline-flex gap-1">
-                  <span className="text-emerald-600 dark:text-emerald-500">
-                    +{conv.diffAdded ?? 0}
-                  </span>
-                  <span className="text-red-600 dark:text-red-500">
-                    &minus;{conv.diffDeleted ?? 0}
-                  </span>
-                </span>
-              )}
-            </span>
-          </span>
-        </button>
-      </ContextMenuTrigger>
+      <ContextMenuTrigger asChild>{row}</ContextMenuTrigger>
       <ContextMenuContent>{menu}</ContextMenuContent>
     </ContextMenu>
   );
@@ -245,6 +254,7 @@ export default function InstancesSidebar({
   instances,
   pinnedInstances,
   archivedInstances,
+  pendingId = null,
   selectedId,
   isDrafting,
   topInset = 0,
@@ -362,6 +372,7 @@ export default function InstancesSidebar({
                 conv={conv}
                 isActive={!isDrafting && selectedId === conv.id}
                 activity
+                pending={conv.id === pendingId}
                 age={formatRelativeTime(conv.updatedAt, now)}
                 demo="instance-row"
                 actions={actions}

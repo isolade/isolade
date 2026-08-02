@@ -42,6 +42,11 @@ _Changes landed on `main` that haven't shipped in a release yet._
   fills as the chat writes to it. Chats created before this keep the size they
   were made with.
 
+### Changed
+
+- A new chat appears in the sidebar as soon as you send, under the start of your
+  message, and takes its generated title once that lands.
+
 ## [0.4.0] - 2026-07-31
 
 ### Added

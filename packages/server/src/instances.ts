@@ -561,6 +561,24 @@ export class InstanceManager {
     return this.get(id);
   }
 
+  // Swap one exact title for another, reporting whether it landed. The
+  // auto-titler uses it to replace the provisional title it set when the first
+  // message was sent: if the user renamed the chat while the model was
+  // thinking, the row no longer carries `expected` and their name stands.
+  // Read-then-write rather than a conditional UPDATE: both statements are
+  // synchronous SQLite on a single-threaded server, so nothing can retitle the
+  // row between them.
+  replaceTitle(id: string, expected: string, title: string): boolean {
+    const row = this.db
+      .select({ title: schema.instances.title })
+      .from(schema.instances)
+      .where(eq(schema.instances.id, id))
+      .get();
+    if (!row || row.title !== expected) return false;
+    this.setTitle(id, title);
+    return true;
+  }
+
   // Pin/unpin a chat: toggle the flag that lifts it into the sidebar's "Pinned"
   // section. Purely presentational, so unlike archive there is no VM lifecycle
   // here, just a flag flip. The updatedAt bump orders the pinned section by
@@ -793,10 +811,10 @@ export class InstanceManager {
   // the context menu's Restart action.
   //
   // Untitled instances are reaped instead of resumed: they're abandoned
-  // drafts (NewInstancePane creates a real VM the moment the user submits
-  // a first message. If the page closes before the auto-title flow lands
-  // AND before beaconDeleteInstance fires, the instance survives but is
-  // hidden by the sidebar's title-required filter). Auto-resuming them
+  // drafts. NewInstancePane spawns a real VM on the first keystroke, and a
+  // chat is titled the moment its first message is sent (see
+  // ChatTurnService), so an untitled instance is one whose draft was never
+  // submitted and whose beaconDeleteInstance never fired. Auto-resuming them
   // booted up to a dozen invisible msb processes every isolade start.
   async resyncAll(): Promise<void> {
     const all = this.list();

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Chat, ChatManager } from "../chats";
 import type { ChatEffort, ChatProvider, ChatRenderChunk, Upload } from "../contracts";
-import { findChatModel } from "../contracts";
+import { findChatModel, provisionalTitle } from "../contracts";
 import type { ChatMessage } from "../db/schema";
 import type { DiffStatsPoller } from "../diff-stats";
 import type { InstanceManager } from "../instances";
@@ -272,12 +272,12 @@ export class ChatTurnService {
       );
       if (inline?.kind === "user_message") inline.uploads = uploadRows.map(toUpload);
     }
-    // Kick off auto-titling on the first user message of an untitled
-    // chat. Runs in parallel with the assistant response. The SSE
-    // stream emits a `title` event when it completes so the sidebar
-    // can update in place. The title is minted by the chat's own provider
-    // CLI inside a VM (see the backends' generateTitle). If that fails we
-    // fall back to a truncation of the first message below.
+    // Title the chat on the first user message of an untitled one. Two steps,
+    // both emitting a `title` event so the sidebar updates in place: the
+    // provisional title right away (see below), then the generated one when it
+    // lands. Runs in parallel with the assistant response. The generated title
+    // is minted by the chat's own provider CLI inside a VM (see the backends'
+    // generateTitle); if that fails, the provisional one stands.
     const needsTitle = !inTurnEdit && instance.title === null;
 
     chatStreamHub.startTurn({
@@ -321,27 +321,28 @@ export class ChatTurnService {
 
         let titlePromise: Promise<void> | null = null;
         if (needsTitle) {
-          // Mint the title in the profile's always-warm titling VM when one is
-          // ready, so it's not gated on this instance's own (often still
+          // Title the chat before the model is even asked. The sidebar gates
+          // entry visibility on `title !== null`, so this is what makes the
+          // chat show up the moment it is sent rather than a round-trip later.
+          const provisional = provisionalTitle(content);
+          instances.setTitle(instanceId, provisional);
+          api.publish("title", provisional);
+          // Mint the real title in the profile's always-warm titling VM when one
+          // is ready, so it's not gated on this instance's own (often still
           // cold-booting) VM, and falls back to the instance VM otherwise.
           const titleVmId =
             (instance.profileId && titleVmManager.getReadyVmId(instance.profileId)) ||
             instance.vmId;
-          // Sidebar gates entry visibility on `title !== null`, so the chat
-          // appears once the title lands. Fall back to a truncation of the
-          // first message only if the model call fails, so the chat still
-          // eventually appears.
           titlePromise = backend
             .generateTitle(titleVmId, content)
             .catch(() => null)
             .then((generated) => {
-              const fallback = content.replace(/\s+/g, " ").trim().slice(0, 60) || "Untitled";
-              return generated && generated.length > 0 ? generated : fallback;
-            })
-            .then((title) => {
-              if (api.signal.aborted) return;
-              instances.setTitle(instanceId, title);
-              api.publish("title", title);
+              if (api.signal.aborted || !generated) return;
+              // Swap it in only while the chat still wears the provisional
+              // title: a rename in this window is the user's own choice and
+              // outranks the model's.
+              if (!instances.replaceTitle(instanceId, provisional, generated)) return;
+              api.publish("title", generated);
             })
             .catch(() => {});
         }
