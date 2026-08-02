@@ -337,10 +337,15 @@ export function createSandboxApp(deps: SandboxAppDeps) {
     if (!clientId) return c.json({ error: "client query parameter required" }, 400);
 
     return streamSSE(c, async (stream) => {
+      const gen = buildRunner(tarStream, clientId);
+      let aborted = false;
+      stream.onAbort(() => {
+        aborted = true;
+      });
       try {
-        const gen = buildRunner(tarStream, clientId);
-        while (true) {
+        while (!aborted) {
           const result = await gen.next();
+          if (aborted) break;
           if (result.done) {
             await stream.writeSSE({
               event: "done",
@@ -351,8 +356,17 @@ export function createSandboxApp(deps: SandboxAppDeps) {
           await stream.writeSSE({ event: "log", data: result.value });
         }
       } catch (err) {
-        console.error("[builds] error:", err);
-        await stream.writeSSE({ event: "error", data: String(err) }).catch(() => {});
+        if (!aborted) {
+          console.error("[builds] error:", err);
+          await stream.writeSSE({ event: "error", data: String(err) }).catch(() => {});
+        }
+      } finally {
+        // A nested Isolade restart closes its SSE connection. Explicitly close
+        // the async generator so BuilderManager runs its shutdown/finally path
+        // instead of leaving an abandoned build and opChain slot behind.
+        await gen.return("").catch((err) => {
+          console.warn("[builds] generator cleanup failed:", err);
+        });
       }
     });
   });

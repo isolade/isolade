@@ -181,6 +181,42 @@ describe("sandbox app HTTP routes", () => {
     expect(clients).toEqual(["host"]);
   });
 
+  it("closes an in-flight build generator when the client disconnects", async () => {
+    let releaseBuild!: () => void;
+    const buildReleased = new Promise<void>((resolve) => {
+      releaseBuild = resolve;
+    });
+    let markFinalized!: () => void;
+    const finalized = new Promise<void>((resolve) => {
+      markFinalized = resolve;
+    });
+    const app = createSandboxApp({
+      vmManager: new FakeVmManager(),
+      async *runBuild() {
+        try {
+          yield "started";
+          await buildReleased;
+          yield "after disconnect";
+          return "unused";
+        } finally {
+          markFinalized();
+        }
+      },
+    });
+
+    const res = await app.request("/builds?client=nested", {
+      method: "POST",
+      body: "tar",
+    });
+    const reader = res.body!.getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).toContain("data: started");
+
+    await reader.cancel();
+    releaseBuild();
+    await finalized;
+  });
+
   it("requires a body for builds", async () => {
     const app = createSandboxApp({ vmManager: new FakeVmManager() });
 

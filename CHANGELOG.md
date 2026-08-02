@@ -12,6 +12,9 @@ _Changes landed on `main` that haven't shipped in a release yet._
   is open.
 - Newly created chats now give `/tmp` up to one quarter of their memory, capped
   at 8 GiB, instead of limiting it to 512 MiB.
+- Back-to-back profile builds no longer occasionally fail because the previous
+  builder still holds the shared cache disk, including after a nested Isolade
+  instance restarts during a build.
 
 ## [0.5.0] - 2026-08-02
 
