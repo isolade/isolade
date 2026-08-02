@@ -256,6 +256,29 @@ describe("live reveal projection", () => {
     expect(revealChunks(chunks, 10)).not.toBe(chunks);
   });
 
+  it("keeps image lookups past the reveal point, so a shown `![](…)` resolves", () => {
+    // The snapshot is published after the text citing it, so gating it behind
+    // the reveal budget would flash the alt text of an image already on screen.
+    const image = {
+      kind: "image",
+      id: "upload-1",
+      sourcePath: "out/a.png",
+      offset: 12,
+      filename: "a.png",
+      mediaType: "image/png",
+      size: 24,
+    } as const;
+    const chunks = [
+      { kind: "text", text: "see ![a](out/a.png) and more prose" },
+      image,
+    ] satisfies StreamChunk[];
+
+    expect(revealChunks(chunks, 19)).toEqual([
+      { kind: "text", text: "see ![a](out/a.png)" },
+      image,
+    ]);
+  });
+
   it("treats reasoning as structural, so a collapsed thought never animates in", () => {
     const thought = {
       kind: "thought",

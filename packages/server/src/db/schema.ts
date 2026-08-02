@@ -335,14 +335,21 @@ export const queuedMessages = sqliteTable(
   (t) => [index("idx_queued_messages_chat").on(t.chatId, t.status, t.createdAt)],
 );
 
-// Files attached to a user message (browser upload or clipboard paste). The
-// bytes live on the host under stateDir()/uploads/<instanceId>/<id>/<filename>
-// and are bind-mounted into the instance's VM so the agent can read them by
-// path (see uploads.ts). This row is just the metadata. `messageId` is null
-// between staging (the upload endpoint) and send (when the message row is
-// created and the upload is associated with it); a staged-but-never-sent
-// upload keeps a null messageId and is swept later. `instanceId` scopes the
-// upload to one VM's mount, and drives download authorization.
+// Files attached to a message, in either direction. The bytes live on the host
+// under stateDir()/uploads/<instanceId>/<id>/<filename>; this row is just the
+// metadata, and `instanceId` scopes it to one VM and drives download
+// authorization. `origin` says which way the file travelled:
+//
+//   "user"  — a browser upload or clipboard paste, also written into the VM so
+//             the agent can read it by path (see uploads.ts). `messageId` is
+//             null between staging (the upload endpoint) and send (when the
+//             message row is created); a staged-but-never-sent upload keeps a
+//             null messageId and is swept later.
+//   "agent" — a snapshot of a file the assistant referenced as a markdown image
+//             in its reply, copied out of the VM the moment it was mentioned so
+//             the transcript keeps the bytes the agent was talking about even
+//             after the file is overwritten (see agent-images.ts). Always
+//             created already attached to its assistant message.
 export const uploads = sqliteTable(
   "uploads",
   {
@@ -354,11 +361,25 @@ export const uploads = sqliteTable(
     filename: text("filename").notNull(),
     mediaType: text("media_type").notNull(),
     size: integer("size").notNull(),
+    origin: text("origin", { enum: ["user", "agent"] })
+      .notNull()
+      .default("user"),
+    // Agent snapshots only: the path inside the VM the assistant wrote in its
+    // markdown. What the renderer matches a `![](…)` destination against.
+    sourcePath: text("source_path"),
+    // Agent snapshots only: sha-256 of the bytes, so re-referencing an
+    // unchanged file reuses one stored copy instead of writing another.
+    contentHash: text("content_hash"),
     createdAt: integer("created_at", { mode: "timestamp" })
       .notNull()
       .$defaultFn(() => new Date()),
   },
-  (t) => [index("idx_uploads_message").on(t.messageId)],
+  (t) => [
+    index("idx_uploads_message").on(t.messageId),
+    // The dedup probe: an agent snapshot is looked up by the path it came from
+    // and the bytes that were there at the time.
+    index("idx_uploads_source").on(t.instanceId, t.sourcePath, t.contentHash),
+  ],
 );
 
 // A message can reference uploads that were already attached to an earlier

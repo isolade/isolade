@@ -1,5 +1,7 @@
+import { ImageOff } from "lucide-react";
+import { Dialog as DialogPrimitive } from "radix-ui";
 import type { ComponentProps, ReactNode } from "react";
-import { createContext, memo, useContext } from "react";
+import { createContext, memo, useContext, useMemo, useState } from "react";
 import type { Components } from "react-markdown";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
@@ -16,6 +18,192 @@ import { CopyButton } from "./CopyButton";
 // class to key off.
 const PreContext = createContext(false);
 
+/** What became of a markdown image the assistant wrote. */
+export type ResolvedMarkdownImage =
+  | { status: "ready"; href: string }
+  | { status: "failed"; reason: "missing" | "not-an-image" | "unreadable" | "unreachable" };
+
+// Said in the transcript, where the reader has no reason to know what the
+// capture step is or that it exists. Each names what is wrong with the file
+// rather than what the code did about it.
+//
+// `none` is the odd one out: it means no capture was even attempted for this
+// reference, which is what a message written before this feature existed looks
+// like, and equally what a server that is not running it looks like. Spelled
+// out rather than left blank so the three states (worked, failed for a reason,
+// never tried) are never confusable on screen.
+const IMAGE_FAILURES = {
+  missing: "file not found",
+  "not-an-image": "not an image",
+  unreadable: "could not be read",
+  unreachable: "could not be fetched",
+  none: "not captured",
+} as const;
+
+/**
+ * Turns a `![](…)` into something renderable, or null when nothing backs it.
+ *
+ * An assistant's images are paths inside a VM the browser cannot reach, so they
+ * are snapshotted host-side as the reply is written and looked up here (see
+ * server/agent-images.ts). Takes the offset as well as the destination because
+ * one path can be shown more than once in a reply, each time with whatever
+ * bytes were there at that moment, and position is what tells those apart.
+ *
+ * The offset is relative to whatever content the nearest provider scoped, so
+ * every layer between the message and a single parsed fragment rebases it (see
+ * MarkdownImageOffset). Absent this context an `<img>` renders the way it always
+ * has, which is what user messages and every other call site want.
+ */
+export type MarkdownImageResolver = (
+  source: string,
+  offset: number,
+) => ResolvedMarkdownImage | null;
+
+export const MarkdownImageContext = createContext<MarkdownImageResolver | null>(null);
+
+/**
+ * Rebase a resolver onto a nested piece of the same text.
+ *
+ * The message's snapshots are recorded against offsets into the whole reply,
+ * while a node's own position is relative to the one fragment remark parsed. A
+ * provider at each level adds back what it sits at, so the two meet.
+ */
+export const MarkdownImageOffset = memo(function MarkdownImageOffset({
+  delta,
+  children,
+}: {
+  delta: number;
+  children: ReactNode;
+}) {
+  const parent = useContext(MarkdownImageContext);
+  const shifted = useMemo(
+    () =>
+      parent === null || delta === 0
+        ? parent
+        : (source: string, offset: number) => parent(source, offset + delta),
+    [parent, delta],
+  );
+  return <MarkdownImageContext.Provider value={shifted}>{children}</MarkdownImageContext.Provider>;
+});
+
+function hasUriScheme(source: string): boolean {
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(source) || source.startsWith("//");
+}
+
+// An image reference with no picture behind it: one pointing outside the
+// machine, one whose file could not be captured, or one nothing ever tried to
+// capture. Better than a browser's broken-image glyph, because the alt text is
+// usually the agent describing what you were meant to be looking at.
+//
+// `reason` always says something, including when nothing was tried, so a chip
+// can never leave you guessing which of those happened.
+function UnresolvedImage({
+  source,
+  alt,
+  reason,
+}: {
+  source: string;
+  alt: string;
+  reason: keyof typeof IMAGE_FAILURES;
+}) {
+  const remote = hasUriScheme(source);
+  return (
+    <span className="my-2 inline-flex max-w-full items-center gap-2 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-xs text-muted-foreground">
+      <ImageOff className="size-3.5 shrink-0" />
+      {alt && <span className="truncate">{alt}</span>}
+      {remote ? (
+        <a
+          href={source}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="truncate text-link hover:underline"
+          onClick={(e) => onExternalLinkClick(e, source)}
+        >
+          {source}
+        </a>
+      ) : (
+        <span className="truncate font-mono opacity-70">{source}</span>
+      )}
+      <span className="shrink-0 opacity-70">({IMAGE_FAILURES[reason]})</span>
+    </span>
+  );
+}
+
+// The picture at full size, over everything else. Radix handles the parts that
+// are easy to get wrong: escape to close, scroll lock, focus trapped while open
+// and returned to the thumbnail after. The content layer covers the viewport
+// rather than sitting inside the overlay, so a click anywhere dismisses it,
+// including on the image itself.
+function ImageLightbox({
+  open,
+  onOpenChange,
+  href,
+  alt,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  href: string;
+  alt: string;
+}) {
+  return (
+    <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
+      <DialogPrimitive.Portal>
+        <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/80" />
+        <DialogPrimitive.Content
+          className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center p-6 outline-none"
+          onClick={() => onOpenChange(false)}
+          aria-describedby={undefined}
+        >
+          {/* Radix requires a title. The caption is the agent's own description
+              of the picture, which is exactly what a screen reader wants. */}
+          <DialogPrimitive.Title className="sr-only">{alt || "Image"}</DialogPrimitive.Title>
+          {/* The grid shrink-wraps the picture rather than the picture being
+              fitted into the grid, so it shows through transparent pixels and
+              nowhere else. An opaque image simply covers it. */}
+          <div className="image-checkerboard">
+            <img src={href} alt={alt} className="max-h-[92vh] max-w-[92vw]" />
+          </div>
+        </DialogPrimitive.Content>
+      </DialogPrimitive.Portal>
+    </DialogPrimitive.Root>
+  );
+}
+
+// A markdown image. Only ever loads bytes the resolver vouched for: a remote
+// URL in an assistant's reply is shown as a link rather than fetched, so a
+// message composed inside a sandboxed VM cannot make the app call out to a host
+// of the agent's choosing just by being displayed.
+function ImageRenderer({ src, alt, title, node }: ComponentProps<"img"> & { node?: unknown }) {
+  const resolve = useContext(MarkdownImageContext);
+  const [zoomed, setZoomed] = useState(false);
+  const source = typeof src === "string" ? src : "";
+  const caption = alt ?? "";
+  if (!resolve) return <img src={src} alt={caption} title={title} className="max-w-full" />;
+  // Where this image sits in the fragment remark parsed, which the providers
+  // above have rebased onto the whole reply.
+  const offset = (node as HastNode | undefined)?.position?.start?.offset ?? 0;
+  const resolved = source ? resolve(source, offset) : null;
+  if (resolved?.status !== "ready") {
+    return <UnresolvedImage source={source} alt={caption} reason={resolved?.reason ?? "none"} />;
+  }
+  return (
+    <>
+      {/* Block and width-fit so `mx-auto` has something to centre. Preflight
+          already makes the image itself a block (see the note on sizing), so
+          the button is only here to own the click and the centring. */}
+      <button
+        type="button"
+        title={title ?? alt}
+        onClick={() => setZoomed(true)}
+        className="mx-auto my-2 block w-fit cursor-zoom-in"
+      >
+        <img src={resolved.href} alt={caption} className="max-h-96 max-w-full rounded-md" />
+      </button>
+      <ImageLightbox open={zoomed} onOpenChange={setZoomed} href={resolved.href} alt={caption} />
+    </>
+  );
+}
+
 // Minimal structural hast type so we don't depend on @types/hast directly.
 type HastNode = {
   type?: string;
@@ -23,6 +211,7 @@ type HastNode = {
   value?: string;
   children?: HastNode[];
   properties?: { className?: unknown };
+  position?: { start?: { offset?: number } };
 };
 
 // Raw text of a hast subtree. Keep the recursive walk so the copy payload does
@@ -101,6 +290,7 @@ const Paragraph = memo(
 const components: Components = {
   pre: PreBlock,
   code: CodeRenderer,
+  img: ImageRenderer,
   // Block elements
   p: Paragraph,
   // `pl-6` (not the tighter `pl-4`) so the outside list markers have room to

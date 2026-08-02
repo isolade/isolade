@@ -15,6 +15,7 @@ import { RENDER_METRICS_ENABLED, recordRenderMetric } from "@/lib/render-metrics
 import { cn } from "@/lib/utils";
 import StreamingMarkdown from "../StreamingMarkdown";
 import {
+  MarkdownImageScope,
   type ProviderSwitchChunk,
   ProviderSwitchDivider,
   providerSwitchOf,
@@ -252,51 +253,53 @@ export const MessageRow = memo(function MessageRow({
             }
           />
         ) : (
-          <div
-            className="group/turn w-full break-words pr-12 text-[15px] leading-relaxed text-foreground"
-            style={{ fontFamily: agentFontFamily }}
-          >
-            {streaming && (!chunks || chunks.length === 0) ? (
-              <WaitingDots label={waitingLabel} />
-            ) : chunks && chunks.length > 0 ? (
-              <>
-                <StreamView
-                  chunks={chunks}
-                  cacheScope={streaming ? undefined : message.id}
-                  showDebug={showDebug}
-                  streaming={streaming}
-                  instanceId={instanceId}
-                  userFontFamily={userFontFamily}
-                  editingUserMessageId={editingUserMessageId}
-                  actionsDisabled={actionsDisabled}
-                  onStartUserMessageEdit={onStartEdit}
-                  onCancelUserMessageEdit={onCancelEdit}
-                  onSubmitUserMessageEdit={onSubmitEdit}
-                  onRequestToolDetails={requestToolDetails}
-                />
-                {streaming && chunks.at(-1)?.kind === "text" && (
-                  <span className="ml-0.5 inline-block h-4 w-1 animate-pulse bg-muted-foreground align-text-bottom" />
-                )}
-              </>
-            ) : (
-              <StreamingMarkdown content={message.content} cacheKey={`${message.id}:content`} />
-            )}
-            {(reply || version) && (
-              <div className="mt-1 flex h-6 items-center">
-                {reply && (
-                  <MessageCopyButton text={reply} className="group-hover/turn:opacity-100" />
-                )}
-                {version && (
-                  <VersionPager
-                    index={version.index}
-                    count={version.count}
+          <MarkdownImageScope chunks={chunks} instanceId={instanceId}>
+            <div
+              className="group/turn w-full break-words pr-12 text-[15px] leading-relaxed text-foreground"
+              style={{ fontFamily: agentFontFamily }}
+            >
+              {streaming && (!chunks || chunks.length === 0) ? (
+                <WaitingDots label={waitingLabel} />
+              ) : chunks && chunks.length > 0 ? (
+                <>
+                  <StreamView
+                    chunks={chunks}
+                    cacheScope={streaming ? undefined : message.id}
+                    showDebug={showDebug}
+                    streaming={streaming}
+                    instanceId={instanceId}
+                    userFontFamily={userFontFamily}
+                    editingUserMessageId={editingUserMessageId}
                     actionsDisabled={actionsDisabled}
-                    onNavigate={(direction) => onNavigateVersion(message.id, direction)}
+                    onStartUserMessageEdit={onStartEdit}
+                    onCancelUserMessageEdit={onCancelEdit}
+                    onSubmitUserMessageEdit={onSubmitEdit}
+                    onRequestToolDetails={requestToolDetails}
                   />
-                )}
-              </div>
-            )}
-          </div>
+                  {streaming && chunks.at(-1)?.kind === "text" && (
+                    <span className="ml-0.5 inline-block h-4 w-1 animate-pulse bg-muted-foreground align-text-bottom" />
+                  )}
+                </>
+              ) : (
+                <StreamingMarkdown content={message.content} cacheKey={`${message.id}:content`} />
+              )}
+              {(reply || version) && (
+                <div className="mt-1 flex h-6 items-center">
+                  {reply && (
+                    <MessageCopyButton text={reply} className="group-hover/turn:opacity-100" />
+                  )}
+                  {version && (
+                    <VersionPager
+                      index={version.index}
+                      count={version.count}
+                      actionsDisabled={actionsDisabled}
+                      onNavigate={(direction) => onNavigateVersion(message.id, direction)}
+                    />
+                  )}
+                </div>
+              )}
+            </div>
+          </MarkdownImageScope>
         )}
       </div>
     </>

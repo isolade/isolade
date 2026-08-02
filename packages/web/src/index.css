@@ -166,6 +166,25 @@ svg.animate-spin > * {
   contain-intrinsic-size: auto 100px;
 }
 
+/* Transparency checkerboard, behind an image opened full size in the lightbox.
+   Without it a PNG with an alpha channel is indistinguishable from one with a
+   black background, because the backdrop behind it is black. Two offset
+   diagonal gradients over a flat base give the familiar image-editor grid.
+   Mid greys rather than the usual white and near-white: against a dark backdrop
+   a white grid glares, and it reads as a deliberate white matte rather than as
+   nothing being there. Deliberately not theme-aware, since the backdrop is dark
+   in both themes. */
+.image-checkerboard {
+  background-color: #a3a3a3;
+  background-image:
+    linear-gradient(45deg, #737373 25%, transparent 25%, transparent 75%, #737373 75%),
+    linear-gradient(45deg, #737373 25%, transparent 25%, transparent 75%, #737373 75%);
+  background-size: 16px 16px;
+  background-position:
+    0 0,
+    8px 8px;
+}
+
 .markdown-fragment[data-first-fragment="false"] > h3:first-child {
   margin-top: 0.5rem;
 }

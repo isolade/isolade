@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { AgentImageCollector } from "../agent-images";
 import type { Chat, ChatManager } from "../chats";
 import type { ChatEffort, ChatProvider, ChatRenderChunk, Upload } from "../contracts";
 import { findChatModel, provisionalTitle } from "../contracts";
@@ -6,6 +7,7 @@ import type { ChatMessage } from "../db/schema";
 import type { DiffStatsPoller } from "../diff-stats";
 import type { InstanceManager } from "../instances";
 import type { ProfileManager } from "../profiles";
+import type { SandboxApi } from "../sandbox-client";
 import type { TitleVmManager } from "../title-vm-manager";
 import { toUpload, type UploadStore, uploadGuestPath } from "../uploads";
 import type { ChatBackend, UploadAttachment } from "./backend";
@@ -48,6 +50,10 @@ export interface ChatTurnDeps {
   chatManager: ChatManager;
   providerSwitchStore: ProviderSwitchStore;
   uploadStore: UploadStore;
+  // Reads back files the assistant cites as markdown images. Optional so a test
+  // driving turns through a fake backend needs no VM: without it a reply's
+  // image references simply stay unresolved text.
+  sandboxClient?: SandboxApi;
   instances: InstanceManager;
   profiles: ProfileManager;
   titleVmManager: TitleVmManager;
@@ -112,6 +118,7 @@ export class ChatTurnService {
       chatManager,
       providerSwitchStore,
       uploadStore,
+      sandboxClient,
       instances,
       profiles,
       titleVmManager,
@@ -354,6 +361,22 @@ export class ChatTurnService {
             })
             .map((chunk) => chunk.text)
             .join("") ?? "";
+        // Snapshots files the reply cites as markdown images, as it cites them.
+        // Eagerly rather than at the end of the turn because an agent that
+        // screenshots, describes, fixes and screenshots again overwrites the
+        // path in between, and the transcript should hold the bytes each
+        // sentence was written about (see agent-images.ts).
+        const agentImages = sandboxClient
+          ? new AgentImageCollector({
+              sandbox: sandboxClient,
+              uploadStore,
+              vmId: instance.vmId,
+              instanceId,
+              chatId,
+              messageId: assistantMessageId,
+              publish: (image) => api.publish("agent_image", image),
+            })
+          : null;
         // Provider-session snapshot for this turn, reported by the backend
         // as facts become known and stamped onto the assistant row on both
         // the success and abort paths, so even an interrupted turn stays
@@ -584,6 +607,7 @@ export class ChatTurnService {
               commitSwitchIfAccepted();
               api.publish("delta", text);
               assistantContent += text;
+              agentImages?.observe(assistantContent);
             },
             onMeta: (meta) => {
               commitSwitchIfAccepted();
@@ -652,6 +676,14 @@ export class ChatTurnService {
           // accepted the request, so commit any pending switch before finalizing.
           commitSwitchIfAccepted();
           assistantContent = result.content || assistantContent;
+          // A backend that returns its reply whole rather than streaming it has
+          // published no deltas for the scanner to have seen, and the cursor is
+          // still at the start, so this is where its references are found. On a
+          // streamed turn the text is already scanned and this does nothing.
+          agentImages?.observe(assistantContent);
+          // Let every snapshot land before the render is read, so the committed
+          // message carries its images rather than acquiring them on a reload.
+          await agentImages?.settle();
           const renderChunks = api.renderChunks();
           const persistedContent = inTurnEdit
             ? renderChunks
@@ -690,6 +722,11 @@ export class ChatTurnService {
           // Persist any partial text for both cancellation and provider
           // failures. The live client commits that same partial before showing
           // an error, so durable history must agree after a reload.
+          //
+          // An image the agent got as far as citing before the turn died is
+          // part of that partial text, so settle here too. The VM outlives an
+          // interrupted turn, so the read still works.
+          await agentImages?.settle().catch(() => {});
           const renderChunks = api.renderChunks();
           if (assistantContent.length > 0 || renderChunks.length > 0) {
             try {

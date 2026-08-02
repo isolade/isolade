@@ -535,6 +535,7 @@ export class ChatManager {
       "render_seed",
       "api_retry",
       "provider_switch",
+      "agent_image",
       ...(includeDebug ? ["thinking", "raw"] : []),
     ];
     return this.db
@@ -592,6 +593,9 @@ export class ChatManager {
       "render_seed",
       "api_retry",
       "provider_switch",
+      // A turn whose only structure is an image still needs a render: its
+      // markdown body alone cannot say where the bytes behind a `![](…)` went.
+      "agent_image",
       ...(includeDebug ? ["thinking", "raw"] : []),
     ];
     return this.db
@@ -1054,6 +1058,7 @@ export class ChatManager {
       "render_seed",
       "api_retry",
       "provider_switch",
+      "agent_image",
       ...(includeDebug ? ["thinking", "raw"] : []),
     ];
     const events = this.db

@@ -112,6 +112,18 @@ export function createUploadsRouter(ctx: RouteContext): Hono {
     }
     const disposition = c.req.query("download") ? "attachment" : "inline";
     const meta = toUpload(row);
+    // An SVG is a document, not just a picture: opened in a tab (which is what
+    // the full-size link on a thumbnail does) its script runs on this origin,
+    // where the auth token lives. Embedding one in an <img> never executes
+    // anything, so the transcript is unaffected, but the tab has to be
+    // defused. `sandbox` with no allow-list puts the response in an opaque
+    // origin with scripting off. Matters most for agent-authored files, which
+    // come out of a VM whose whole premise is that its contents are untrusted,
+    // so it is applied to any SVG rather than gated on the origin column.
+    const svgGuard: Record<string, string> =
+      meta.mediaType === "image/svg+xml"
+        ? { "Content-Security-Policy": "sandbox", "X-Content-Type-Options": "nosniff" }
+        : {};
     // Stream the file rather than reading it fully into memory, so large
     // downloads stay cheap. Readable.toWeb yields a standard ReadableStream that
     // the Response body accepts.
@@ -125,6 +137,7 @@ export function createUploadsRouter(ctx: RouteContext): Hono {
         "Content-Length": String(size),
         // Quote the filename so spaces/specials in the name don't break the header.
         "Content-Disposition": `${disposition}; filename="${meta.filename.replace(/"/g, "")}"`,
+        ...svgGuard,
       },
     });
   });
