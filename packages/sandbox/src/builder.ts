@@ -975,6 +975,7 @@ export class BuilderManager {
     this.registry = null;
     if (handle) await killHandle(handle);
     if (!sb) return;
+    let stopped = false;
     // Force the guest to flush the page cache before we halt it. `sb.stop()`
     // hard-kills the VM with no clean shutdown (no `sync`, no fs unmount, no
     // writeback timer firing), so any dir creates / file writes still buffered
@@ -990,6 +991,7 @@ export class BuilderManager {
     }
     try {
       await withTimeout(sb.stop(), 10_000, "sandbox.stop");
+      stopped = true;
     } catch (err) {
       console.warn("[builder] shutdown: stop failed:", err);
     }
@@ -997,6 +999,18 @@ export class BuilderManager {
       await withTimeout(Sandbox.remove(sb.name), 10_000, "Sandbox.remove");
     } catch (err) {
       console.warn("[builder] shutdown: Sandbox.remove failed:", err);
+    }
+    // stop() leaves the native Sandbox inside the JS wrapper, so Microsandbox
+    // retains disk-lock file descriptors until Bun garbage-collects that wrapper.
+    // An immediately queued build can fail to reattach the cache disk. Once the
+    // VM is confirmed stopped, detach() consumes the native handle and releases
+    // those resources deterministically.
+    if (stopped) {
+      try {
+        await withTimeout(sb.detach(), 5_000, "sandbox.detach");
+      } catch (err) {
+        console.warn("[builder] shutdown: detach failed:", err);
+      }
     }
   }
 }
