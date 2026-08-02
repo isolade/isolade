@@ -46,6 +46,11 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Fixed
 
+- A build driven from a nested instance no longer fails when one of its steps
+  goes quiet. Any step that prints nothing for ten seconds, `yarn install`
+  fetching packages being the usual one, had the connection carrying the build
+  closed under it, and the failure read "The socket connection was closed
+  unexpectedly" while the build itself carried on fine on the host.
 - The update notice now points at how to update rather than at the release
   artifact. Downloading the macOS build through a browser is the one route that
   leaves it quarantined and refusing to launch, so the notice was walking people
