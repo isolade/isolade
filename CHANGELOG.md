@@ -8,23 +8,9 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Added
 
-- A new install now offers to set itself up, rather than opening onto an empty
-  profile with six unexplained steps between you and a working agent. It asks
-  first whether you want the ready-made Excalidraw demo or your own code. Your own
-  code means naming the profile, pointing it at the repositories the work touches
-  (paths or URLs, as many as you like, or none at all), and saying which base and
-  toolchains the image should carry. It writes the Dockerfile from your answers,
-  which is the step people gave up on, and shows it beside the questions as you
-  answer them. Then it builds, honestly slow and leaving the build running if you
-  close the card, and signs you in at the end, which is where it has to be since
-  signing in runs the provider's CLI inside a VM built from that image. It stops
-  at a built profile rather than steering you further, and the same guided setup
-  is available any time from Settings, Profiles, since setting up a second profile
-  is the same work as the first.
-- Profile seeding into nested instances can now be switched off with
-  `ISOLADE_SEED=0`. Instances created with it set ignore their profile's
-  `seed_profiles` and start with no profiles at all, which is what you want when
-  working on the first-run experience inside Isolade.
+- New installs now guide you through creating and building a first profile, either
+  from the ready-made Excalidraw demo or your own repositories and toolchains.
+  Guided setup is also available from Settings > Profiles.
 
 ### Changed
 
@@ -32,13 +18,9 @@ _Changes landed on `main` that haven't shipped in a release yet._
 - Agent messages are now set in a sans-serif face by default. If you had picked
   serif, that sticks, and Settings still offers serif and any font on your
   machine.
-- A fresh install now has no profiles at all, where it used to be given an empty
-  "Default" that existed in the list and could not do anything. Guided setup
-  creates the first one. The last profile can also be deleted now, which the
-  seeded one had made impossible, and the places you would meet an install with
-  none say so: the workspace offers to set one up rather than showing a composer
-  that cannot create anything, and a settings section that configures a profile
-  tells you there is nothing to configure yet.
+- New installs no longer create an unusable "Default" profile. Empty workspaces
+  and profile settings now point to guided setup, and the last profile can be
+  deleted.
 - A profile's instructions are now part of the system prompt rather than being
   prepended to a chat's first message, so they hold for the whole chat and
   outrank the rest of it. You can also pick the prompt they join: Isolade's own,
@@ -55,16 +37,8 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Fixed
 
-- A profile whose Dockerfile does not create an `agent` user now builds. Isolade
-  stacks a layer on every image that runs as that user, and it required the image
-  to have supplied one, failing with `chown: invalid user: 'agent'` from a layer
-  the person reading the error had not written. The layer creates the user when
-  an image has none, and leaves the one your Dockerfile made alone.
-- A build driven from a nested instance no longer fails when one of its steps
-  goes quiet. Any step that prints nothing for ten seconds, `yarn install`
-  fetching packages being the usual one, had the connection carrying the build
-  closed under it, and the failure read "The socket connection was closed
-  unexpectedly" while the build itself carried on fine on the host.
+- Profile images now build even when their Dockerfile does not define an `agent`
+  user.
 - On macOS, the window can now be dragged from the title-bar area while Settings
   is open.
 - Newly created chats now give `/tmp` up to one quarter of their memory, capped
