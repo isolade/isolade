@@ -34,7 +34,7 @@ import type {
   ModelOverrides,
   Terminal,
 } from "../../lib/contracts";
-import { DEFAULT_CHAT_MODEL_ID } from "../../lib/contracts";
+import { DEFAULT_CHAT_MODEL_ID, provisionalTitle } from "../../lib/contracts";
 import SettingsPane, {
   DEFAULT_SETTINGS_SECTION,
   isSettingsSection,
@@ -547,7 +547,11 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     const standIn: Instance = {
       id: `local-${crypto.randomUUID()}`,
       vmId: "",
-      title: null,
+      // The same provisional title the server is about to persist for this
+      // chat, so the sidebar entry is there from the first frame instead of
+      // waiting on the create round-trip. The sidebar reads it back off this
+      // row until the server's own title lands (see the sidebar sections).
+      title: provisionalTitle(firstMessage),
       status: "running",
       lastError: null,
       image: "",
@@ -964,22 +968,30 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     [draft],
   );
 
-  // Sidebar only shows instances whose title has landed (either the
-  // auto-generated one or the server-side truncation fallback). Untitled
-  // rows include pre-submit drafts and the brief window between submit and
-  // first title event. Each remaining chat lands in exactly one section:
-  // archived (its own collapsed disclosure), else pinned (the "Pinned" heading
-  // at the top), else the main active list.
+  // Sidebar only shows instances whose title has landed (the provisional one
+  // the server writes when the first message is sent, or the generated one that
+  // replaces it), so untitled rows are exactly the chats nothing was ever sent
+  // to. A just-submitted draft is carried by its stand-in title until the
+  // server's row catches up: first as a row of its own, then folded onto the
+  // real row for the moment it exists but is still untitled. Each remaining
+  // chat lands in exactly one section: archived (its own collapsed disclosure),
+  // else pinned (the "Pinned" heading at the top), else the main active list.
   const { archivedInstances, pinnedInstances, activeInstances } = useMemo(() => {
-    const sidebarInstances = instances.filter(
-      (c) => c.title !== null && c.title.trim() !== "" && (c.profileId ?? null) === activeProfileId,
+    const titled = (c: Instance) => c.title !== null && c.title.trim() !== "";
+    const draftTitle = draft?.instance.title ?? null;
+    const rows = instances.map((c) =>
+      draftTitle && c.id === draft?.instanceId && !titled(c) ? { ...c, title: draftTitle } : c,
+    );
+    if (draft && draft.instanceId === null) rows.unshift(draft.instance);
+    const sidebarInstances = rows.filter(
+      (c) => titled(c) && (c.profileId ?? null) === activeProfileId,
     );
     return {
       archivedInstances: sidebarInstances.filter((c) => c.archived),
       pinnedInstances: sidebarInstances.filter((c) => !c.archived && c.pinned),
       activeInstances: sidebarInstances.filter((c) => !c.archived && !c.pinned),
     };
-  }, [activeProfileId, instances]);
+  }, [activeProfileId, instances, draft]);
 
   const handleRequestDelete = useCallback((id: string) => setConfirmingDelete(id), []);
   const handleRequestClearArchive = useCallback(() => setConfirmingClearArchive(true), []);
@@ -1013,6 +1025,7 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
               instances={activeInstances}
               pinnedInstances={pinnedInstances}
               archivedInstances={archivedInstances}
+              pendingId={draftPending ? draft.standInInstanceId : null}
               selectedId={view.kind === "instance" ? view.id : null}
               isDrafting={view.kind === "drafting"}
               topInset={TITLE_BAR_WITH_INSET_HEIGHT}

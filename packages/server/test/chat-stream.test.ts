@@ -162,10 +162,34 @@ class FakeBackend {
     return this.cancelSteerResult;
   };
 
-  // Titles are best-effort, and returning null exercises the truncation fallback,
-  // matching how these tests behaved when the host had no credentials.
+  // What the titling call returns. Null by default (what a host with no
+  // credentials produces), which leaves the chat on its provisional title.
+  public titleResult: string | null = null;
+  // Held open by the titling tests so they can act while the model is still
+  // "thinking". Resolves immediately otherwise.
+  public titleGate: Promise<void> = Promise.resolve();
+  // Resolves once a titling call is in flight.
+  public titleRequested: Promise<void> = Promise.resolve();
+  private markTitleRequested: () => void = () => {};
+
+  // Arms the gate, so the next titling call blocks until `release()` is called
+  // and then returns `title`. `requested` resolves when that call comes in.
+  gateTitle(title: string | null): { release: () => void } {
+    let release!: () => void;
+    this.titleGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.titleRequested = new Promise<void>((resolve) => {
+      this.markTitleRequested = resolve;
+    });
+    this.titleResult = title;
+    return { release };
+  }
+
   generateTitle = async (): Promise<string | null> => {
-    return null;
+    this.markTitleRequested();
+    await this.titleGate;
+    return this.titleResult;
   };
 }
 
@@ -242,6 +266,7 @@ describe("chat streaming resilience", () => {
   let seedInstance: () => string;
   let chatStreamHub: ReturnType<typeof createTestServer>["chatStreamHub"];
   let chatManager: ReturnType<typeof createTestServer>["chatManager"];
+  let instances: ReturnType<typeof createTestServer>["instances"];
   let backend: FakeBackend;
   let cleanup: () => Promise<void>;
 
@@ -259,6 +284,7 @@ describe("chat streaming resilience", () => {
     seedInstance = server.seedInstance;
     chatStreamHub = server.chatStreamHub;
     chatManager = server.chatManager;
+    instances = server.instances;
     cleanup = server.cleanup;
   });
 
@@ -348,6 +374,88 @@ describe("chat streaming resilience", () => {
     expect(msgs[1]!.role).toBe("assistant");
     expect(msgs[1]!.content).toBe("hello world");
     expect(msgs[1]!.id).toBe(messageId);
+  });
+
+  // The titles published on a turn, oldest first, read back off its durable
+  // event stream (where every publish lands, whoever was subscribed at the
+  // time).
+  function titlesFor(messageId: string): string[] {
+    return chatManager
+      .getEventsForMessage(messageId, -2)
+      .filter((event) => event.type === "title")
+      .map((event) => JSON.parse(event.payload) as string);
+  }
+
+  function messageIdOf(events: { event: string; data: string }[]): string {
+    const frame = events.find((event) => event.event === "message_id");
+    if (!frame) throw new Error("missing message_id frame");
+    return JSON.parse(frame.data) as string;
+  }
+
+  it("titles a chat from its first message, then swaps in the generated title", async () => {
+    const { instanceId, chatId } = await makeChat();
+    backend.setScript([{ kind: "delta", text: "on it" }]);
+    const { release } = backend.gateTitle("Fix login redirect");
+
+    const res = await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: "  why does my   login\nredirect loop?  " }),
+    });
+    // Titled before the model is even asked, so the chat has a sidebar entry
+    // from the first frame of the turn rather than a round-trip later.
+    await backend.titleRequested;
+    expect(instances.get(instanceId)?.title).toBe("why does my login redirect loop?");
+    release();
+
+    const { events } = await readAllSse(res);
+    expect(titlesFor(messageIdOf(events))).toEqual([
+      "why does my login redirect loop?",
+      "Fix login redirect",
+    ]);
+    expect(instances.get(instanceId)?.title).toBe("Fix login redirect");
+    backend.titleResult = null;
+  });
+
+  it("leaves the provisional title in place when titling fails", async () => {
+    const { instanceId, chatId } = await makeChat();
+    backend.setScript([{ kind: "delta", text: "on it" }]);
+
+    const res = await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: "why does my login redirect loop?" }),
+    });
+    const { events } = await readAllSse(res);
+
+    expect(titlesFor(messageIdOf(events))).toEqual(["why does my login redirect loop?"]);
+    expect(instances.get(instanceId)?.title).toBe("why does my login redirect loop?");
+  });
+
+  it("keeps a rename made while the title is still being generated", async () => {
+    const { instanceId, chatId } = await makeChat();
+    backend.setScript([{ kind: "delta", text: "on it" }]);
+    const { release } = backend.gateTitle("Fix login redirect");
+
+    const res = await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: "why does my login redirect loop?" }),
+    });
+    await backend.titleRequested;
+    await fetch(`${baseUrl}/api/instances/${instanceId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "Login bug" }),
+    });
+    release();
+
+    const { events } = await readAllSse(res);
+    // The user named it, so the generated title is dropped rather than
+    // published over their name.
+    expect(titlesFor(messageIdOf(events))).toEqual(["why does my login redirect loop?"]);
+    expect(instances.get(instanceId)?.title).toBe("Login bug");
+    backend.titleResult = null;
   });
 
   it("warns after an acknowledgement timeout and clears on a late acknowledgement", async () => {

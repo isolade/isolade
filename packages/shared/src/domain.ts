@@ -122,6 +122,17 @@ export const instanceSchema = z.object({
 });
 export const instanceArraySchema = z.array(instanceSchema);
 
+// The title a chat wears from the moment its first message is sent: that
+// message on one line, cut to a sidebar-sized prefix. The sidebar only lists
+// titled chats, so this is what puts a new chat in the list right away instead
+// of a model round-trip later, and it's what the chat keeps if the titling call
+// fails. The generated title replaces it when it lands. Both sides compute it:
+// the server for the row it persists, the client for the row it shows
+// optimistically while the send is still in flight.
+export function provisionalTitle(firstMessage: string): string {
+  return firstMessage.replace(/\s+/g, " ").trim().slice(0, 60) || "Untitled";
+}
+
 export const terminalSchema = z.object({
   id: z.string(),
   instanceId: z.string(),

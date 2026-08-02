@@ -53,6 +53,11 @@ _Changes landed on `main` that haven't shipped in a release yet._
   thinking tokens it has already spent, instead of counting them up from zero as
   if the turn were starting.
 
+### Changed
+
+- A new chat appears in the sidebar as soon as you send, under the start of your
+  message, and takes its generated title once that lands.
+
 ## [0.4.0] - 2026-07-31
 
 ### Added
