@@ -46,6 +46,11 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Fixed
 
+- A profile whose Dockerfile does not create an `agent` user now builds. Isolade
+  stacks a layer on every image that runs as that user, and it required the image
+  to have supplied one, failing with `chown: invalid user: 'agent'` from a layer
+  the person reading the error had not written. The layer creates the user when
+  an image has none, and leaves the one your Dockerfile made alone.
 - A build driven from a nested instance no longer fails when one of its steps
   goes quiet. Any step that prints nothing for ten seconds, `yarn install`
   fetching packages being the usual one, had the connection carrying the build
