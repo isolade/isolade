@@ -472,6 +472,24 @@ export function createSandboxApp(deps: SandboxAppDeps) {
   return app;
 }
 
+// Serve options every transport shares, so a liveness setting can't end up on
+// one and not the other.
+//
+// idleTimeout: 0 because this API's long responses go quiet for as long as the
+// work does. A build's SSE stream carries buildkit's output, and a quiet RUN
+// step emits nothing for minutes (`yarn install` prints one line and then
+// fetches packages in silence), as do registry sweeps. Bun's default is to
+// close a connection after 10 seconds with no bytes in either direction, which
+// lands on the caller as "The socket connection was closed unexpectedly" and
+// fails a build that is running perfectly well on the other side.
+function sandboxServeOptions(app: ReturnType<typeof createSandboxApp>) {
+  return {
+    fetch: app.fetch,
+    websocket,
+    idleTimeout: 0,
+  };
+}
+
 // Production boot for the STANDALONE sandbox service (external-sandbox dev
 // mode, `bun run --cwd packages/sandbox dev`). Invoked from src/main.ts after
 // the microsandbox-availability probe. Tests import createSandboxApp directly
@@ -494,9 +512,7 @@ export async function startSandboxServer() {
   return {
     port: SANDBOX_PORT,
     hostname: "0.0.0.0",
-    fetch: app.fetch,
-    websocket,
-    idleTimeout: 0,
+    ...sandboxServeOptions(app),
   };
 }
 
@@ -510,13 +526,13 @@ export async function startSandboxServer() {
 // exposes, veneering the same runtime.
 export function serveSandboxOnUnix(socketPath: string, deps: SandboxAppDeps) {
   const app = createSandboxApp(deps);
-  // No server-level idleTimeout here (Bun doesn't accept one on a unix socket).
-  // The long-lived cases (an exec-stream WS quiet during a long agent turn,
-  // build-log SSE) ride the same `websocket` handler the TCP server uses, so
-  // their liveness behavior matches the already-shipping port-served path.
+  // @ts-ignore: Bun declares idleTimeout on the port-served options only, while
+  // the runtime reads it here just the same (checked against a response that
+  // sends nothing for fifteen seconds: it arrives with the option and is cut off
+  // after ten seconds without it). Nothing else disables the timeout on this
+  // transport, `server.timeout(req, 0)` included.
   return Bun.serve({
     unix: socketPath,
-    fetch: app.fetch,
-    websocket,
+    ...sandboxServeOptions(app),
   });
 }

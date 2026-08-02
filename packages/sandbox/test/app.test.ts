@@ -1,5 +1,8 @@
 import { describe, expect, it, spyOn } from "bun:test";
-import { createSandboxApp } from "../src/index";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createSandboxApp, serveSandboxOnUnix } from "../src/index";
 
 class FakeVmManager {
   calls: { method: string; args: unknown[] }[] = [];
@@ -323,6 +326,31 @@ describe("sandbox app HTTP routes", () => {
       expect(warn).toHaveBeenCalledTimes(1);
     } finally {
       warn.mockRestore();
+    }
+  });
+});
+
+describe("serving the sandbox over a unix socket", () => {
+  it("keeps a connection open while it has nothing to say", () => {
+    // This socket is what a nested instance drives, and its builds come back as
+    // one long response carrying buildkit's output. A quiet RUN step sends
+    // nothing for minutes (`yarn install` announces itself and then fetches
+    // packages in silence), and Bun closes a connection after ten idle seconds
+    // unless told otherwise, which reaches the caller as "The socket connection
+    // was closed unexpectedly" while the build runs on happily at this end.
+    //
+    // Asserted on the options rather than by waiting out eleven seconds of
+    // silence against a live socket.
+    const dir = mkdtempSync(join(tmpdir(), "isolade-sandbox-socket-"));
+    const socketPath = join(dir, "sandbox.sock");
+    const serve = spyOn(Bun, "serve");
+    try {
+      const server = serveSandboxOnUnix(socketPath, { vmManager: new FakeVmManager() });
+      expect(serve.mock.calls[0]?.[0]).toMatchObject({ unix: socketPath, idleTimeout: 0 });
+      server.stop(true);
+    } finally {
+      serve.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

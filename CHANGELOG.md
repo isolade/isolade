@@ -55,6 +55,11 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Fixed
 
+- A build driven from a nested instance no longer fails when one of its steps
+  goes quiet. Any step that prints nothing for ten seconds, `yarn install`
+  fetching packages being the usual one, had the connection carrying the build
+  closed under it, and the failure read "The socket connection was closed
+  unexpectedly" while the build itself carried on fine on the host.
 - On macOS, the window can now be dragged from the title-bar area while Settings
   is open.
 - Newly created chats now give `/tmp` up to one quarter of their memory, capped
