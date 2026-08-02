@@ -338,9 +338,9 @@ export function CustomStep({
         <div className="space-y-2">
           <span className="font-medium text-sm">Your repositories</span>
           <p className="text-muted-foreground text-xs">
-            A path on this machine, or a URL to clone. Add as many as the work touches, or none at
-            all: an empty workspace is a valid profile, and an agent can clone into it. Your own
-            working trees stay where they are.
+            A repository on github.com, or the path to a checkout on this machine. Add as many as
+            the work touches, or none at all: an empty workspace is a valid profile, and an agent
+            can clone into it. Your own working trees stay where they are.
           </p>
           <div className="space-y-1.5">
             {sources.map((source, i) => (

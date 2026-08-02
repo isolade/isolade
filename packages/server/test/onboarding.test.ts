@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   BASES,
@@ -13,6 +13,7 @@ import {
   TOOLCHAINS,
 } from "@isolade/shared";
 import { DEMO_CONFIG_FORM, DEMO_DOCKERFILE, DEMO_REPO_NAME } from "../src/onboarding-demo";
+import { expandHomePath } from "../src/profile-config";
 import { createOnboardingRouter } from "../src/routes/onboarding";
 
 // The onboarding wizard. It infers nothing about a repository: the
@@ -234,9 +235,9 @@ describe("the routes", () => {
     return repoPathCheckSchema.parse(await res.json());
   };
 
-  it("accepts a directory", async () => {
+  it("accepts a checkout on this machine", async () => {
     const dir = join(root, "project");
-    mkdirSync(dir);
+    mkdirSync(join(dir, ".git"), { recursive: true });
     expect(await check(dir)).toMatchObject({ ok: true, remote: false, problem: null });
   });
 
@@ -252,12 +253,46 @@ describe("the routes", () => {
     expect((await check(file)).problem).toContain("is a file");
   });
 
-  it("passes a remote source through for the build to resolve", async () => {
-    // Reaching a private repository needs credentials the wizard deliberately
-    // does not ask for, so the build is what reports whether it worked.
-    for (const url of ["https://github.com/owner/repo", "git@github.com:owner/repo.git"]) {
-      expect(await check(url)).toMatchObject({ ok: true, remote: true });
+  it("catches a directory that is not a checkout", async () => {
+    // The build ships a repository's history with its tree, so this one fails
+    // there, minutes later, having been waved through here.
+    const dir = join(root, "not-a-repo");
+    mkdirSync(dir);
+    expect((await check(dir)).problem).toContain("not a Git checkout");
+  });
+
+  it("takes a remote in the form the field itself suggests", async () => {
+    // `github.com/owner/repo` is the placeholder in the input and the build
+    // clones it happily. This route used to answer "Nothing exists at" it.
+    for (const source of [
+      "github.com/owner/repo",
+      "https://github.com/owner/repo",
+      "https://github.com/owner/repo.git",
+    ]) {
+      expect(await check(source)).toMatchObject({ ok: true, remote: true, problem: null });
     }
+  });
+
+  it("says what it takes when a remote is not one the build could clone", async () => {
+    // Passing these through was worse than rejecting them: the build treats a
+    // source it cannot parse as a directory name, and fails on that instead.
+    for (const source of [
+      "git@github.com:owner/repo.git",
+      "ssh://git@github.com/owner/repo.git",
+      "https://gitlab.com/owner/repo",
+      "https://github.com/owner/repo/tree/main",
+    ]) {
+      const result = await check(source);
+      expect(result.ok).toBe(false);
+      expect(result.problem).toContain("github.com/owner/repo");
+    }
+  });
+
+  it("resolves a typed path the way the build will", async () => {
+    // Same expansion on both sides, so `~/code/thing` is not reported missing
+    // here and then cloned there.
+    expect(expandHomePath("~/code/thing")).toBe(join(homedir(), "code/thing"));
+    expect(expandHomePath("/tmp/~/keep")).toBe("/tmp/~/keep");
   });
 
   it("serves a demo definition that matches its schema", async () => {

@@ -303,7 +303,9 @@ export const profileConfigSchema = z
   })
   .strict();
 
-function expandHomePath(input: string): string {
+/** Exported so the onboarding check resolves a typed path the way the build
+ *  will, rather than telling someone nothing exists at `~/code/thing`. */
+export function expandHomePath(input: string): string {
   return input.replace(/^~(?=\/|$)/, homedir());
 }
 
