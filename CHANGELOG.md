@@ -42,6 +42,12 @@ _Changes landed on `main` that haven't shipped in a release yet._
   fills as the chat writes to it. Chats created before this keep the size they
   were made with.
 
+### Fixed
+
+- Opening a chat that has been thinking while you were elsewhere now shows the
+  thinking tokens it has already spent, instead of counting them up from zero as
+  if the turn were starting.
+
 ## [0.4.0] - 2026-07-31
 
 ### Added
