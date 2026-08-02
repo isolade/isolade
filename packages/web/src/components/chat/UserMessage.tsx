@@ -5,6 +5,7 @@ import type { Upload } from "@/lib/contracts";
 import { useAttachments } from "@/lib/use-attachments";
 import { cn } from "@/lib/utils";
 import { AttachmentStrip } from "./AttachmentStrip";
+import { MessageCopyButton } from "./MessageCopyButton";
 import { MessageUploads } from "./MessageUploads";
 
 export interface UserMessageModel {
@@ -177,8 +178,16 @@ export const UserMessage = memo(function UserMessage({
     onStartEdit !== undefined &&
     onCancelEdit !== undefined &&
     onSubmitEdit !== undefined;
+  // What the user wrote, verbatim. A message that is only attachments has
+  // nothing to put on the clipboard.
+  const copyable = message.content.length > 0;
   const body = (
-    <div className={cn("group flex flex-col items-end gap-1", editing ? "w-full" : "max-w-[80%]")}>
+    <div
+      className={cn(
+        "group/message flex flex-col items-end gap-1",
+        editing ? "w-full" : "max-w-[80%]",
+      )}
+    >
       {editing && editable ? (
         <UserMessageEditor
           message={message}
@@ -208,19 +217,27 @@ export const UserMessage = memo(function UserMessage({
                 : "Message was not sent"}
             </div>
           )}
-          {(editable || footer) && (
-            <div className="flex h-6 items-center" data-chat-action>
+          {(copyable || editable || footer) && (
+            <div className="flex h-6 items-center">
+              {copyable && (
+                <MessageCopyButton
+                  text={message.content}
+                  className="group-hover/message:opacity-100"
+                />
+              )}
               {editable && (
-                <button
-                  type="button"
-                  aria-label="Edit message"
-                  data-disabled-at-rest="false"
-                  disabled={actionsDisabled}
-                  onClick={() => onStartEdit(message.id)}
-                  className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground opacity-0 hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100 disabled:pointer-events-none disabled:opacity-0"
-                >
-                  <Pencil className="h-3.5 w-3.5" />
-                </button>
+                <div className="flex items-center" data-chat-action>
+                  <button
+                    type="button"
+                    aria-label="Edit message"
+                    data-disabled-at-rest="false"
+                    disabled={actionsDisabled}
+                    onClick={() => onStartEdit(message.id)}
+                    className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground opacity-0 hover:text-foreground focus-visible:opacity-100 group-hover/message:opacity-100 disabled:pointer-events-none disabled:opacity-0"
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                  </button>
+                </div>
               )}
               {footer}
             </div>

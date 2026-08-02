@@ -376,6 +376,46 @@ describe("CodexBackend notification parsing", () => {
     expect(result.sessionId).toBe("thread-1");
   });
 
+  // Codex speaks in agentMessage items: a remark before it runs something, the
+  // reply once it is done. Each one is announced once, whichever notification
+  // gets there first, so the transcript can tell the two apart.
+  it("marks each agentMessage as the start of an utterance, once", async () => {
+    const { events, result } = await run([
+      ["item/started", { item: { id: "m1", type: "agentMessage", status: "inProgress" } }],
+      ["item/agentMessage/delta", { itemId: "m1", delta: "Running the tests." }],
+      [
+        "item/started",
+        { item: { id: "c1", type: "commandExecution", status: "inProgress", command: "bun test" } },
+      ],
+      [
+        "item/completed",
+        {
+          item: {
+            id: "c1",
+            type: "commandExecution",
+            status: "completed",
+            command: "bun test",
+            aggregatedOutput: "ok",
+            exitCode: 0,
+          },
+        },
+      ],
+      // No item/started for the second one: its own deltas name it instead.
+      ["item/agentMessage/delta", { itemId: "m2", delta: "They pass." }],
+      ["item/agentMessage/delta", { itemId: "m2", delta: " Nothing else to report." }],
+      ["turn/completed", { turn: { status: "completed" } }],
+    ]);
+
+    expect(events.map((event) => event.type)).toEqual([
+      "reply_start",
+      "tool_call_start",
+      "tool_call_input",
+      "tool_call_result",
+      "reply_start",
+    ]);
+    expect(result.content).toBe("Running the tests.They pass. Nothing else to report.");
+  });
+
   it("maps a command item to tool_call_start/result with a humanized name", async () => {
     const { events } = await run([
       [

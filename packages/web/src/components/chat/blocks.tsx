@@ -569,6 +569,10 @@ export const StreamView = memo(function StreamView({
         // The provider-switch divider renders above the triggering user message
         // (see MessageRow.switchAbove), not inside the assistant bubble.
         if (chunk.kind === "provider_switch") return null;
+        // Where one utterance ends and the next begins. It divides the text
+        // around it for anything reading the transcript (copying the reply,
+        // say); on the page the paragraphs speak for themselves.
+        if (chunk.kind === "reply_start") return null;
         if (!showDebug) return null;
         if (chunk.kind === "thinking") return <ThinkingBlock key={i} text={chunk.text} />;
         return (

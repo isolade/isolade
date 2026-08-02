@@ -58,6 +58,11 @@ export interface ModelBilling {
 // Anything we know how to identify (thinking blocks, tool calls, …) is
 // emitted as a typed variant instead.
 export type ChatEvent =
+  // The agent has begun a new utterance: the text that follows is a fresh
+  // thing it is saying, not more of the last one. Both providers mark this
+  // themselves, so the transcript can tell a remark before a command apart
+  // from the reply that comes after it.
+  | { type: "reply_start" }
   | { type: "tool_call_start"; id: string; name: string }
   | { type: "tool_call_input"; id: string; input: unknown }
   | { type: "tool_call_result"; id: string; output: string; isError?: boolean }

@@ -10,6 +10,10 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 - The composer now shows whether the agent is working and how long the turn has
   taken, in the corner next to the send button.
+- Every message can now be copied. Hover one and a copy button appears beneath
+  it. Your own messages copy what you wrote. An agent's copies its reply, as the
+  Markdown it wrote, without the remarks it made along the way or the tool calls
+  and reasoning between them.
 
 ### Changed
 

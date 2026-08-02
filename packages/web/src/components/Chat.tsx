@@ -1692,6 +1692,7 @@ function Chat({
         // byte identical chunks.
         if (
           ev.type === "delta" ||
+          ev.type === "reply_start" ||
           ev.type === "thinking_start" ||
           ev.type === "thinking_delta" ||
           ev.type === "thinking_tokens" ||
