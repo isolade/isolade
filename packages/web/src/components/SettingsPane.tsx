@@ -16,7 +16,7 @@ import {
   SlidersHorizontal,
   Users,
 } from "lucide-react";
-import { useId } from "react";
+import { type MouseEvent as ReactMouseEvent, useId } from "react";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -285,6 +285,14 @@ export default function SettingsPane({
     !sidebarCollapsed && "border-l border-border",
   );
 
+  // Sections reach into the title-bar row, so the content pane needs to carry
+  // the drag events while the sidebar is visible. Capture them so a click on
+  // empty title-bar space works even when the event originates in a section's
+  // first element. useWindowDrag still ignores interactive descendants.
+  const contentTopDrag = !sidebarCollapsed && topDrag && topInset > 0 ? topDrag : undefined;
+  const isContentTitleBar = (e: ReactMouseEvent<HTMLDivElement>): boolean =>
+    e.clientY < e.currentTarget.getBoundingClientRect().top + topInset;
+
   return (
     <main className="flex-1 min-w-0 min-h-0 flex flex-col bg-muted/30">
       <Tabs
@@ -386,7 +394,15 @@ export default function SettingsPane({
         {/* The settings content is the inset card (see contentFrame above):
             bordered only where it meets chrome, with the top-left corner rounded
             when the nav is alongside it. */}
-        <div className={contentFrame}>
+        <div
+          className={contentFrame}
+          onMouseDownCapture={
+            contentTopDrag && ((e) => isContentTitleBar(e) && contentTopDrag.onMouseDown(e))
+          }
+          onDoubleClickCapture={
+            contentTopDrag && ((e) => isContentTitleBar(e) && contentTopDrag.onDoubleClick(e))
+          }
+        >
           {/* Sections reach up into the title-bar row: nothing is stacked above
               them, so whatever a section leads with lands level with the window
               controls, which float over the nav beside it. The one exception is

@@ -6,6 +6,11 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+### Fixed
+
+- On macOS, the window can now be dragged from the title-bar area while Settings
+  is open.
+
 ## [0.5.0] - 2026-08-02
 
 ### Added
