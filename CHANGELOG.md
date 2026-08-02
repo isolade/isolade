@@ -6,6 +6,8 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+## [0.5.0] - 2026-08-02
+
 ### Added
 
 - Agents can now show you images. A markdown image in a reply, like
