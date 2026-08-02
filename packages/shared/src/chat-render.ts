@@ -66,6 +66,33 @@ export const chatRenderChunkSchema = z.discriminatedUnion("kind", [
     kind: z.literal("interruption"),
     id: z.string(),
   }),
+  // A file the assistant referenced as a markdown image, snapshotted out of the
+  // VM when it was mentioned (see server/agent-images.ts). Renders no block of
+  // its own: it is the lookup entry the turn's markdown resolves a `![](…)`
+  // against, on `sourcePath` (the destination exactly as the agent wrote it)
+  // plus `offset`. One chunk per occurrence, so a path mentioned twice in a
+  // reply carries the bytes each mention was written about, even when the agent
+  // rewrote the file in between. A chunk rather than message metadata so the
+  // live stream, the resume snapshot and the compacted history all carry it
+  // through the one reducer below.
+  z.object({
+    kind: z.literal("image"),
+    sourcePath: z.string(),
+    // Where the `![` sat in the message text. What distinguishes two mentions
+    // of one path, and what the renderer matches its own node position against.
+    offset: z.number().int().nonnegative(),
+    // The stored bytes. Set together, and only on a reference that was
+    // captured. `id` present is what "this one worked" means.
+    id: z.string().optional(),
+    filename: z.string().optional(),
+    mediaType: z.string().optional(),
+    size: z.number().int().nonnegative().optional(),
+    // Why there are no bytes, on a reference that could not be captured. A
+    // failure is published like a success so the transcript can say what went
+    // wrong: without it every cause looks the same on screen, and so does a
+    // turn where nothing tried to capture at all.
+    error: z.enum(["missing", "not-an-image", "unreadable", "unreachable"]).optional(),
+  }),
   z.object({
     kind: z.literal("raw"),
     source: z.enum(["claude", "codex"]),
@@ -273,42 +300,53 @@ export function boundChatRenderChunks(chunks: ChatRenderChunk[]): ChatRenderChun
  * reducer. That keeps historical rows byte-for-byte equivalent to a turn that
  * is still streaming while avoiding delivery of thousands of token deltas on
  * every chat open.
+ *
+ * Returns whether the event was one this understands. The live client needs to
+ * know, because an event from a newer server than itself should be surfaced as
+ * a visible debug chunk rather than silently ignored, and it cannot tell the
+ * two apart from a mutation that may legitimately be a no-op. Answering here
+ * rather than having the caller test a list of type names is deliberate: that
+ * list used to live in the client, and it drifted the moment a new chunk event
+ * was added, which cost live streaming an entire feature until a reload.
+ *
+ * A recognized event carrying a malformed payload still counts as handled. It
+ * is ours to drop quietly, not something to show the reader as unknown.
  */
 export function applyChatRenderEvent(
   chunks: ChatRenderChunk[],
   toolIndex: Map<string, number>,
   type: string,
   payload: unknown,
-): void {
+): boolean {
   switch (type) {
     case "render_seed": {
       const parsed = z.array(chatRenderChunkSchema).safeParse(payload);
-      if (!parsed.success) return;
+      if (!parsed.success) return true;
       chunks.push(...parsed.data);
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
         if (chunk?.kind === "tool") toolIndex.set(chunk.id, i);
       }
-      return;
+      return true;
     }
     case "delta": {
       const text = typeof payload === "string" ? payload : String(payload ?? "");
       const last = chunks[chunks.length - 1];
       if (last?.kind === "text") last.text += text;
       else chunks.push({ kind: "text", text });
-      return;
+      return true;
     }
     case "thinking": {
       const p = payload as { text?: string } | null;
       chunks.push({ kind: "thinking", text: p?.text ?? "" });
-      return;
+      return true;
     }
     case "thinking_start": {
       const p = payload as {
         id?: string;
         provider?: "claude" | "codex";
       } | null;
-      if (!p?.id || !p.provider) return;
+      if (!p?.id || !p.provider) return true;
       const existing = chunks.findIndex((chunk) => chunk.kind === "thought" && chunk.id === p.id);
       if (existing < 0) {
         chunks.push({
@@ -319,7 +357,7 @@ export function applyChatRenderEvent(
           status: "thinking",
         });
       }
-      return;
+      return true;
     }
     case "thinking_delta": {
       const p = payload as {
@@ -327,7 +365,7 @@ export function applyChatRenderEvent(
         provider?: "claude" | "codex";
         text?: string;
       } | null;
-      if (!p?.id || !p.provider) return;
+      if (!p?.id || !p.provider) return true;
       const index = chunks.findIndex((chunk) => chunk.kind === "thought" && chunk.id === p.id);
       const text = p.text ?? "";
       if (index < 0) {
@@ -338,13 +376,13 @@ export function applyChatRenderEvent(
           text,
           status: "thinking",
         });
-        return;
+        return true;
       }
       const current = chunks[index];
       if (current?.kind === "thought") {
         chunks[index] = { ...current, text: current.text + text, status: "thinking" };
       }
-      return;
+      return true;
     }
     case "thinking_tokens": {
       const p = payload as {
@@ -353,7 +391,7 @@ export function applyChatRenderEvent(
         tokens?: number;
         tokensDelta?: number;
       } | null;
-      if (!p?.id || !p.provider) return;
+      if (!p?.id || !p.provider) return true;
       const index = chunks.findIndex((chunk) => chunk.kind === "thought" && chunk.id === p.id);
       const current = index < 0 ? undefined : chunks[index];
       const previousTokens = current?.kind === "thought" ? (current.tokens ?? 0) : 0;
@@ -373,7 +411,7 @@ export function applyChatRenderEvent(
           status: "thinking",
         });
       }
-      return;
+      return true;
     }
     case "thinking_done": {
       const p = payload as {
@@ -382,7 +420,7 @@ export function applyChatRenderEvent(
         text?: string;
         tokens?: number;
       } | null;
-      if (!p?.id || !p.provider) return;
+      if (!p?.id || !p.provider) return true;
       const index = chunks.findIndex((chunk) => chunk.kind === "thought" && chunk.id === p.id);
       const current = index < 0 ? undefined : chunks[index];
       if (current?.kind === "thought") {
@@ -402,11 +440,11 @@ export function applyChatRenderEvent(
           status: "done",
         });
       }
-      return;
+      return true;
     }
     case "tool_call_start": {
       const p = payload as { id?: string; name?: string } | null;
-      if (!p?.id) return;
+      if (!p?.id) return true;
       const index = toolIndex.get(p.id);
       if (index !== undefined) {
         const current = chunks[index];
@@ -417,7 +455,7 @@ export function applyChatRenderEvent(
         toolIndex.set(p.id, chunks.length);
         chunks.push({ kind: "tool", id: p.id, name: p.name ?? "tool", status: "running" });
       }
-      return;
+      return true;
     }
     case "tool_call_input": {
       const p = payload as {
@@ -426,7 +464,7 @@ export function applyChatRenderEvent(
         summary?: string;
         detailsAvailable?: boolean;
       } | null;
-      if (!p?.id) return;
+      if (!p?.id) return true;
       const index = toolIndex.get(p.id);
       const current = index === undefined ? undefined : chunks[index];
       if (index !== undefined && current?.kind === "tool") {
@@ -437,7 +475,7 @@ export function applyChatRenderEvent(
           ...(p.detailsAvailable ? { detailsAvailable: true } : {}),
         };
       }
-      return;
+      return true;
     }
     case "tool_call_result": {
       const p = payload as {
@@ -446,7 +484,7 @@ export function applyChatRenderEvent(
         isError?: boolean;
         detailsAvailable?: boolean;
       } | null;
-      if (!p?.id) return;
+      if (!p?.id) return true;
       const index = toolIndex.get(p.id);
       const current = index === undefined ? undefined : chunks[index];
       if (index !== undefined && current?.kind === "tool") {
@@ -458,7 +496,7 @@ export function applyChatRenderEvent(
           ...(p.detailsAvailable ? { detailsAvailable: true } : {}),
         };
       }
-      return;
+      return true;
     }
     case "api_retry": {
       const p = payload as {
@@ -479,7 +517,7 @@ export function applyChatRenderEvent(
       const last = chunks[chunks.length - 1];
       if (last?.kind === "api_retry") chunks[chunks.length - 1] = next;
       else chunks.push(next);
-      return;
+      return true;
     }
     case "steered_user_message": {
       const p = payload as {
@@ -489,7 +527,7 @@ export function applyChatRenderEvent(
         deliveryStatus?: "sending" | "confirmed" | "unknown" | "rejected";
         capabilities?: { edit?: boolean };
       } | null;
-      if (!p?.id) return;
+      if (!p?.id) return true;
       const index = chunks.findIndex((chunk) => chunk.kind === "user_message" && chunk.id === p.id);
       if (index >= 0) {
         const current = chunks[index];
@@ -512,7 +550,7 @@ export function applyChatRenderEvent(
             chunks[index] = next;
           }
         }
-        return;
+        return true;
       }
       chunks.push({
         kind: "user_message",
@@ -522,15 +560,42 @@ export function applyChatRenderEvent(
         deliveryStatus: p.deliveryStatus ?? "confirmed",
         ...(p.capabilities?.edit ? { capabilities: { edit: true } } : {}),
       });
-      return;
+      return true;
+    }
+    case "agent_image": {
+      const parsed = chatRenderChunkSchema.safeParse({ ...(payload as object), kind: "image" });
+      if (!parsed.success || parsed.data.kind !== "image") return true;
+      const image = parsed.data;
+      // Keyed on the occurrence, not the path: a reply may mention one file
+      // repeatedly, and each mention is its own snapshot. Replacing rather than
+      // appending keeps a turn resumed mid-flight from stacking duplicates.
+      const index = chunks.findIndex(
+        (chunk) => chunk.kind === "image" && chunk.offset === image.offset,
+      );
+      if (index >= 0) {
+        chunks[index] = image;
+        return true;
+      }
+      // Goes BEFORE a text run still being written, not after it. This event
+      // fires the moment a reference closes, which is mid-sentence: the agent
+      // writes `![a](x.png)` and keeps typing. Landing after the text would
+      // leave a non-text chunk last, so the next delta would start a second
+      // text chunk instead of coalescing, and the sentence would render as two
+      // paragraphs broken at whatever character the snapshot happened to
+      // interrupt. Position carries no meaning of its own here, since an image
+      // chunk renders nothing and is matched by `sourcePath` and `offset`.
+      const last = chunks[chunks.length - 1];
+      if (last?.kind === "text") chunks.splice(chunks.length - 1, 0, image);
+      else chunks.push(image);
+      return true;
     }
     case "turn_interrupted": {
       const p = payload as { id?: string } | null;
-      if (!p?.id) return;
+      if (!p?.id) return true;
       const index = chunks.findIndex((chunk) => chunk.kind === "interruption" && chunk.id === p.id);
       if (index < 0) {
         chunks.push({ kind: "interruption", id: p.id });
-        return;
+        return true;
       }
       const marker = chunks[index];
       const userIndex = chunks.findIndex(
@@ -542,7 +607,7 @@ export function applyChatRenderEvent(
       }
       if (marker?.kind === "interruption") chunks.push(marker);
       if (user?.kind === "user_message") chunks.push(user);
-      return;
+      return true;
     }
     case "raw": {
       const p = payload as { source?: "claude" | "codex"; payload?: unknown } | null;
@@ -553,7 +618,7 @@ export function applyChatRenderEvent(
         label: rawEventLabel(source, p?.payload),
         payload: p?.payload,
       });
-      return;
+      return true;
     }
     case "provider_switch": {
       const p = payload as {
@@ -569,10 +634,10 @@ export function applyChatRenderEvent(
         toProvider: p?.toProvider ?? "",
         toModel: p?.toModel ?? "",
       });
-      return;
+      return true;
     }
     default:
-      return;
+      return false;
   }
 }
 

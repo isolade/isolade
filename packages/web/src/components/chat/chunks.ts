@@ -37,10 +37,11 @@ export interface UsageState {
 export type ToolChunk = ToolRenderChunk;
 export type StreamChunk = ChatRenderChunk;
 
-// Reduce one persisted SSE event into a chunk stream, mutating in place.
-// Shared between live streaming (where the live reducer wraps it with state
-// updates + scroll calls) and mount-time replay (which just folds the array).
-// Per-id tool index passed in so callers can keep state across events.
+// Reduce one persisted SSE event into a chunk stream, mutating in place, and
+// report whether the event was one it understands. Shared between live
+// streaming (where the live reducer wraps it with state updates + scroll calls)
+// and mount-time replay (which just folds the array). Per-id tool index passed
+// in so callers can keep state across events.
 export const applyEvent = applyChatRenderEvent;
 
 /** Merge a focused full-detail response into a live reducer without replacing
@@ -158,7 +159,7 @@ function safeSliceEnd(text: string, requested: number): number {
 export function revealChunks(chunks: readonly StreamChunk[], budget: number): StreamChunk[] {
   const revealed: StreamChunk[] = [];
   let remaining = Math.max(0, budget);
-  for (const chunk of chunks) {
+  for (const [index, chunk] of chunks.entries()) {
     if (chunk.kind !== "text") {
       revealed.push(chunk);
       continue;
@@ -170,6 +171,14 @@ export function revealChunks(chunks: readonly StreamChunk[], budget: number): St
     }
     const end = safeSliceEnd(chunk.text, remaining);
     if (end > 0) revealed.push({ ...chunk, text: chunk.text.slice(0, end) });
+    // An `image` chunk is a lookup entry for markdown that has already been
+    // revealed above it, not a block of its own, and it is published after the
+    // text that cites it. Dropping it here with the rest of the tail would
+    // leave a `![](…)` that is on screen resolving against nothing until the
+    // reveal caught up, so it flashed its alt text first.
+    for (const rest of chunks.slice(index + 1)) {
+      if (rest.kind === "image") revealed.push(rest);
+    }
     return revealed;
   }
   return revealed;

@@ -8,6 +8,8 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Added
 
+- Agents can now show you images. A markdown image in a reply, like
+  `![the chart](out/chart.png)`, renders in the chat.
 - The composer now shows whether the agent is working and how long the turn has
   taken, in the corner next to the send button.
 

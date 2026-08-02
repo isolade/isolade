@@ -75,6 +75,12 @@ export function removeUploadsForInstance(instanceId: string): void {
   rmSync(uploadsInstanceDir(instanceId), { recursive: true, force: true });
 }
 
+/** Drop one upload's bytes. Every row owns its own directory, so this takes the
+ * whole thing rather than the file inside it. */
+export function removeUploadDir(instanceId: string, id: string): void {
+  rmSync(join(uploadsInstanceDir(instanceId), id), { recursive: true, force: true });
+}
+
 /** The wire view of an upload row (drops the internal association columns). */
 export function toUpload(row: UploadRow): Upload {
   return { id: row.id, filename: row.filename, mediaType: row.mediaType, size: row.size };
@@ -82,6 +88,11 @@ export function toUpload(row: UploadRow): Upload {
 
 // DB-backed store for upload metadata. Filesystem layout lives in the free
 // functions above; this owns the `uploads` table.
+//
+// The table holds both directions (see db/schema.ts). Everything below that
+// speaks of "a message's attachments" means the user's own, so it filters on
+// origin: an assistant's inline images reach the client as render chunks, and
+// must never appear in the attachment strip or be reusable as a browser upload.
 export class UploadStore {
   constructor(private readonly db: Db) {}
 
@@ -127,7 +138,13 @@ export class UploadStore {
     const candidates = this.db
       .select()
       .from(schema.uploads)
-      .where(and(eq(schema.uploads.instanceId, instanceId), inArray(schema.uploads.id, uniqueIds)))
+      .where(
+        and(
+          eq(schema.uploads.instanceId, instanceId),
+          eq(schema.uploads.origin, "user"),
+          inArray(schema.uploads.id, uniqueIds),
+        ),
+      )
       .all();
     const allowed = candidates.filter((row) => row.messageId === null || row.chatId === chatId);
     if (allowed.length === 0) return [];
@@ -170,12 +187,15 @@ export class UploadStore {
       .from(schema.messageUploads)
       .innerJoin(schema.uploads, eq(schema.messageUploads.uploadId, schema.uploads.id))
       .where(
-        messageIds
-          ? and(
-              eq(schema.messageUploads.chatId, chatId),
-              inArray(schema.messageUploads.messageId, messageIds),
-            )
-          : eq(schema.messageUploads.chatId, chatId),
+        and(
+          eq(schema.uploads.origin, "user"),
+          messageIds
+            ? and(
+                eq(schema.messageUploads.chatId, chatId),
+                inArray(schema.messageUploads.messageId, messageIds),
+              )
+            : eq(schema.messageUploads.chatId, chatId),
+        ),
       )
       .orderBy(asc(schema.messageUploads.position))
       .all();
@@ -193,10 +213,77 @@ export class UploadStore {
       .select({ upload: schema.uploads })
       .from(schema.messageUploads)
       .innerJoin(schema.uploads, eq(schema.messageUploads.uploadId, schema.uploads.id))
-      .where(eq(schema.messageUploads.messageId, messageId))
+      .where(and(eq(schema.messageUploads.messageId, messageId), eq(schema.uploads.origin, "user")))
       .orderBy(asc(schema.messageUploads.position))
       .all()
       .map(({ upload }) => toUpload(upload));
+  }
+
+  // ---- Assistant inline images (see agent-images.ts) ----
+
+  // The stored snapshot for a path whose bytes hash to `contentHash`, if this
+  // chat already has one. Identical bytes at the same path are one stored copy
+  // however many messages cite them; bytes that changed are a new row, which is
+  // what makes an overwritten screenshot a second snapshot rather than a silent
+  // substitution in the earlier message.
+  //
+  // Scoped to the chat, not the instance. Every row in this table belongs to
+  // exactly one chat, which is what lets `removeForChat` drop rows and bytes by
+  // chat id; a row shared between two chats would be deleted out from under the
+  // survivor. Two chats showing the same unchanged file therefore keep a copy
+  // each, which is the price of being able to delete either one cleanly.
+  findAgentImage(
+    instanceId: string,
+    chatId: string,
+    sourcePath: string,
+    contentHash: string,
+  ): UploadRow | undefined {
+    return this.db
+      .select()
+      .from(schema.uploads)
+      .where(
+        and(
+          eq(schema.uploads.instanceId, instanceId),
+          eq(schema.uploads.chatId, chatId),
+          eq(schema.uploads.origin, "agent"),
+          eq(schema.uploads.sourcePath, sourcePath),
+          eq(schema.uploads.contentHash, contentHash),
+        ),
+      )
+      .get();
+  }
+
+  // Record a snapshot whose bytes the caller has already written to the host
+  // store. Unlike a browser upload there is no staging step: the assistant
+  // message that cited the file is known at capture time, so the row is born
+  // claimed.
+  recordAgentImage(opts: {
+    id: string;
+    instanceId: string;
+    chatId: string;
+    messageId: string;
+    filename: string;
+    mediaType: string;
+    size: number;
+    sourcePath: string;
+    contentHash: string;
+  }): Upload {
+    this.db
+      .insert(schema.uploads)
+      .values({ ...opts, origin: "agent" })
+      .run();
+    return { id: opts.id, filename: opts.filename, mediaType: opts.mediaType, size: opts.size };
+  }
+
+  // Associate a snapshot with the message that cited it. Separate from
+  // `attach` because that one is the browser's staged-upload claim path, with
+  // its own cross-chat rules; here the association is simply a fact.
+  attachAgentImage(chatId: string, messageId: string, uploadId: string): void {
+    this.db
+      .insert(schema.messageUploads)
+      .values({ chatId, messageId, uploadId, position: 0 })
+      .onConflictDoNothing()
+      .run();
   }
 
   releaseQueuedMessage(chatId: string, messageId: string): void {
@@ -218,9 +305,34 @@ export class UploadStore {
     });
   }
 
+  // Everything a deleted chat had attached, metadata and bytes alike. The rows
+  // have to be read before they are dropped, because their instance and id are
+  // what locate the bytes: deleting only the rows would leave the files behind
+  // until the whole instance went, which for an agent's inline images is a
+  // screenshot per mention rather than the odd hand-picked attachment.
+  //
+  // Safe to delete the bytes outright because a row belongs to exactly one
+  // chat: a browser upload is claimed by the first chat that sends it (see
+  // `attach`), and a snapshot is deduped only within its own chat (see
+  // `findAgentImage`). A staged upload never sent has no chat and is left for
+  // the instance-level sweep.
   removeForChat(chatId: string): void {
+    const rows = this.db
+      .select({ instanceId: schema.uploads.instanceId, id: schema.uploads.id })
+      .from(schema.uploads)
+      .where(eq(schema.uploads.chatId, chatId))
+      .all();
     this.db.delete(schema.messageUploads).where(eq(schema.messageUploads.chatId, chatId)).run();
     this.db.delete(schema.uploads).where(eq(schema.uploads.chatId, chatId)).run();
+    for (const row of rows) {
+      try {
+        removeUploadDir(row.instanceId, row.id);
+      } catch (err) {
+        // The row is already gone, so the boot sweep is the backstop. Losing
+        // the bytes is not worth failing a delete the user asked for.
+        console.warn(`[uploads] failed to remove ${row.id} for deleted chat ${chatId}:`, err);
+      }
+    }
   }
 }
 

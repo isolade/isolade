@@ -18,10 +18,14 @@ import {
   TriangleAlert,
   Wrench,
 } from "lucide-react";
-import { memo, useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { uploadUrl } from "@/lib/api";
 import type { Upload } from "@/lib/contracts";
 import { findChatModel, summarizeChatToolInput } from "@/lib/contracts";
 import { cn } from "@/lib/utils";
+import type { ResolvedMarkdownImage } from "../Markdown";
+import { MarkdownImageContext, MarkdownImageOffset } from "../Markdown";
 import StreamingMarkdown from "../StreamingMarkdown";
 import type { StreamChunk, ToolChunk } from "./chunks";
 import { UserMessage } from "./UserMessage";
@@ -482,6 +486,56 @@ export const ProviderSwitchDivider = memo(function ProviderSwitchDivider({
   );
 });
 
+/**
+ * Makes a turn's snapshotted images resolvable by the markdown inside it.
+ *
+ * Wraps the whole assistant body rather than just the chunk list, so the
+ * pure-text path (a turn whose render collapsed to its message content) is
+ * covered by the same rules. An assistant message always has a resolver, even
+ * an empty one: that is what stops a remote `![](https://…)` written inside a
+ * VM from being fetched by the app just because it scrolled into view.
+ */
+export const MarkdownImageScope = memo(function MarkdownImageScope({
+  chunks,
+  instanceId,
+  children,
+}: {
+  chunks: StreamChunk[] | undefined;
+  instanceId: string;
+  children: ReactNode;
+}) {
+  const resolve = useMemo(() => {
+    const bySource = new Map<string, { offset: number; image: ResolvedMarkdownImage }[]>();
+    for (const chunk of chunks ?? []) {
+      if (chunk.kind !== "image") continue;
+      const occurrences = bySource.get(chunk.sourcePath) ?? [];
+      occurrences.push({
+        offset: chunk.offset,
+        image: chunk.id
+          ? { status: "ready", href: uploadUrl(instanceId, chunk.id) }
+          : { status: "failed", reason: chunk.error ?? "unreadable" },
+      });
+      bySource.set(chunk.sourcePath, occurrences);
+    }
+    return (source: string, offset: number) => {
+      const occurrences = bySource.get(source);
+      if (!occurrences?.length) return null;
+      // Nearest rather than exact. The two offsets agree on settled text, but a
+      // turn still streaming can be parsed from a lightly rewritten source (an
+      // unclosed link shown as plain text, a fence closed for display), which
+      // shifts node positions by a few characters. Nearest lands on the right
+      // occurrence throughout, where an exact match would drop the image for a
+      // frame, and it costs nothing when a path appears only once.
+      let best = occurrences[0] as { offset: number; image: ResolvedMarkdownImage };
+      for (const candidate of occurrences) {
+        if (Math.abs(candidate.offset - offset) < Math.abs(best.offset - offset)) best = candidate;
+      }
+      return best.image;
+    };
+  }, [chunks, instanceId]);
+  return <MarkdownImageContext.Provider value={resolve}>{children}</MarkdownImageContext.Provider>;
+});
+
 // Memoized so a re-render of Chat (e.g. a tab switch flipping `visible`, or a
 // streaming delta on a *different* message) doesn't reconcile every past
 // turn's tool/thinking/markdown blocks. History chunk arrays keep a stable
@@ -520,17 +574,26 @@ export const StreamView = memo(function StreamView({
   onSubmitUserMessageEdit?: (id: string, content: string, uploads: Upload[]) => void;
   onRequestToolDetails?: (toolId: string) => void;
 }) {
+  // Advanced as the text chunks are laid out below, in order.
+  let textOffset = 0;
   return (
     <>
       {chunks.map((chunk, i) => {
         if (chunk.kind === "text") {
+          // Snapshots are recorded against offsets into the reply as a whole,
+          // which is every text chunk end to end (a tool call between two runs
+          // of prose starts a new one). So each chunk sits at the total length
+          // of the ones before it.
+          const base = textOffset;
+          textOffset += chunk.text.length;
           return (
-            <StreamingMarkdown
-              key={i}
-              content={chunk.text}
-              streaming={streaming && i === chunks.length - 1}
-              cacheKey={cacheScope === undefined ? undefined : `${cacheScope}:text:${i}`}
-            />
+            <MarkdownImageOffset key={i} delta={base}>
+              <StreamingMarkdown
+                content={chunk.text}
+                streaming={streaming && i === chunks.length - 1}
+                cacheKey={cacheScope === undefined ? undefined : `${cacheScope}:text:${i}`}
+              />
+            </MarkdownImageOffset>
           );
         }
         if (chunk.kind === "tool") {
@@ -569,6 +632,9 @@ export const StreamView = memo(function StreamView({
         // The provider-switch divider renders above the triggering user message
         // (see MessageRow.switchAbove), not inside the assistant bubble.
         if (chunk.kind === "provider_switch") return null;
+        // An image chunk has no block of its own: it is what MarkdownImageScope
+        // resolves the text above it against, and it appears inline there.
+        if (chunk.kind === "image") return null;
         if (!showDebug) return null;
         if (chunk.kind === "thinking") return <ThinkingBlock key={i} text={chunk.text} />;
         return (

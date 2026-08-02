@@ -1,7 +1,7 @@
 import { memo, useRef } from "react";
 import { retainMarkdownCache } from "@/lib/markdown-cache";
 import { type MarkdownFragment, StreamingMarkdownCache } from "@/lib/streaming-markdown";
-import Markdown from "./Markdown";
+import Markdown, { MarkdownImageOffset } from "./Markdown";
 
 const MarkdownFragmentView = memo(
   function MarkdownFragmentView({
@@ -24,7 +24,11 @@ const MarkdownFragmentView = memo(
         data-last-fragment={last ? "true" : "false"}
         style={{ display: "contents" }}
       >
-        <Markdown content={fragment.content} />
+        {/* Node positions inside this fragment count from its own start, so
+            rebase them onto the text as a whole for any image lookup. */}
+        <MarkdownImageOffset delta={fragment.start}>
+          <Markdown content={fragment.content} />
+        </MarkdownImageOffset>
       </div>
     );
   },

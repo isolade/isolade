@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { randomUUID } from "crypto";
 import { asc, eq, sql } from "drizzle-orm";
 import { createDb, schema } from "../src/db";
+import { UploadStore } from "../src/uploads";
 
 // Build a database at the version-2 shape for the tables migration 3 touches
 // (chats without active_leaf_id, chat_messages without the tree columns), so
@@ -206,7 +207,7 @@ describe("db migrations 3-16 (tree, attachments, rendering, layout, queue, provi
       const raw = new Database(path);
       const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(17);
+      expect(version).toBe(18);
       const messageColumns = raw
         .query("SELECT name FROM pragma_table_info('chat_messages')")
         .all() as Array<{ name: string }>;
@@ -388,7 +389,7 @@ describe("db migration 7 (panel layout)", () => {
       const version = (
         new Database(path).query("PRAGMA user_version").get() as { user_version: number }
       ).user_version;
-      expect(version).toBe(17);
+      expect(version).toBe(18);
     } finally {
       rmSync(path, { force: true });
       rmSync(`${path}-wal`, { force: true });
@@ -502,7 +503,7 @@ describe("db migration 10 (per-message provider identity)", () => {
       const raw = new Database(path);
       const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(17);
+      expect(version).toBe(18);
       const switchesTable = raw
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'provider_switches'")
         .get() as { name: string } | null;
@@ -582,7 +583,7 @@ describe("db migration 12 (per-chat usage attribution)", () => {
       const raw = new Database(path);
       const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(17);
+      expect(version).toBe(18);
       const index = raw
         .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
         .get("idx_usage_events_chat") as { name: string } | null;
@@ -657,7 +658,7 @@ describe("db migration 16 (turn timing)", () => {
       const raw = new Database(path);
       const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(17);
+      expect(version).toBe(18);
       raw.close();
     } finally {
       rmSync(path, { force: true });
@@ -729,8 +730,91 @@ describe("db migration 17 (weighted token column)", () => {
       expect(column).toBeNull();
       const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(17);
+      expect(version).toBe(18);
       raw.close();
+    } finally {
+      rmSync(path, { force: true });
+      rmSync(`${path}-wal`, { force: true });
+      rmSync(`${path}-shm`, { force: true });
+    }
+  });
+});
+
+// A v17 database whose uploads table predates the assistant's own images, so
+// every row in it is a browser upload and the origin column does not exist yet.
+function seedV17Db(path: string): { uploadId: string; instanceId: string } {
+  const sqlite = new Database(path);
+  sqlite.run(`
+    CREATE TABLE uploads (
+      id TEXT PRIMARY KEY,
+      instance_id TEXT NOT NULL,
+      chat_id TEXT,
+      message_id TEXT,
+      filename TEXT NOT NULL,
+      media_type TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch())
+    )
+  `);
+  const uploadId = randomUUID();
+  const instanceId = randomUUID();
+  sqlite.run(
+    `INSERT INTO uploads (id, instance_id, filename, media_type, size)
+     VALUES (?, ?, 'diagram.png', 'image/png', 4096)`,
+    [uploadId, instanceId],
+  );
+  sqlite.run(`PRAGMA user_version = 17`);
+  sqlite.close();
+  return { uploadId, instanceId };
+}
+
+describe("db migration 18 (assistant inline images)", () => {
+  it("keeps existing attachments as the user uploads they are", () => {
+    const path = join(tmpdir(), `isolade-mig18-${randomUUID()}.db`);
+    try {
+      const { uploadId } = seedV17Db(path);
+      const db = createDb(path);
+
+      // The column default is exactly right for every pre-existing row, so the
+      // ALTER backfills them with no pass of its own. Getting this wrong would
+      // hide a user's attachments from their own message.
+      const existing = db
+        .select()
+        .from(schema.uploads)
+        .where(eq(schema.uploads.id, uploadId))
+        .get();
+      expect(existing?.origin).toBe("user");
+      expect(existing?.filename).toBe("diagram.png");
+      expect(existing?.sourcePath).toBeNull();
+      expect(existing?.contentHash).toBeNull();
+
+      const raw = new Database(path);
+      const version = (raw.query("PRAGMA user_version").get() as { user_version: number })
+        .user_version;
+      expect(version).toBe(18);
+      raw.close();
+    } finally {
+      rmSync(path, { force: true });
+      rmSync(`${path}-wal`, { force: true });
+      rmSync(`${path}-shm`, { force: true });
+    }
+  });
+
+  it("keeps a migrated database's attachments visible to the store", () => {
+    const path = join(tmpdir(), `isolade-mig18-store-${randomUUID()}.db`);
+    try {
+      const { uploadId, instanceId } = seedV17Db(path);
+      const db = createDb(path);
+      const store = new UploadStore(db);
+      const chatId = randomUUID();
+      const messageId = randomUUID();
+
+      // The origin filter added alongside the column must not strand rows that
+      // were written before it existed.
+      expect(store.attach(instanceId, chatId, messageId, [uploadId]).map((r) => r.id)).toEqual([
+        uploadId,
+      ]);
+      expect(store.listForMessage(messageId).map((u) => u.id)).toEqual([uploadId]);
     } finally {
       rmSync(path, { force: true });
       rmSync(`${path}-wal`, { force: true });

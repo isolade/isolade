@@ -1687,32 +1687,20 @@ function Chat({
           );
           return;
         }
-        // Chunk-producing events flow through the shared reducer so
-        // mount-time replay and live streaming end up with byte-for-
-        // byte identical chunks.
-        if (
-          ev.type === "delta" ||
-          ev.type === "thinking_start" ||
-          ev.type === "thinking_delta" ||
-          ev.type === "thinking_tokens" ||
-          ev.type === "thinking_done" ||
-          ev.type === "thinking" ||
-          ev.type === "tool_call_start" ||
-          ev.type === "tool_call_input" ||
-          ev.type === "tool_call_result" ||
-          ev.type === "steered_user_message" ||
-          ev.type === "turn_interrupted" ||
-          ev.type === "render_seed" ||
-          ev.type === "api_retry" ||
-          ev.type === "provider_switch" ||
-          ev.type === "raw"
-        ) {
-          const debugReplay = debugReplayRef.current;
-          if (debugReplay?.messageId === streamingMessageIdRef.current) {
-            debugReplay.events.push(ev);
-          }
-          if ((ev.type === "thinking" || ev.type === "raw") && !showDebugRef.current) return;
-          applyEvent(chunks, toolIndex, ev.type, ev.payload);
+        // Reasoning and raw frames are debug-only, and are dropped before the
+        // reducer sees them rather than after, so a turn with debug off does
+        // not accumulate chunks nobody will look at.
+        if ((ev.type === "thinking" || ev.type === "raw") && !showDebugRef.current) return;
+        const debugReplay = debugReplayRef.current;
+        if (debugReplay?.messageId === streamingMessageIdRef.current) {
+          debugReplay.events.push(ev);
+        }
+        // Chunk-producing events flow through the shared reducer so mount-time
+        // replay and live streaming end up with byte-for-byte identical chunks.
+        // The reducer reports whether it recognized the event, which is the
+        // only reliable way to ask: a list of type names kept out here is a
+        // list that drifts from the switch it mirrors.
+        if (applyEvent(chunks, toolIndex, ev.type, ev.payload)) {
           // Only the answer is paced out at a readable cadence. Reasoning
           // arrives whole, like a tool call: its block is collapsed until the
           // reader opens it, so there is nothing on screen for a character
@@ -1725,8 +1713,9 @@ function Chat({
           }
           return;
         }
-        // Unknown event type, so surface as a raw debug chunk rather
-        // than dropping silently.
+        // An event this build has never heard of, which is what a server newer
+        // than the app looks like. Surfaced as a raw debug chunk rather than
+        // dropped silently.
         console.warn(`[chat] unknown SSE event '${ev.type}'`, ev.payload);
         chunks.push({
           kind: "raw",

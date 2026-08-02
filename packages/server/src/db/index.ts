@@ -104,7 +104,7 @@ function defaultDbPath(): string {
  * gone, and nothing else ever read it. Dropped rather than left unwritten so a
  * column that would only ever hold zeros does not outlive its one reader.
  */
-const SCHEMA_VERSION = 17;
+const SCHEMA_VERSION = 18;
 
 /**
  * The complete, current schema: one CREATE TABLE (plus indexes) per table in
@@ -395,10 +395,12 @@ function createSchema(sqlite: Database): void {
     )
   `);
 
-  // Files attached to a user message. Bytes live on the host and are
-  // bind-mounted into the instance's VM (see uploads.ts). message_id is null
-  // while an upload is staged (uploaded but not yet sent) and set when it's
-  // attached to a sent message.
+  // Files attached to a message. Bytes live on the host (see uploads.ts).
+  // origin "user" is a browser upload, also written into the instance's VM;
+  // message_id is null while it is staged (uploaded but not yet sent) and set
+  // when it's attached to a sent message. origin "agent" is a snapshot of a
+  // file the assistant referenced as a markdown image, copied out of the VM
+  // when it was mentioned (see agent-images.ts).
   sqlite.run(`
     CREATE TABLE IF NOT EXISTS uploads (
       id TEXT PRIMARY KEY,
@@ -408,12 +410,18 @@ function createSchema(sqlite: Database): void {
       filename TEXT NOT NULL,
       media_type TEXT NOT NULL,
       size INTEGER NOT NULL,
+      origin TEXT NOT NULL DEFAULT 'user',
+      source_path TEXT,
+      content_hash TEXT,
       created_at INTEGER NOT NULL DEFAULT (unixepoch())
     )
   `);
   sqlite.run(`
     CREATE INDEX IF NOT EXISTS idx_uploads_message ON uploads (message_id)
   `);
+  // `idx_uploads_source` is deliberately NOT created here, for the same reason
+  // as `idx_usage_events_chat` above: the columns it indexes arrive with
+  // migration 18, which has not run yet on a database from an older build.
   sqlite.run(`
     CREATE TABLE IF NOT EXISTS message_uploads (
       chat_id TEXT NOT NULL,
@@ -749,6 +757,22 @@ const migrations: Record<number, (sqlite: Database) => void> = {
       sqlite.run(`ALTER TABLE usage_events DROP COLUMN effective_input_tokens`);
     }
   },
+  18: (sqlite) => {
+    const has = (column: string) =>
+      sqlite.query(`SELECT name FROM pragma_table_info('uploads') WHERE name = ?`).get(column) !=
+      null;
+    // Every existing row is a browser upload, which is exactly what the column
+    // default says, so the ALTER backfills them correctly on its own.
+    if (!has("origin")) {
+      sqlite.run(`ALTER TABLE uploads ADD COLUMN origin TEXT NOT NULL DEFAULT 'user'`);
+    }
+    if (!has("source_path")) sqlite.run(`ALTER TABLE uploads ADD COLUMN source_path TEXT`);
+    if (!has("content_hash")) sqlite.run(`ALTER TABLE uploads ADD COLUMN content_hash TEXT`);
+    sqlite.run(`
+      CREATE INDEX IF NOT EXISTS idx_uploads_source
+      ON uploads (instance_id, source_path, content_hash)
+    `);
+  },
 };
 
 function migrate(sqlite: Database): void {
@@ -781,6 +805,10 @@ function migrate(sqlite: Database): void {
     `);
     sqlite.run(`
       CREATE INDEX IF NOT EXISTS idx_usage_events_chat ON usage_events (chat_id)
+    `);
+    sqlite.run(`
+      CREATE INDEX IF NOT EXISTS idx_uploads_source
+      ON uploads (instance_id, source_path, content_hash)
     `);
     sqlite.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     return;

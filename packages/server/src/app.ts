@@ -515,6 +515,7 @@ export function createApp(dbPathOrOpts?: string | CreateAppOptions) {
     chatManager,
     providerSwitchStore,
     uploadStore,
+    sandboxClient,
     instances,
     profiles,
     titleVmManager,
