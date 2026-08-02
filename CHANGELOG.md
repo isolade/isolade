@@ -37,6 +37,11 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Fixed
 
+- A terminal tab no longer comes back garbled after being off screen, where
+  recalling a command with the up arrow used to paint over the prompt.
+
+### Fixed
+
 - A chat no longer runs out of disk part-way through a large checkout or build.
   Its writable disk was 4 GiB and is now 64 GiB, which the host still only
   fills as the chat writes to it. Chats created before this keep the size they
