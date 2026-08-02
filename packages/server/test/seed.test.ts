@@ -127,6 +127,22 @@ describe("importSeedProfiles", () => {
     expect(db.select().from(schema.profiles).all()).toHaveLength(1);
   });
 
+  test("ISOLADE_SEED=0 skips the import even with a bundle mounted", () => {
+    const bundle = stageBundle();
+    process.env.ISOLADE_SEED = "0";
+    try {
+      importSeedProfiles(db, bundle);
+    } finally {
+      delete process.env.ISOLADE_SEED;
+    }
+    expect(db.select().from(schema.profiles).all()).toEqual([]);
+    expect(existsSync(profileDir("acme"))).toBe(false);
+
+    // Unset again, the same bundle imports normally.
+    importSeedProfiles(db, bundle);
+    expect(profileRow("acme")?.image).toBe("ref-1");
+  });
+
   test("an unparseable manifest aborts the import without throwing", () => {
     const bundle = stageBundle();
     writeFileSync(join(bundle, "manifest.json"), "not json");

@@ -624,6 +624,26 @@ dockerfile = "./Dockerfile"
     await server.instances.remove(instance.id);
   });
 
+  it("ISOLADE_SEED=0 creates the dev VM with no seed at all", async () => {
+    keepSets = [];
+    process.env.ISOLADE_SEED = "0";
+    const instance = await server.instances
+      .create({ profileId: "dev", title: "unseeded" })
+      .finally(() => {
+        delete process.env.ISOLADE_SEED;
+      });
+
+    // The exposed sandbox still wires up; only the seeding half is off.
+    const opts = createdVms.at(-1)!;
+    expect(opts.env?.[CLIENT_ID_ENV]).toBe(instance.id);
+    expect(opts.volumes?.some((v) => v.guestPath === SEED_MOUNT)).toBe(false);
+    expect(instance.seedProfiles).toBeNull();
+    expect(keepSets).toEqual([]);
+    expect(existsSync(seedStagingDir(instance.id))).toBe(false);
+
+    await server.instances.remove(instance.id);
+  });
+
   it("ignores seed_profiles without expose_sandbox", async () => {
     keepSets = [];
     const instance = await server.instances.create({ profileId: "no-expose", title: "plain" });

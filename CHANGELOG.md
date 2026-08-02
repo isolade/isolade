@@ -6,6 +6,13 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+### Added
+
+- Profile seeding into nested instances can now be switched off with
+  `ISOLADE_SEED=0`. Instances created with it set ignore their profile's
+  `seed_profiles` and start with no profiles at all, which is what you want when
+  working on the first-run experience inside Isolade.
+
 ### Changed
 
 - The model picker now offers only models you can actually run.
