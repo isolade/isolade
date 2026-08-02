@@ -69,12 +69,19 @@ export const TOOLCHAINS: readonly Toolchain[] = [
     id: "rust",
     label: "Rust",
     blurb: "rustup, with the stable toolchain",
-    packages: ["build-essential"],
+    // curl and ca-certificates because rustup is fetched over HTTPS and neither
+    // base ships them, so the step below would fail on a bare image.
+    packages: ["build-essential", "ca-certificates", "curl"],
     extra: [
-      "# rustup rather than Ubuntu's package, which lags a long way behind.",
-      "RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path \\",
-      "    && echo 'export PATH=\"$HOME/.cargo/bin:$PATH\"' >> /etc/profile.d/rust.sh",
-      'ENV PATH="/root/.cargo/bin:$PATH"',
+      "# rustup rather than the distribution's package, which lags a long way",
+      "# behind. It installs to a shared location rather than a home directory,",
+      "# and stays writable, because cargo writes to CARGO_HOME as it builds and",
+      "# the agent is not the user that ran the install.",
+      "ENV RUSTUP_HOME=/usr/local/rustup \\",
+      "    CARGO_HOME=/usr/local/cargo \\",
+      '    PATH="/usr/local/cargo/bin:$PATH"',
+      "RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal \\",
+      '    && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"',
     ].join("\n"),
   },
   {
@@ -135,7 +142,22 @@ export function composeDockerfile(
   const chosen = TOOLCHAINS.filter((t) => toolchainIds.includes(t.id));
   const packages = [...new Set(chosen.flatMap((t) => t.packages ?? []))].toSorted();
 
-  const lines = [`FROM ${imageFor(base)}`, ""];
+  // The workspace directories are made here rather than left to COPY, which
+  // creates a missing destination owned by root: the files inside would belong
+  // to the agent while the directory holding them would not, so it could edit
+  // what is there and create nothing new.
+  const workspaceDirs = ["/workspace", ...repoNames.map((name) => `/workspace/${name}`)];
+  const lines = [
+    `FROM ${imageFor(base)}`,
+    "",
+    "# The user the agent runs as, owning the workspace it works in. Isolade's",
+    "# own layer creates this user if a Dockerfile has not, but creating it here",
+    "# is what lets the repositories below arrive belonging to it.",
+    "RUN useradd --user-group --create-home --shell /bin/bash agent \\",
+    `    && mkdir -p ${workspaceDirs.join(" ")} \\`,
+    `    && chown agent:agent ${workspaceDirs.join(" ")}`,
+    "",
+  ];
 
   if (packages.length) {
     lines.push(
@@ -157,7 +179,7 @@ export function composeDockerfile(
       "# needed, which is one line to add above once you know.",
     );
     for (const name of repoNames) {
-      lines.push(`COPY --from=${name} . /workspace/${name}`);
+      lines.push(`COPY --from=${name} --chown=agent:agent . /workspace/${name}`);
     }
     lines.push("");
   }

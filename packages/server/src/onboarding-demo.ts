@@ -18,6 +18,12 @@ export const DEMO_PROFILE_NAME = "Excalidraw";
 
 export const DEMO_REPO_NAME = "excalidraw";
 
+/** Uid the demo's agent user takes. Fixed rather than left to `useradd`, so the
+ *  yarn cache mount below can be owned by it: BuildKit gives a cache mount to
+ *  root unless told otherwise, and the install runs as the agent. 1001 because
+ *  `node:22` already has `node` at 1000. */
+const DEMO_AGENT_UID = 1001;
+
 /**
  * Unlike the scaffolds in `onboarding.ts`, this installs dependencies at build
  * time. The reasoning differs because the situation does: a scaffold faces a
@@ -28,19 +34,36 @@ export const DEMO_REPO_NAME = "excalidraw";
  * the demo rather than before it.
  *
  * Yarn's cache is a cache mount, so a rebuild re-uses the download.
+ *
+ * The agent user is created here rather than left to the agent layer, because
+ * only a Dockerfile that has one can `COPY --chown` and install as it. The
+ * alternative is a tree and a `node_modules` owned by root, which the agent
+ * cannot edit and Vite cannot write its cache into, so the demo would build and
+ * then fail at the thing it exists to show.
  */
 export const DEMO_DOCKERFILE = `# syntax=docker/dockerfile:1
 # The excalidraw demo environment. Yours to edit like any other profile.
 FROM node:22
 
+# The user the agent runs as. It owns the checkout and everything installed into
+# it, so an agent can edit the source and the dev server can write its caches.
+# The directory is made here rather than left to WORKDIR, which would create it
+# owned by root and leave yarn unable to write node_modules into it.
+RUN useradd --uid ${DEMO_AGENT_UID} --user-group --create-home --shell /bin/bash agent \\
+    && mkdir -p /workspace/${DEMO_REPO_NAME} \\
+    && chown agent:agent /workspace /workspace/${DEMO_REPO_NAME}
+
 WORKDIR /workspace/${DEMO_REPO_NAME}
-COPY --from=${DEMO_REPO_NAME} . .
+COPY --from=${DEMO_REPO_NAME} --chown=agent:agent . .
+
+USER agent
 
 # Dependencies are installed here rather than on first boot, so an instance
 # starts with a working tree ready to run. The cache mount means a rebuild
 # re-uses the download instead of fetching the tree again.
-RUN --mount=type=cache,target=/usr/local/share/.cache/yarn \\
-    yarn install --frozen-lockfile --network-timeout 600000
+RUN --mount=type=cache,target=/home/agent/.cache/yarn,uid=${DEMO_AGENT_UID},gid=${DEMO_AGENT_UID} \\
+    yarn install --frozen-lockfile --network-timeout 600000 \\
+        --cache-folder /home/agent/.cache/yarn
 `;
 
 export const DEMO_CONFIG_FORM: ProfileConfigForm = {
