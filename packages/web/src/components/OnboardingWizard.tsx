@@ -356,11 +356,6 @@ export function CustomStep({
                   onChange={(e) => setSource(i, e.target.value)}
                   className="min-w-0 flex-1 rounded-md border border-border bg-transparent px-2.5 py-1.5 font-mono text-xs outline-none focus:border-primary"
                 />
-                {source.trim() && (
-                  <span className="shrink-0 font-mono text-muted-foreground text-xs">
-                    {names[filled.indexOf(source.trim())]}
-                  </span>
-                )}
                 <Button
                   size="icon-xs"
                   variant="ghost"
