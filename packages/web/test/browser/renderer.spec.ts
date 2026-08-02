@@ -1960,6 +1960,49 @@ test.describe("message renderer browser gate", () => {
     expect(cost!.x + cost!.width).toBeLessThanOrEqual(times!.x + 1);
   });
 
+  // Where a spinner's rotation lives decides whether it turns in place. Rotating
+  // the <svg> element pivots on its CSS box, and that box rarely lands on a
+  // whole device pixel: the turn clock's spinner moves by one 7.2px monospace
+  // character the moment a turn crosses a minute, and in WKWebView the leftover
+  // fraction became the radius of a wobble. Rotating the geometry inside the
+  // icon pivots on the viewBox centre, which no pixel grid can shift.
+  test("spins a lucide icon around its own centre rather than its CSS box", async ({ page }) => {
+    await page.goto("/test/browser/harness/index.html");
+    const spun = await page.evaluate(() => {
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("viewBox", "0 0 24 24");
+      svg.setAttribute("class", "size-3 animate-spin");
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      // lucide's Loader2 arc.
+      path.setAttribute("d", "M21 12a9 9 0 1 1-6.219-8.56");
+      svg.append(path);
+      document.body.append(svg);
+      const read = (el: Element) => {
+        const style = getComputedStyle(el);
+        return {
+          animationName: style.animationName,
+          animationDuration: style.animationDuration,
+          transformOrigin: style.transformOrigin,
+          overflow: style.overflow,
+        };
+      };
+      const measured = { element: read(svg), geometry: read(path) };
+      svg.remove();
+      return measured;
+    });
+    expect(spun.element.animationName).toBe("none");
+    // Named rather than merely present: the rotation is handed the same theme
+    // animation the utility uses, so a renamed one has to fail here instead of
+    // leaving every spinner in the app sitting still.
+    expect(spun.geometry.animationName).toBe("spin");
+    expect(spun.geometry.animationDuration).toBe("1s");
+    // The centre of the 24x24 user space every lucide icon is drawn around.
+    expect(spun.geometry.transformOrigin).toBe("12px 12px");
+    // The viewport stays put while its contents turn, so it must not clip what
+    // an icon like RefreshCw reaches on the diagonal.
+    expect(spun.element.overflow).toBe("visible");
+  });
+
   // The model controls stay interactive mid-turn and their edits are local until
   // the next send flushes them. Fast mode has to ride that flush like model and
   // effort do: left out of it, the bolt went on showing a premium rate the server

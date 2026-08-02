@@ -106,13 +106,23 @@ const ThinkingBlock = memo(function ThinkingBlock({ text }: { text: string }) {
   );
 });
 
+// Count a figure up toward `target`. Mounting does not animate: a block that
+// arrives with tokens already spent (opening a chat that has been working while
+// you were looking at another one) paints that figure straight away, rather
+// than racing up to it from zero as if the thinking were starting now. Only
+// growth this block sees happen counts up.
 function useAnimatedInteger(target: number | undefined): number | undefined {
-  const [displayed, setDisplayed] = useState(target === undefined ? undefined : 0);
-  const displayedRef = useRef(displayed ?? 0);
+  const [displayed, setDisplayed] = useState(target);
+  const displayedRef = useRef(target ?? 0);
   useEffect(() => {
     if (target === undefined) {
       displayedRef.current = 0;
       setDisplayed(undefined);
+      return;
+    }
+    const from = displayedRef.current;
+    if (from === target) {
+      setDisplayed(target);
       return;
     }
     if (globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
@@ -120,7 +130,6 @@ function useAnimatedInteger(target: number | undefined): number | undefined {
       setDisplayed(target);
       return;
     }
-    const from = displayedRef.current;
     const startedAt = performance.now();
     const duration = Math.min(700, Math.max(260, Math.abs(target - from) * 0.8));
     let frame = 0;

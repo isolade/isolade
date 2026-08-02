@@ -299,6 +299,10 @@ describe("MessageHistory", () => {
     expect(html).toContain('data-thinking-provider="claude"');
     expect(html).toContain('data-thinking-status="done"');
     expect(html).toContain("I checked the relevant state before answering.");
+    // Painted on the first frame: opening a chat that has been thinking shows
+    // the tokens it has spent, not a count-up from zero. Only growth seen while
+    // the block is mounted animates.
+    expect(html).toContain("768 tokens");
   });
 
   it("renders Codex summary emphasis as plain text", () => {
