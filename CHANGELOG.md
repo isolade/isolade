@@ -24,6 +24,10 @@ _Changes landed on `main` that haven't shipped in a release yet._
   the tokens behind it (and, on Claude, what is holding them) on hover. Fast mode
   and the context figures used to be buried in the model picker, and the new-chat
   box gets the bolt too.
+- A turn's thinking now stays collapsed until you open it, so a long stretch of
+  reasoning no longer pushes the answer down the pane.
+- A new chat appears in the sidebar as soon as you send, under the start of your
+  message, and takes its generated title once that lands.
 
 ### Removed
 
@@ -31,41 +35,19 @@ _Changes landed on `main` that haven't shipped in a release yet._
   the composer. The providers do not publish how a turn counts against a plan, so
   the figure was guesswork. The windows they do report are unaffected.
 
-### Changed
-
-- A turn's thinking now stays collapsed until you open it, so a long stretch of
-  reasoning no longer pushes the answer down the pane.
-
 ### Fixed
 
 - Claude chats no longer pay for an extra Haiku call on their first message,
   spent on a session title Isolade never used.
-
-### Fixed
-
 - A terminal tab no longer comes back garbled after being off screen, where
   recalling a command with the up arrow used to paint over the prompt.
-
-### Fixed
-
 - A chat no longer runs out of disk part-way through a large checkout or build.
   Its writable disk was 4 GiB and is now 64 GiB, which the host still only
   fills as the chat writes to it. Chats created before this keep the size they
   were made with.
-
-### Fixed
-
 - Opening a chat that has been thinking while you were elsewhere now shows the
   thinking tokens it has already spent, instead of counting them up from zero as
   if the turn were starting.
-
-### Changed
-
-- A new chat appears in the sidebar as soon as you send, under the start of your
-  message, and takes its generated title once that lands.
-
-### Fixed
-
 - The model picker no longer ends up naming the raw model id with an empty menu
   behind it. It happened when the window opened before Isolade's server was
   answering, and lasted the rest of the session. The picker now reads the model
