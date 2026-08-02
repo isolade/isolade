@@ -8,6 +8,10 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Added
 
+- Profile seeding into nested instances can now be switched off with
+  `ISOLADE_SEED=0`. Instances created with it set ignore their profile's
+  `seed_profiles` and start with no profiles at all, which is what you want when
+  working on the first-run experience inside Isolade.
 - Isolade now installs on Linux distributions that `apt` does not serve. Releases
   carry the same payload as a plain tarball beside the `.deb`, and the installer
   reaches for it when there is no `apt`, unpacking into `/opt/isolade` and wiring
