@@ -19,7 +19,7 @@ import {
 } from "microsandbox";
 import { createServer } from "net";
 import { cpus as hostCpus, totalmem } from "os";
-import { join } from "path";
+import { join, normalize } from "path";
 
 // microsandbox exports PatchBuilder as a value (a constructor alias), not a
 // class declaration, so it can't be used directly in type position. The
@@ -97,6 +97,7 @@ export interface PortBinding {
 
 const TTYD_CONNECT_TIMEOUT_MS = 10_000;
 const MIB = 1024 * 1024;
+const TMPFS_MAX_SIZE_MIB = 8 * 1024;
 
 // Where the PTY relay script is written in the guest (mirrors port-forwarder's
 // RELAY_PATH). One script per VM backs every terminal's ttyd reach.
@@ -116,6 +117,15 @@ function getHostMemoryMib() {
 
 export function getVmMemoryMib(hostMemoryMib = getHostMemoryMib()) {
   return Math.max(1, Math.floor((hostMemoryMib * 3) / 4));
+}
+
+// Keep /tmp proportional to the VM's memory so smaller hosts cannot lose an
+// excessive share of RAM to temporary files. Unlike microsandbox's 512 MiB
+// default, the higher ceiling leaves enough room for package extraction and
+// compiler intermediates on normal developer machines. A tmpfs size is only a
+// limit: pages consume guest/host memory when written, not when mounted.
+export function getVmTmpfsMib(vmMemoryMib: number) {
+  return Math.min(TMPFS_MAX_SIZE_MIB, Math.max(1, Math.floor(vmMemoryMib / 4)));
 }
 
 // Logical size of the writable overlay upper (upper.ext4), which is what
@@ -408,6 +418,7 @@ export class VmManager {
     let patchesMs = 0;
     let patchedHomePaths: string[] = [];
     const networkPolicy = buildNetworkPolicy(opts.hostPorts ?? [], opts.network);
+    const vmMemoryMib = getVmMemoryMib();
     let builder = Sandbox.builder(name)
       // imageWith (not image) so the overlay upper is sized explicitly. See
       // UPPER_SIZE_MIB; the default would be 4 GiB.
@@ -423,7 +434,7 @@ export class VmManager {
       // below host-sized to avoid microVM memory-map failures on large hosts
       // while still leaving enough room for builds, language servers, and agents.
       .cpus(getHostCpuCount())
-      .memory(getVmMemoryMib())
+      .memory(vmMemoryMib)
       .envs(env)
       .workdir("/workspace")
       .replace()
@@ -435,6 +446,16 @@ export class VmManager {
         patchesMs += performance.now() - t;
         return out;
       });
+
+    // microsandbox otherwise supplies a 512 MiB /tmp tmpfs for OCI images.
+    // Override it with our proportional limit, while preserving a profile's
+    // explicit /tmp bind mount when one was requested.
+    const hasExplicitTmpMount = (opts.volumes ?? []).some(
+      (vol) => normalize(resolveGuestHomePath(vol.guestPath, home)) === "/tmp",
+    );
+    if (!hasExplicitTmpMount) {
+      builder = builder.volume("/tmp", (m) => m.tmpfs().size(getVmTmpfsMib(vmMemoryMib)));
+    }
 
     for (const [hostStr, guestPort] of Object.entries(portsMap)) {
       builder = builder.port(Number(hostStr), guestPort);

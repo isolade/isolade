@@ -6,6 +6,7 @@ import {
   collectVolumeParentDirs,
   getHostTimezone,
   getVmMemoryMib,
+  getVmTmpfsMib,
   isInsecureRegistryRef,
 } from "../src/vms";
 
@@ -84,6 +85,19 @@ describe("VM sizing", () => {
   it("keeps a positive memory size for tiny host values", () => {
     expect(getVmMemoryMib(1)).toBe(1);
     expect(getVmMemoryMib(2)).toBe(1);
+  });
+
+  it("gives /tmp one quarter of VM memory up to 8 GiB", () => {
+    expect(getVmTmpfsMib(2048)).toBe(512);
+    expect(getVmTmpfsMib(6144)).toBe(1536);
+    expect(getVmTmpfsMib(12288)).toBe(3072);
+    expect(getVmTmpfsMib(24576)).toBe(6144);
+    expect(getVmTmpfsMib(49152)).toBe(8192);
+  });
+
+  it("keeps a positive /tmp size for tiny VM memory values", () => {
+    expect(getVmTmpfsMib(1)).toBe(1);
+    expect(getVmTmpfsMib(3)).toBe(1);
   });
 });
 

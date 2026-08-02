@@ -10,6 +10,8 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 - On macOS, the window can now be dragged from the title-bar area while Settings
   is open.
+- Newly created chats now give `/tmp` up to one quarter of their memory, capped
+  at 8 GiB, instead of limiting it to 512 MiB.
 
 ## [0.5.0] - 2026-08-02
 
