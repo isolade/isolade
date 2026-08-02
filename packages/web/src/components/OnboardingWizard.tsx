@@ -4,6 +4,7 @@ import {
   composeDockerfile,
   DEFAULT_BASE,
   repoNamesFor,
+  TOOL_CATEGORIES,
   TOOLCHAINS,
 } from "@isolade/shared";
 import { AlertTriangle, Check, FolderGit2, Loader2, Plus, Sparkles, Trash2 } from "lucide-react";
@@ -403,37 +404,46 @@ export function CustomStep({
               </button>
             ))}
           </div>
-          <div className="grid grid-cols-2 gap-1.5">
-            {TOOLCHAINS.map((tool) => {
-              const on = tools.includes(tool.id);
-              return (
-                <label
-                  key={tool.id}
-                  className={cn(
-                    "flex cursor-pointer items-start gap-2 rounded-md border p-2 text-xs",
-                    on ? "border-primary bg-primary/5" : "border-border",
-                  )}
-                >
-                  <input
-                    type="checkbox"
-                    checked={on}
-                    className="mt-0.5"
-                    onChange={() =>
-                      setTools((prev) =>
-                        prev.includes(tool.id)
-                          ? prev.filter((x) => x !== tool.id)
-                          : [...prev, tool.id],
-                      )
-                    }
-                  />
-                  <span className="flex flex-col gap-0.5">
-                    <span className="font-medium">{tool.label}</span>
-                    <span className="text-muted-foreground">{tool.blurb}</span>
-                  </span>
-                </label>
-              );
-            })}
-          </div>
+          {/* By family rather than one long grid: someone here for a database
+              can skip four headings instead of reading every checkbox. */}
+          {TOOL_CATEGORIES.map((category) => (
+            <div key={category.id} className="space-y-1.5 pt-1">
+              <span className="text-[11px] text-muted-foreground uppercase tracking-wide">
+                {category.label}
+              </span>
+              <div className="grid grid-cols-2 gap-1.5">
+                {TOOLCHAINS.filter((tool) => tool.category === category.id).map((tool) => {
+                  const on = tools.includes(tool.id);
+                  return (
+                    <label
+                      key={tool.id}
+                      className={cn(
+                        "flex cursor-pointer items-start gap-2 rounded-md border p-2 text-xs",
+                        on ? "border-primary bg-primary/5" : "border-border",
+                      )}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={on}
+                        className="mt-0.5"
+                        onChange={() =>
+                          setTools((prev) =>
+                            prev.includes(tool.id)
+                              ? prev.filter((x) => x !== tool.id)
+                              : [...prev, tool.id],
+                          )
+                        }
+                      />
+                      <span className="flex flex-col gap-0.5">
+                        <span className="font-medium">{tool.label}</span>
+                        <span className="text-muted-foreground">{tool.blurb}</span>
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
         </div>
 
         <div className="flex items-center gap-3">

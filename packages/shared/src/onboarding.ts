@@ -30,44 +30,106 @@ function imageFor(base: BaseId): string {
   return (BASES.find((b) => b.id === base) ?? BASES[0]).image;
 }
 
+/** The families the offer is grouped into, in the order the wizard shows them.
+ *  A list this long is a wall to read flat. Grouped, someone here for a
+ *  database stops reading at the headings that are not it. */
+export const TOOL_CATEGORIES = [
+  { id: "language", label: "Languages and runtimes" },
+  { id: "build", label: "Building and testing" },
+  { id: "data", label: "Databases" },
+  { id: "media", label: "Documents and media" },
+  { id: "cli", label: "Command line" },
+] as const;
+
+export type ToolCategoryId = (typeof TOOL_CATEGORIES)[number]["id"];
+
 export interface Toolchain {
   id: string;
   label: string;
+  category: ToolCategoryId;
   /** Shown beside the label, for choosing without knowing the packages. */
   blurb: string;
   /** apt packages, folded into one install step with every other choice. */
   packages?: readonly string[];
   /** Anything that is not an apt package, appended as its own step. */
   extra?: string;
+  /** A comment under the install step, for a choice whose packages are only
+   *  half the story and the rest is the agent's to do inside the VM. */
+  note?: string;
 }
 
 /**
- * What the wizard offers. Node is deliberately absent: the agent layer installs
- * Node LTS into every image already, so offering it would suggest a choice that
- * does not exist.
+ * What the wizard offers, grouped by `TOOL_CATEGORIES` and in that order, so the
+ * file it composes reads in the same order as the questions that produced it.
+ *
+ * Two rules decide what can be here at all:
+ *
+ * Every apt package is spelled the same on both bases, so choosing Debian never
+ * silently changes what a checkbox installs. That rules out things people do ask
+ * for: Ubuntu 24.04 has no real `chromium` (a snap stub) and dropped `awscli`,
+ * and neither base packages kubectl or terraform. Those stay a Dockerfile edit
+ * rather than a checkbox that works on one base and fails on the other.
+ *
+ * Nothing may depend on Node, npm or the agent CLIs. This file is the base stage
+ * and the layer carrying those is appended after it, so an `npx` here would run
+ * before there is a Node to run it. Node is not on offer either: every image gets
+ * Node LTS regardless, so a checkbox for it would suggest a choice that does not
+ * exist.
  */
 export const TOOLCHAINS: readonly Toolchain[] = [
   {
     id: "python",
     label: "Python",
-    blurb: "python3, pip and venv",
-    packages: ["python3", "python3-pip", "python3-venv"],
+    category: "language",
+    blurb: "python3, pip, venv and headers",
+    // The headers so that a pip install of something with a C extension can
+    // compile, given the build tools below, rather than stopping on a missing
+    // `Python.h` from inside a wheel nobody here wrote.
+    packages: ["python3", "python3-dev", "python3-pip", "python3-venv"],
+  },
+  {
+    id: "uv",
+    label: "uv",
+    category: "language",
+    blurb: "Astral's Python package manager",
+    packages: ["ca-certificates", "curl"],
+    extra: [
+      "# uv is a single binary, installed to a shared prefix rather than to the",
+      "# home of the user that ran the build. It can fetch its own Python, so it",
+      "# is useful with or without the Python above.",
+      "RUN curl -fsSL https://astral.sh/uv/install.sh \\",
+      "    | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh",
+    ].join("\n"),
+  },
+  {
+    id: "bun",
+    label: "Bun",
+    category: "language",
+    blurb: "the Bun runtime, beside the Node every image has",
+    // unzip because the installer unpacks a zip, and neither base ships it.
+    packages: ["ca-certificates", "curl", "unzip"],
+    extra: [
+      "# Bun installs beside the Node the agent layer adds, for a project that",
+      "# wants it. Its package cache lives under BUN_INSTALL, so that directory",
+      "# has to stay writable by the agent, who is not the user installing here.",
+      "ENV BUN_INSTALL=/usr/local/bun \\",
+      '    PATH="/usr/local/bun/bin:$PATH"',
+      "RUN curl -fsSL https://bun.sh/install | bash \\",
+      '    && mkdir -p "$BUN_INSTALL/install/cache" \\',
+      '    && chmod -R a+w "$BUN_INSTALL/install"',
+    ].join("\n"),
   },
   {
     id: "go",
     label: "Go",
-    blurb: "the Go toolchain from Ubuntu",
+    category: "language",
+    blurb: "the distribution's Go toolchain",
     packages: ["golang-go"],
-  },
-  {
-    id: "java",
-    label: "Java",
-    blurb: "the default JDK",
-    packages: ["default-jdk"],
   },
   {
     id: "rust",
     label: "Rust",
+    category: "language",
     blurb: "rustup, with the stable toolchain",
     // curl and ca-certificates because rustup is fetched over HTTPS and neither
     // base ships them, so the step below would fail on a bare image.
@@ -85,10 +147,126 @@ export const TOOLCHAINS: readonly Toolchain[] = [
     ].join("\n"),
   },
   {
+    id: "java",
+    label: "Java",
+    category: "language",
+    blurb: "the default JDK and Maven",
+    packages: ["default-jdk", "maven"],
+  },
+  {
+    id: "ruby",
+    label: "Ruby",
+    category: "language",
+    blurb: "Ruby with Bundler and headers",
+    packages: ["ruby-bundler", "ruby-full"],
+  },
+  {
+    id: "php",
+    label: "PHP",
+    category: "language",
+    blurb: "PHP's command line and Composer",
+    packages: ["composer", "php-cli"],
+  },
+  {
     id: "build",
     label: "Build tools",
+    category: "build",
     blurb: "gcc, make and pkg-config, for native extensions",
     packages: ["build-essential", "pkg-config"],
+  },
+  {
+    id: "cmake",
+    label: "CMake",
+    category: "build",
+    blurb: "cmake and ninja, for C and C++ projects",
+    packages: ["build-essential", "cmake", "ninja-build"],
+  },
+  {
+    id: "browser",
+    label: "Browser testing",
+    category: "build",
+    blurb: "the libraries a headless Chromium needs",
+    // The dependency set Playwright and Puppeteer both want. Spelled out rather
+    // than left to `playwright install --with-deps`, which reads the release
+    // name and refuses one it has not heard of.
+    packages: [
+      "fonts-liberation",
+      "libasound2t64",
+      "libatk-bridge2.0-0t64",
+      "libatk1.0-0t64",
+      "libatspi2.0-0t64",
+      "libcups2t64",
+      "libdbus-1-3",
+      "libdrm2",
+      "libgbm1",
+      "libnspr4",
+      "libnss3",
+      "libpango-1.0-0",
+      "libxcomposite1",
+      "libxdamage1",
+      "libxfixes3",
+      "libxkbcommon0",
+      "libxrandr2",
+    ],
+    note: [
+      "# The browser itself is not baked in. Playwright and Puppeteer download",
+      "# one into the agent's home in seconds, and only the shared libraries it",
+      "# needs take root to install, which is why those are the part that is here.",
+    ].join("\n"),
+  },
+  {
+    id: "sqlite",
+    label: "SQLite",
+    category: "data",
+    blurb: "the sqlite3 command line",
+    packages: ["sqlite3"],
+  },
+  {
+    id: "dbclients",
+    label: "Database clients",
+    category: "data",
+    blurb: "psql, mysql and redis-cli",
+    // Clients rather than servers. A server in the image is a service nothing
+    // starts, since the agent is not root inside the VM, and a database is
+    // usually somewhere else anyway.
+    packages: ["default-mysql-client", "postgresql-client", "redis-tools"],
+  },
+  {
+    id: "docs",
+    label: "Docs and diagrams",
+    category: "media",
+    blurb: "Pandoc and Graphviz",
+    packages: ["graphviz", "pandoc"],
+  },
+  {
+    id: "media",
+    label: "Media tools",
+    category: "media",
+    blurb: "ffmpeg and ImageMagick",
+    packages: ["ffmpeg", "imagemagick"],
+  },
+  {
+    id: "shell",
+    label: "Shell utilities",
+    category: "cli",
+    blurb: "jq, tmux, vim and the basics a slim base leaves out",
+    // A minimal base has no `ps`, no `less` and no `file`, which an agent finds
+    // out one failed command at a time.
+    packages: [
+      "file",
+      "htop",
+      "iputils-ping",
+      "jq",
+      "less",
+      "procps",
+      "rsync",
+      "tmux",
+      "tree",
+      "unzip",
+      "vim",
+      "wget",
+      "zip",
+    ],
   },
 ];
 
@@ -123,6 +301,24 @@ export function repoNamesFor(sources: readonly string[]): string[] {
     seen.set(base, count + 1);
     return count === 0 ? base : `${base}-${count + 1}`;
   });
+}
+
+/**
+ * Package names across as few lines as fit a narrow column. Two choices can add
+ * up to thirty packages, and one line of thirty is a horizontal scrollbar in the
+ * preview beside the questions.
+ */
+function wrapPackages(packages: readonly string[], width = 60): string[] {
+  const lines: string[] = [];
+  for (const name of packages) {
+    const last = lines.at(-1);
+    if (last !== undefined && last.length + 1 + name.length <= width) {
+      lines[lines.length - 1] = `${last} ${name}`;
+    } else {
+      lines.push(name);
+    }
+  }
+  return lines;
 }
 
 /**
@@ -163,10 +359,13 @@ export function composeDockerfile(
     lines.push(
       "RUN apt-get update \\",
       "    && apt-get install -y --no-install-recommends \\",
-      `        ${packages.join(" ")} \\`,
+      ...wrapPackages(packages).map((line) => `        ${line} \\`),
       "    && rm -rf /var/lib/apt/lists/*",
       "",
     );
+    for (const tool of chosen) {
+      if (tool.note) lines.push(tool.note, "");
+    }
   }
   for (const tool of chosen) {
     if (tool.extra) lines.push(tool.extra, "");

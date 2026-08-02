@@ -9,6 +9,7 @@ import {
   repoFormSchema,
   repoNamesFor,
   repoPathCheckSchema,
+  TOOL_CATEGORIES,
   TOOLCHAINS,
 } from "@isolade/shared";
 import { DEMO_CONFIG_FORM, DEMO_DOCKERFILE, DEMO_REPO_NAME } from "../src/onboarding-demo";
@@ -142,6 +143,81 @@ describe("composing the Dockerfile", () => {
     // Node arrives in every image regardless, so offering it would suggest a
     // choice that does not exist.
     expect(TOOLCHAINS.map((t) => t.id)).not.toContain("node");
+  });
+
+  it("asks apt for a shared package once, however many choices want it", () => {
+    // Build tools, CMake and Rust all want build-essential, and apt naming it
+    // three times is a Dockerfile nobody would have written by hand.
+    const df = composeDockerfile([], ["build", "cmake", "rust"]);
+    expect(df.match(/build-essential/g)).toHaveLength(1);
+  });
+
+  it("wraps the packages rather than emitting one very long line", () => {
+    // The preview sits in a narrow column beside the questions, and two choices
+    // can add up to thirty packages.
+    const df = composeDockerfile([], ["shell", "browser"]);
+    const packageLines = df.split("\n").filter((line) => line.startsWith("        "));
+    expect(packageLines.length).toBeGreaterThan(1);
+    for (const line of packageLines) expect(line.length).toBeLessThanOrEqual(72);
+  });
+});
+
+describe("what is on offer", () => {
+  it("puts every toolchain in a category, and every category to use", () => {
+    const categories = TOOL_CATEGORIES.map((c) => c.id);
+    for (const tool of TOOLCHAINS) expect(categories).toContain(tool.category);
+    for (const id of categories) expect(TOOLCHAINS.some((t) => t.category === id)).toBe(true);
+  });
+
+  it("names each toolchain once", () => {
+    const ids = TOOLCHAINS.map((t) => t.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("keeps the list in category order, so the file reads like the questions", () => {
+    const order = TOOL_CATEGORIES.map((c) => c.id);
+    const seen = TOOLCHAINS.map((t) => order.indexOf(t.category));
+    expect(seen).toEqual([...seen].toSorted((a, b) => a - b));
+  });
+
+  it("depends on nothing the agent layer adds after this file", () => {
+    // The scaffold is the base stage and the agent layer is appended to it, so
+    // an npx or a corepack here would run before there is a Node to run it.
+    for (const tool of TOOLCHAINS) {
+      const steps = (tool.extra ?? "")
+        .split("\n")
+        .filter((line) => !line.trim().startsWith("#"))
+        .join("\n");
+      expect(steps).not.toMatch(/\b(corepack|node|npm|npx)\b/);
+    }
+  });
+
+  it("brings its own curl for anything it fetches over the network", () => {
+    // Neither base ships curl or ca-certificates, so a step that downloads an
+    // installer has to ask for them itself.
+    for (const tool of TOOLCHAINS) {
+      const fetches = (tool.extra ?? "").split("\n").some((line) => line.includes("curl -"));
+      if (!fetches) continue;
+      expect(tool.packages ?? []).toContain("ca-certificates");
+      expect(tool.packages ?? []).toContain("curl");
+    }
+  });
+
+  it("only notes what the packages beside the note leave out", () => {
+    // A note is emitted under the install step, so a toolchain with a note and
+    // nothing to install would have it quietly dropped.
+    for (const tool of TOOLCHAINS) {
+      if (tool.note) expect(tool.packages ?? []).not.toHaveLength(0);
+    }
+  });
+
+  it("installs into a shared prefix, never into a home directory", () => {
+    // The user that runs the build is not the user that runs the agent, so a
+    // toolchain under /root is one the agent cannot see.
+    for (const tool of TOOLCHAINS) {
+      expect(tool.extra ?? "").not.toContain("/root");
+      expect(tool.extra ?? "").not.toContain("$HOME");
+    }
   });
 });
 

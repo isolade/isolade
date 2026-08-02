@@ -49,6 +49,12 @@ describe("setting up your own", () => {
     expect(html).toContain("Python");
   });
 
+  it("groups what it offers, since a list this long does not scan flat", () => {
+    expect(html).toContain("Languages and runtimes");
+    expect(html).toContain("Databases");
+    expect(html).toContain("Command line");
+  });
+
   it("offers a base to build on", () => {
     expect(html).toContain("Ubuntu 24.04");
     expect(html).toContain("Debian 13");
