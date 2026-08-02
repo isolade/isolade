@@ -79,8 +79,8 @@ describe("composing the Dockerfile", () => {
 
   it("copies each repository to its own place under /workspace", () => {
     const df = composeDockerfile(["api", "web"], []);
-    expect(df).toContain("COPY --from=api . /workspace/api");
-    expect(df).toContain("COPY --from=web . /workspace/web");
+    expect(df).toContain("COPY --from=api --chown=agent:agent . /workspace/api");
+    expect(df).toContain("COPY --from=web --chown=agent:agent . /workspace/web");
   });
 
   it("installs only what was asked for, in one apt step", () => {
@@ -91,22 +91,51 @@ describe("composing the Dockerfile", () => {
     expect(df.match(/apt-get install/g)).toHaveLength(1);
   });
 
+  it("creates the user the agent runs as, before anything is copied", () => {
+    // Isolade's layer creates one if a Dockerfile has not, but only a Dockerfile
+    // that has the user can COPY --chown to it, and a repository the agent
+    // cannot write to is not a workspace.
+    const df = composeDockerfile(["app"], []);
+    expect(df).toContain("useradd");
+    expect(df.indexOf("useradd")).toBeLessThan(df.indexOf("COPY"));
+    expect(df).toContain("COPY --from=app --chown=agent:agent . /workspace/app");
+  });
+
+  it("installs a toolchain where any user can reach it", () => {
+    // rustup into a home directory is a toolchain the agent cannot run, and
+    // fetching it needs a curl neither base ships.
+    const df = composeDockerfile([], ["rust"]);
+    expect(df).toContain("curl");
+    expect(df).not.toContain("/root/.cargo");
+    expect(df).toContain("CARGO_HOME=/usr/local/cargo");
+  });
+
   it("does not install project dependencies", () => {
     // Same reasoning as ever: how to install them is the project's business, and
     // a failed install is a failed first build. The agent can do it and say what
     // it needed.
     const df = composeDockerfile(["app"], []);
-    const instructions = df
-      .split("\n")
-      .filter((l: string) => l.trim() && !l.trim().startsWith("#"))
-      .map((l: string) => l.trim().split(/\s+/)[0]);
-    expect(instructions).toEqual(["FROM", "COPY"]);
+    // Instructions only: blank lines, comments, and the continuation lines of a
+    // multi-line RUN are not any of them.
+    let continued = false;
+    const instructions: string[] = [];
+    for (const line of df.split("\n")) {
+      const text = line.trim();
+      const isContinuation = continued;
+      continued = text.endsWith("\\");
+      if (!text || text.startsWith("#") || isContinuation) continue;
+      instructions.push(text.split(/\s+/)[0]!);
+    }
+    // The one RUN is the agent user, which is the image's business rather than
+    // the project's.
+    expect(instructions).toEqual(["FROM", "RUN", "COPY"]);
+    expect(df).not.toMatch(/npm|yarn|pnpm|pip install|bundle install|go mod/);
   });
 
   it("adds the steps a toolchain needs beyond apt", () => {
     const df = composeDockerfile([], ["rust"]);
     expect(df).toContain("rustup");
-    expect(df).toContain("ENV PATH=");
+    expect(df).toContain('PATH="/usr/local/cargo/bin:$PATH"');
   });
 
   it("offers no toolchain the agent layer already installs", () => {
@@ -167,7 +196,7 @@ describe("the routes", () => {
 describe("the demo definition", () => {
   it("names the repo its Dockerfile copies from", () => {
     expect(DEMO_CONFIG_FORM.repos[0]?.name).toBe(DEMO_REPO_NAME);
-    expect(DEMO_DOCKERFILE).toContain(`COPY --from=${DEMO_REPO_NAME} . .`);
+    expect(DEMO_DOCKERFILE).toContain(`COPY --from=${DEMO_REPO_NAME} --chown=agent:agent . .`);
     expect(repoFormSchema.safeParse(DEMO_CONFIG_FORM.repos[0]).success).toBe(true);
   });
 
@@ -175,6 +204,18 @@ describe("the demo definition", () => {
     // The demo is a definition we own and test, so it can do what a scaffold for
     // an unknown project must not: run something that can fail.
     expect(DEMO_DOCKERFILE).toContain("yarn install");
-    expect(composeDockerfile(["app"], [])).not.toContain("RUN");
+  });
+
+  it("hands the checkout to the user the agent runs as", () => {
+    // Root-owned sources build fine and then fail at the only thing the demo is
+    // for, since the agent cannot edit them and Vite cannot write its cache.
+    expect(DEMO_DOCKERFILE).toContain("useradd");
+    expect(DEMO_DOCKERFILE).toContain("--chown=agent:agent");
+    expect(DEMO_DOCKERFILE).toContain("USER agent");
+    // The install runs as that user, so what it writes belongs to it too, which
+    // is why the cache mount has to be handed over as well.
+    const install = DEMO_DOCKERFILE.slice(DEMO_DOCKERFILE.indexOf("USER agent"));
+    expect(install).toContain("yarn install");
+    expect(install).toMatch(/type=cache[^\n]*uid=\d+,gid=\d+/);
   });
 });
