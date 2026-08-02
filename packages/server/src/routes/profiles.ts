@@ -244,9 +244,10 @@ export function createProfilesRouter(ctx: RouteContext): Hono {
   app.delete("/api/profiles/:id", (c) => {
     const id = c.req.param("id");
     if (!profiles.get(id)) return c.json({ error: "not found" }, 404);
-    if (profiles.list().length <= 1) {
-      return c.json({ error: "cannot delete the only profile" }, 400);
-    }
+    // The last profile can go too. An install with none is an ordinary state:
+    // the workspace and the profile-scoped settings sections say so, and the
+    // guided setup makes the next one.
+    //
     // Tear down the profile's warm titling VM before its credential dir is
     // removed. Fire-and-forget: deletion shouldn't block on VM teardown.
     void titleVmManager.disposeForProfile(id);

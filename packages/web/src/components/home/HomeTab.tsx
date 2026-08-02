@@ -1,4 +1,6 @@
+import { Wand2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { PromptDialog } from "@/components/ui/prompt-dialog";
 import { TITLE_BAR_WITH_INSET_HEIGHT } from "@/lib/tauri";
@@ -35,6 +37,8 @@ import type {
   Terminal,
 } from "../../lib/contracts";
 import { CHAT_MODELS, DEFAULT_CHAT_MODEL_ID, provisionalTitle } from "../../lib/contracts";
+import { useOnboarding } from "../../lib/useOnboarding";
+import OnboardingWizard from "../OnboardingWizard";
 import SettingsPane, {
   DEFAULT_SETTINGS_SECTION,
   isSettingsSection,
@@ -241,13 +245,20 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
   // A profile IS the buildable unit, so its id is all we need. Switching
   // profiles happens in Settings and reloads the app, so this is fetched once.
   const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
+  // Null activeProfileId means two different things, and the workspace has to
+  // tell them apart: still resolving, or an install that genuinely has no
+  // profile. Only the second gets an empty state.
+  const [profilesResolved, setProfilesResolved] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
         const profileId = await resolveActiveProfileId();
-        if (!cancelled) setActiveProfileId(profileId);
+        if (!cancelled) {
+          setActiveProfileId(profileId);
+          setProfilesResolved(true);
+        }
       } catch {
         // Profiles API unavailable (e.g. demo mock), so leave unscoped.
       }
@@ -1011,6 +1022,12 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
 
   const settingsOpen = settingsSection !== null;
 
+  // Guided setup. It opens itself on an install with nothing to work with, and
+  // is otherwise opened from the Profiles section. Bumping the counter after it
+  // creates a profile re-runs the predicate against reality.
+  const [profilesVersion, setProfilesVersion] = useState(0);
+  const onboarding = useOnboarding(profilesVersion);
+
   // Only draw an edge where the content meets another surface. Window edges
   // stay flush and unframed; internal panel boundaries are owned by the panel
   // tree itself.
@@ -1066,13 +1083,33 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
                     aria-hidden
                     {...windowDrag}
                   />
-                  <NewInstancePane
-                    profileId={activeProfileId}
-                    chatModels={chatModels}
-                    modelOverrides={modelOverrides}
-                    defaultModelId={DEFAULT_CHAT_MODEL_ID}
-                    onSubmit={handleSubmitDraft}
-                  />
+                  {profilesResolved && !activeProfileId ? (
+                    // A composer with no profile behind it can take a message
+                    // and do nothing with it, since there is no environment to
+                    // create an instance in. Say that instead.
+                    <div className="flex flex-1 items-center justify-center p-6">
+                      <div className="max-w-sm space-y-3 text-center">
+                        <p className="font-medium text-sm">No environment yet</p>
+                        <p className="text-muted-foreground text-xs">
+                          Agents run in a VM built from a profile, and there are none. Guided setup
+                          takes the repositories you want to work on, asks what the image should
+                          carry, and builds it.
+                        </p>
+                        <Button size="sm" onClick={onboarding.open_}>
+                          <Wand2 className="size-3.5" />
+                          Guided setup
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <NewInstancePane
+                      profileId={activeProfileId}
+                      chatModels={chatModels}
+                      modelOverrides={modelOverrides}
+                      defaultModelId={DEFAULT_CHAT_MODEL_ID}
+                      onSubmit={handleSubmitDraft}
+                    />
+                  )}
                 </div>
               )}
 
@@ -1126,9 +1163,27 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
               activeProfileId={activeProfileId}
               chatModels={chatModels}
               onSectionChange={setSettingsSection}
+              onOpenWizard={onboarding.open_}
               sidebarCollapsed={sidebarCollapsed}
               topInset={TITLE_BAR_WITH_INSET_HEIGHT}
               topDrag={windowDrag}
+            />
+          </div>
+        )}
+
+        {/* Guided setup. On a fresh install the card is what the window holds,
+            so the backdrop is opaque: a scrim would imply something underneath
+            being withheld, and there is nothing there. Opened deliberately it
+            is a modal over real work, so that gets the scrim. */}
+        {onboarding.open && (
+          <div
+            className={`absolute inset-0 z-50 flex items-center justify-center p-6 ${
+              onboarding.self ? "bg-background" : "bg-black/50"
+            }`}
+          >
+            <OnboardingWizard
+              onClose={onboarding.close}
+              onProfileCreated={() => setProfilesVersion((v) => v + 1)}
             />
           </div>
         )}
