@@ -40,6 +40,31 @@ describe("applyChatRenderEvent", () => {
     ]);
   });
 
+  it("records where one utterance ends and the next begins", () => {
+    const chunks: ChatRenderChunk[] = [];
+    const toolIndex = new Map<string, number>();
+    const apply = (type: string, payload?: unknown) =>
+      applyChatRenderEvent(chunks, toolIndex, type, payload ?? null);
+
+    // Nothing precedes the turn's first utterance, so it needs no marker.
+    apply("reply_start");
+    apply("delta", "I'll run the tests.");
+    apply("tool_call_start", { id: "t1", name: "Bash" });
+    apply("tool_call_result", { id: "t1", output: "ok" });
+    // Two in a row would mean an utterance that never said anything, which is
+    // not a division worth recording.
+    apply("reply_start");
+    apply("reply_start");
+    apply("delta", "They pass.");
+
+    expect(chunks).toEqual([
+      { kind: "text", text: "I'll run the tests." },
+      { kind: "tool", id: "t1", name: "Bash", status: "done", output: "ok", isError: undefined },
+      { kind: "reply_start" },
+      { kind: "text", text: "They pass." },
+    ]);
+  });
+
   it("folds a snapshotted image into a lookup chunk for the occurrence", () => {
     const chunks: ChatRenderChunk[] = [{ kind: "text", text: "Here it is: ![a chart](out/a.png)" }];
     applyChatRenderEvent(chunks, new Map(), "agent_image", {
@@ -153,6 +178,7 @@ describe("what the reducer claims to handle", () => {
   // the switch belongs here too.
   const SAMPLES: Record<string, unknown> = {
     delta: "text",
+    reply_start: null,
     thinking: { text: "reasoning" },
     thinking_start: { id: "r1", provider: "codex" },
     thinking_delta: { id: "r1", provider: "codex", text: "x" },
@@ -186,6 +212,9 @@ describe("what the reducer claims to handle", () => {
       if (type === "tool_call_input" || type === "tool_call_result") {
         applyChatRenderEvent(chunks, new Map(), "tool_call_start", SAMPLES.tool_call_start);
       }
+      // `reply_start` only marks a boundary between two utterances, so it needs
+      // one before it to be a boundary of.
+      if (type === "reply_start") applyChatRenderEvent(chunks, new Map(), "delta", "said");
       const toolIndex = new Map<string, number>();
       for (const [index, chunk] of chunks.entries()) {
         if (chunk.kind === "tool") toolIndex.set(chunk.id, index);

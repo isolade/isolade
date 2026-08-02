@@ -312,3 +312,32 @@ test.describe("attached PR badge", () => {
     await expect(visible(page, '[data-demo="pr-badge"]')).toHaveCount(0);
   });
 });
+
+test.describe("model picker", () => {
+  // The picker is fed from the catalog compiled into the bundle, so nothing it
+  // shows waits on the server. Before that it was fed only by
+  // GET /api/chat/models, and a page that loaded while the server was still
+  // coming up (or restarting under a dev edit) got a picker naming the raw model
+  // id with an empty menu behind it, for the rest of the session: the fetch runs
+  // once and swallows its error.
+  test("names the model and offers the catalog with the server unreachable", async ({ page }) => {
+    await page.goto(
+      "/test/browser/harness/index.html?workspace=1&instances=1&chatsPerInstance=1" +
+        "&messages=4&catalogDown=1",
+    );
+    await page.waitForFunction(
+      () => document.documentElement.dataset.workspaceHarnessReady === "true",
+    );
+    await pressRow(page, 0);
+
+    const picker = page.locator(
+      '[data-retained-instance][aria-hidden="false"] [data-demo="model-picker"]',
+    );
+    await expect(picker).toHaveText("Sonnet 5 High");
+
+    await picker.click();
+    const menu = page.locator('[data-slot="dropdown-menu-content"]');
+    await expect(menu.locator('[data-demo="model-claude-opus-5"]')).toHaveText("Opus 5");
+    expect(await menu.locator('[data-demo^="model-"]').count()).toBeGreaterThan(1);
+  });
+});

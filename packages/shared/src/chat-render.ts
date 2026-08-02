@@ -19,6 +19,13 @@ export const tokenUsageSchema = z.object({
 
 export const chatRenderChunkSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("text"), text: z.string() }),
+  // Where one thing the agent said ends and the next begins. Both providers
+  // draw this line themselves — Claude opens a text content block, codex starts
+  // an agentMessage item — and a turn crosses it several times: a remark before
+  // a command, then the answer once the command is done. Nothing renders it;
+  // it exists so the text either side is known to be two utterances rather than
+  // one, which is what lets the UI pick out the reply on its own.
+  z.object({ kind: z.literal("reply_start") }),
   z.object({
     kind: z.literal("thought"),
     id: z.string(),
@@ -334,6 +341,15 @@ export function applyChatRenderEvent(
       const last = chunks[chunks.length - 1];
       if (last?.kind === "text") last.text += text;
       else chunks.push({ kind: "text", text });
+      return true;
+    }
+    case "reply_start": {
+      // A marker only earns its place between two utterances. At the head of a
+      // turn there is nothing before it to separate, and a second one in a row
+      // would mean an utterance that never said anything.
+      const last = chunks[chunks.length - 1];
+      if (!last || last.kind === "reply_start") return true;
+      chunks.push({ kind: "reply_start" });
       return true;
     }
     case "thinking": {

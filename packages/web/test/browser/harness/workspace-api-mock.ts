@@ -18,6 +18,12 @@ export interface WorkspaceFixtureOptions {
   /** Attached pull requests per instance, for the tab strip's PR badge. */
   prsPerInstance: number;
   profileId: string;
+  /**
+   * Fail `GET /api/chat/models`, standing in for a page that loads while the
+   * server isn't answering yet (the app window opens before its sidecar
+   * listens, and the sidecar restarts on every backend edit in dev).
+   */
+  catalogDown?: boolean;
 }
 
 // Attached PRs for one instance, cycling through the states the badge draws so a
@@ -190,6 +196,7 @@ export function installWorkspaceApiMock(options: WorkspaceFixtureOptions): Works
     split,
     prsPerInstance,
     profileId,
+    catalogDown = false,
   } = options;
   const now = new Date();
   const instances: Instance[] = Array.from({ length: instanceCount }, (_, index) => ({
@@ -296,7 +303,11 @@ export function installWorkspaceApiMock(options: WorkspaceFixtureOptions): Works
     if (path === "/api/profiles") return json(serialized.profiles);
     if (path === "/api/instances" && method === "GET") return json(serialized.instances());
     if (path === "/api/chats") return json(serialized.chats);
-    if (path === "/api/chat/models") return json(serialized.models);
+    if (path === "/api/chat/models") {
+      return catalogDown
+        ? Promise.reject(new TypeError("Failed to fetch"))
+        : json(serialized.models);
+    }
     if (path === "/api/update") return json(serialized.update);
     if (/^\/api\/profiles\/[^/]+\/models$/.test(path)) return json({});
     if (/^\/api\/profiles\/[^/]+\/(activate|deactivate)$/.test(path)) return json({ ok: true });

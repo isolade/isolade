@@ -227,6 +227,67 @@ test.describe("message renderer browser gate", () => {
     await expect.poll(async () => (await body.boundingBox())?.height ?? 0).toBeGreaterThan(0);
   });
 
+  // What lands on the clipboard is the source text, not the rendered page: an
+  // answer copies as the Markdown the agent wrote, headings and asterisks
+  // intact, and a question copies as the words the reader typed. And only the
+  // agent's last utterance: the turn below talked its way to the answer through
+  // a remark and a command, neither of which the reader asked for.
+  test("copies a message as the text behind it", async ({ page, context }) => {
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    const answerId = "chat-a-production-m1";
+    await page.route("**/api/instances/*/chats/*/transcript?*", async (route) => {
+      await route.fulfill({
+        json: {
+          ...transcriptFixture("chat-a", 4),
+          chunksByMessage: {
+            [answerId]: [
+              { kind: "text", text: "Let me check the tests." },
+              {
+                kind: "tool",
+                id: "tool-1",
+                name: "Bash",
+                summary: "bun test",
+                output: "ok",
+                status: "done",
+              },
+              { kind: "reply_start" },
+              {
+                kind: "text",
+                text: "### Production response 1\n\nThis **Markdown** came through the transcript API.",
+              },
+            ],
+          },
+        },
+      });
+    });
+    await page.goto("/test/browser/harness/index.html?production=1&chats=1");
+    await page.waitForFunction(
+      () => document.documentElement.dataset.productionHarnessReady === "true",
+    );
+    const clipboard = () => page.evaluate(() => navigator.clipboard.readText());
+
+    const answer = page.locator(`[data-message-id="${answerId}"]`);
+    const answerCopy = answer.getByRole("button", { name: "Copy message" });
+    // A transcript at rest carries no buttons: each one is drawn only once the
+    // reader is on the message it belongs to.
+    await expect(answerCopy).toHaveCSS("opacity", "0");
+    await answer.hover();
+    await expect(answerCopy).toHaveCSS("opacity", "1");
+    await expect(answer).toContainText("Let me check the tests.");
+    await answerCopy.click();
+    expect(await clipboard()).toBe(
+      "### Production response 1\n\nThis **Markdown** came through the transcript API.",
+    );
+
+    const question = page.locator('[data-message-id="chat-a-production-m0"]');
+    const questionCopy = question.getByRole("button", { name: "Copy message" });
+    await expect(questionCopy).toHaveCSS("opacity", "0");
+    await question.getByText("Production question 0").hover();
+    await expect(questionCopy).toHaveCSS("opacity", "1");
+    await questionCopy.click();
+    expect(await clipboard()).toBe("Production question 0");
+  });
+
   test("keeps expanded-sidebar tabs flush with the panel edge", async ({ page }) => {
     await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
       await route.fulfill({
@@ -1958,6 +2019,49 @@ test.describe("message renderer browser gate", () => {
       })
       .boundingBox();
     expect(cost!.x + cost!.width).toBeLessThanOrEqual(times!.x + 1);
+  });
+
+  // Where a spinner's rotation lives decides whether it turns in place. Rotating
+  // the <svg> element pivots on its CSS box, and that box rarely lands on a
+  // whole device pixel: the turn clock's spinner moves by one 7.2px monospace
+  // character the moment a turn crosses a minute, and in WKWebView the leftover
+  // fraction became the radius of a wobble. Rotating the geometry inside the
+  // icon pivots on the viewBox centre, which no pixel grid can shift.
+  test("spins a lucide icon around its own centre rather than its CSS box", async ({ page }) => {
+    await page.goto("/test/browser/harness/index.html");
+    const spun = await page.evaluate(() => {
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("viewBox", "0 0 24 24");
+      svg.setAttribute("class", "size-3 animate-spin");
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      // lucide's Loader2 arc.
+      path.setAttribute("d", "M21 12a9 9 0 1 1-6.219-8.56");
+      svg.append(path);
+      document.body.append(svg);
+      const read = (el: Element) => {
+        const style = getComputedStyle(el);
+        return {
+          animationName: style.animationName,
+          animationDuration: style.animationDuration,
+          transformOrigin: style.transformOrigin,
+          overflow: style.overflow,
+        };
+      };
+      const measured = { element: read(svg), geometry: read(path) };
+      svg.remove();
+      return measured;
+    });
+    expect(spun.element.animationName).toBe("none");
+    // Named rather than merely present: the rotation is handed the same theme
+    // animation the utility uses, so a renamed one has to fail here instead of
+    // leaving every spinner in the app sitting still.
+    expect(spun.geometry.animationName).toBe("spin");
+    expect(spun.geometry.animationDuration).toBe("1s");
+    // The centre of the 24x24 user space every lucide icon is drawn around.
+    expect(spun.geometry.transformOrigin).toBe("12px 12px");
+    // The viewport stays put while its contents turn, so it must not clip what
+    // an icon like RefreshCw reaches on the diagonal.
+    expect(spun.element.overflow).toBe("visible");
   });
 
   // The model controls stay interactive mid-turn and their edits are local until

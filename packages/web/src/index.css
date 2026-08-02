@@ -108,14 +108,33 @@
   }
 }
 
-/* Spinner rotation pivot. lucide icons (Loader2/RefreshCw) spun with
-   `.animate-spin` wobble in WebKit/WKWebView (the Tauri app's webview)
-   because a percentage `transform-origin` on an <svg> resolves against the SVG
-   viewport coordinate system rather than the element box, so the pivot drifts
-   off-centre. Pinning transform-box to the icon's own fill box makes `center`
-   the icon's geometric centre, so every spinner rotates cleanly in place. */
+/* Spinner rotation pivot, for every icon the app spins (Loader2, RefreshCw,
+   RotateCw). They wobble in WebKit/WKWebView (the Tauri app's webview) when the
+   rotation is applied to the <svg> element, because then the pivot is the
+   element's CSS box and that box hardly ever lands on a whole device pixel: the
+   fraction between the box and the pixel grid becomes the radius of a slow
+   orbit instead of a turn in place. What the fraction is depends on whatever
+   shares the line, which is why the wobble comes and goes rather than being
+   there all along. The composer's turn clock is the clearest case: its digits
+   are monospace, so a turn crossing a minute ("59s" becoming "1:00") moves the
+   spinner by one 7.2px character, which is not a whole number of device pixels.
+
+   So spin the geometry inside the icon rather than the icon's box. Within the
+   SVG the pivot resolves in the icon's own 24x24 user space (`transform-box:
+   view-box` is the default there), which has no pixel grid to miss: `center` is
+   exactly the centre every lucide icon is drawn around, whatever fraction of a
+   pixel the element itself sits at. The viewport now stays put while its
+   contents turn, so it has to stop clipping them (RefreshCw and RotateCw reach
+   past the viewBox on the diagonal), which paints no further outside the box
+   than rotating the element already did. Note that stopping a spinner now means
+   stopping its geometry: `animation: none` on the element alone leaves the
+   contents turning. */
 svg.animate-spin {
-  transform-box: fill-box;
+  animation: none;
+  overflow: visible;
+}
+svg.animate-spin > * {
+  animation: var(--animate-spin);
   transform-origin: center;
 }
 

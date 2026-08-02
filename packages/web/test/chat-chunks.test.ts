@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   applyEvent,
+  finalReplyMarkdown,
   mergeToolDetails,
   replaceChunksFromSnapshot,
   revealableLength,
@@ -138,6 +139,76 @@ describe("applyEvent", () => {
       ["title", "A title"],
     ]);
     expect(chunks).toEqual([]);
+  });
+});
+
+describe("finalReplyMarkdown", () => {
+  it("takes the last utterance alone, not the remarks and machinery above it", () => {
+    const chunks = fold([
+      ["reply_start", null],
+      ["delta", "Let me look at the file.\n"],
+      ["tool_call_start", { id: "t1", name: "Read" }],
+      ["tool_call_result", { id: "t1", output: "file contents", isError: false }],
+      ["thinking_delta", { id: "r1", provider: "claude", text: "weighing options" }],
+      ["steered_user_message", { id: "steer-1", content: "actually, do it differently" }],
+      ["reply_start", null],
+      ["delta", "\nDone: see `src/app.ts`."],
+    ]);
+
+    expect(chunks.map((chunk) => chunk.kind)).toEqual([
+      "text",
+      "tool",
+      "thought",
+      "user_message",
+      "reply_start",
+      "text",
+    ]);
+    expect(finalReplyMarkdown(chunks, "")).toBe("Done: see `src/app.ts`.");
+  });
+
+  it("keeps one utterance whole across the reasoning that interleaves it", () => {
+    const chunks = fold([
+      ["reply_start", null],
+      ["delta", "An earlier remark."],
+      ["tool_call_start", { id: "t1", name: "Bash" }],
+      ["tool_call_result", { id: "t1", output: "ok", isError: false }],
+      ["reply_start", null],
+      ["delta", "The tests pass."],
+      ["thinking_delta", { id: "r1", provider: "claude", text: "anything else to mention?" }],
+      ["delta", "Coverage is unchanged."],
+    ]);
+
+    expect(finalReplyMarkdown(chunks, "")).toBe("The tests pass.\n\nCoverage is unchanged.");
+  });
+
+  it("offers what a turn said before its last tool call, that being all it said", () => {
+    const chunks = fold([
+      ["reply_start", null],
+      ["delta", "Checking the build."],
+      ["tool_call_start", { id: "t1", name: "Bash" }],
+      ["tool_call_result", { id: "t1", output: "building…", isError: false }],
+    ]);
+
+    expect(finalReplyMarkdown(chunks, "")).toBe("Checking the build.");
+  });
+
+  it("looks past an utterance that has not said anything yet", () => {
+    const chunks = fold([
+      ["reply_start", null],
+      ["delta", "Running the suite."],
+      ["tool_call_start", { id: "t1", name: "Bash" }],
+      ["tool_call_result", { id: "t1", output: "ok", isError: false }],
+      ["reply_start", null],
+    ]);
+
+    expect(finalReplyMarkdown(chunks, "")).toBe("Running the suite.");
+  });
+
+  it("falls back to the stored body for a row we hold no chunks for", () => {
+    expect(finalReplyMarkdown(undefined, "  Error: the VM went away.  ")).toBe(
+      "Error: the VM went away.",
+    );
+    expect(finalReplyMarkdown([{ kind: "text", text: "   " }], "body")).toBe("body");
   });
 });
 

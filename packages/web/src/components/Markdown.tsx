@@ -1,7 +1,7 @@
-import { Check, Copy, ImageOff } from "lucide-react";
+import { ImageOff } from "lucide-react";
 import { Dialog as DialogPrimitive } from "radix-ui";
 import type { ComponentProps, ReactNode } from "react";
-import { createContext, memo, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, memo, useContext, useMemo, useState } from "react";
 import type { Components } from "react-markdown";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
@@ -9,6 +9,7 @@ import remarkGfm from "remark-gfm";
 import { highlightCode } from "@/lib/highlight";
 import { RENDER_METRICS_ENABLED, recordRenderMetric } from "@/lib/render-metrics";
 import { onExternalLinkClick } from "../lib/tauri";
+import { CopyButton } from "./CopyButton";
 
 // True while rendering inside a fenced code block's <pre>. react-markdown
 // gives the `code` renderer no parent information, so without this context
@@ -221,39 +222,6 @@ function hastText(node: HastNode | undefined): string {
   return (node.children ?? []).map(hastText).join("");
 }
 
-function CopyButton({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
-  const resetTimer = useRef<number | null>(null);
-  useEffect(
-    () => () => {
-      if (resetTimer.current !== null) window.clearTimeout(resetTimer.current);
-    },
-    [],
-  );
-  const Icon = copied ? Check : Copy;
-  return (
-    <button
-      type="button"
-      aria-label="Copy code"
-      onClick={() => {
-        navigator.clipboard
-          .writeText(text)
-          .then(() => {
-            setCopied(true);
-            if (resetTimer.current !== null) window.clearTimeout(resetTimer.current);
-            resetTimer.current = window.setTimeout(() => setCopied(false), 1500);
-          })
-          .catch((err: unknown) => {
-            console.warn("[markdown] clipboard write failed:", err);
-          });
-      }}
-      className="text-muted-foreground hover:text-foreground"
-    >
-      <Icon className="h-3 w-3" />
-    </button>
-  );
-}
-
 // Fenced code block: memoized lowlight output with a copy button floating in
 // the top-right corner. Replaces react-markdown's default <pre> so we
 // don't end up with our card div nested inside a <pre>. The button sits
@@ -268,7 +236,7 @@ function PreBlock({ node, children }: { node?: unknown; children?: ReactNode }) 
   return (
     <div className="relative my-2 rounded-md bg-muted/40 border border-border">
       <div className="absolute top-1 right-1 rounded p-1 bg-background/80 backdrop-blur-sm">
-        <CopyButton text={text} />
+        <CopyButton text={text} label="Copy code" />
       </div>
       <div className="overflow-x-auto">
         <pre className="px-3 py-2 text-xs leading-relaxed">

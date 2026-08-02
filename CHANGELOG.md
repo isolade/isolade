@@ -12,6 +12,10 @@ _Changes landed on `main` that haven't shipped in a release yet._
   `![the chart](out/chart.png)`, renders in the chat.
 - The composer now shows whether the agent is working and how long the turn has
   taken, in the corner next to the send button.
+- Every message can now be copied. Hover one and a copy button appears beneath
+  it. Your own messages copy what you wrote. An agent's copies its reply, as the
+  Markdown it wrote, without the remarks it made along the way or the tool calls
+  and reasoning between them.
 
 ### Changed
 
@@ -39,10 +43,33 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Fixed
 
+- A terminal tab no longer comes back garbled after being off screen, where
+  recalling a command with the up arrow used to paint over the prompt.
+
+### Fixed
+
 - A chat no longer runs out of disk part-way through a large checkout or build.
   Its writable disk was 4 GiB and is now 64 GiB, which the host still only
   fills as the chat writes to it. Chats created before this keep the size they
   were made with.
+
+### Fixed
+
+- Opening a chat that has been thinking while you were elsewhere now shows the
+  thinking tokens it has already spent, instead of counting them up from zero as
+  if the turn were starting.
+
+### Changed
+
+- A new chat appears in the sidebar as soon as you send, under the start of your
+  message, and takes its generated title once that lands.
+
+### Fixed
+
+- The model picker no longer ends up naming the raw model id with an empty menu
+  behind it. It happened when the window opened before Isolade's server was
+  answering, and lasted the rest of the session. The picker now reads the model
+  catalog that ships inside the app, so it is right from the first frame.
 
 ## [0.4.0] - 2026-07-31
 

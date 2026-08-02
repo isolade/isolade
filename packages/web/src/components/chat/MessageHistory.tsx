@@ -21,7 +21,8 @@ import {
   providerSwitchOf,
   StreamView,
 } from "./blocks";
-import type { StreamChunk } from "./chunks";
+import { finalReplyMarkdown, type StreamChunk } from "./chunks";
+import { MessageCopyButton } from "./MessageCopyButton";
 import { UserMessage } from "./UserMessage";
 
 const EDITABLE_USER_MESSAGE = { edit: true } as const;
@@ -214,6 +215,11 @@ export const MessageRow = memo(function MessageRow({
     [message.id, onRequestToolDetails],
   );
   const version = message.version;
+  // A turn offers its reply to the clipboard once it has finished writing it.
+  // Mid-stream the text is still moving, and a half-copied answer is worse than
+  // no button at all.
+  const reply =
+    message.role === "assistant" && !streaming ? finalReplyMarkdown(chunks, message.content) : "";
   return (
     <>
       {switchAbove && <ProviderSwitchDivider chunk={switchAbove} />}
@@ -249,7 +255,7 @@ export const MessageRow = memo(function MessageRow({
         ) : (
           <MarkdownImageScope chunks={chunks} instanceId={instanceId}>
             <div
-              className="w-full break-words pr-12 text-[15px] leading-relaxed text-foreground"
+              className="group/turn w-full break-words pr-12 text-[15px] leading-relaxed text-foreground"
               style={{ fontFamily: agentFontFamily }}
             >
               {streaming && (!chunks || chunks.length === 0) ? (
@@ -277,13 +283,20 @@ export const MessageRow = memo(function MessageRow({
               ) : (
                 <StreamingMarkdown content={message.content} cacheKey={`${message.id}:content`} />
               )}
-              {version && (
-                <VersionPager
-                  index={version.index}
-                  count={version.count}
-                  actionsDisabled={actionsDisabled}
-                  onNavigate={(direction) => onNavigateVersion(message.id, direction)}
-                />
+              {(reply || version) && (
+                <div className="mt-1 flex h-6 items-center">
+                  {reply && (
+                    <MessageCopyButton text={reply} className="group-hover/turn:opacity-100" />
+                  )}
+                  {version && (
+                    <VersionPager
+                      index={version.index}
+                      count={version.count}
+                      actionsDisabled={actionsDisabled}
+                      onNavigate={(direction) => onNavigateVersion(message.id, direction)}
+                    />
+                  )}
+                </div>
               )}
             </div>
           </MarkdownImageScope>

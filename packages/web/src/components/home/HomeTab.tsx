@@ -34,7 +34,7 @@ import type {
   ModelOverrides,
   Terminal,
 } from "../../lib/contracts";
-import { DEFAULT_CHAT_MODEL_ID } from "../../lib/contracts";
+import { CHAT_MODELS, DEFAULT_CHAT_MODEL_ID, provisionalTitle } from "../../lib/contracts";
 import SettingsPane, {
   DEFAULT_SETTINGS_SECTION,
   isSettingsSection,
@@ -205,7 +205,11 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
   // closed), plus a flag set while that delete is in flight.
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
-  const [chatModels, setChatModels] = useState<ChatModelDefinition[]>([]);
+  // Seeded from the catalog compiled into this bundle so the pickers are never
+  // empty, not even on the first frame or when the server is still coming up
+  // (the app's window opens before its sidecar listens, and the sidecar
+  // restarts on every backend edit in dev). The fetch below refreshes it.
+  const [chatModels, setChatModels] = useState<ChatModelDefinition[]>(() => [...CHAT_MODELS]);
   const [modelOverrides, setModelOverrides] = useState<ModelOverrides>({});
   const [allChats, setAllChats] = useState<Chat[]>([]);
   const [terminalsByInstance, setTerminalsByInstance] = useState<Record<string, Terminal[]>>({});
@@ -403,7 +407,10 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
       ? ((instances.find((c) => c.id === view.id) ?? draftInstance(draft, view.id))?.profileId ??
         null)
       : activeProfileId;
-  // The model catalog is static (Claude + Codex), so fetch it once. Per-profile
+  // The model catalog is static (Claude + Codex), so fetch it once. It only ever
+  // confirms what the bundled catalog this state starts from already says (the
+  // route serves the very same CHAT_MODELS, from the same build), so a failed
+  // fetch is a no-op rather than a picker with nothing in it. Per-profile
   // visibility/tier overrides are layered on below.
   useEffect(() => {
     let cancelled = false;
@@ -547,7 +554,11 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     const standIn: Instance = {
       id: `local-${crypto.randomUUID()}`,
       vmId: "",
-      title: null,
+      // The same provisional title the server is about to persist for this
+      // chat, so the sidebar entry is there from the first frame instead of
+      // waiting on the create round-trip. The sidebar reads it back off this
+      // row until the server's own title lands (see the sidebar sections).
+      title: provisionalTitle(firstMessage),
       status: "running",
       lastError: null,
       image: "",
@@ -964,22 +975,30 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
     [draft],
   );
 
-  // Sidebar only shows instances whose title has landed (either the
-  // auto-generated one or the server-side truncation fallback). Untitled
-  // rows include pre-submit drafts and the brief window between submit and
-  // first title event. Each remaining chat lands in exactly one section:
-  // archived (its own collapsed disclosure), else pinned (the "Pinned" heading
-  // at the top), else the main active list.
+  // Sidebar only shows instances whose title has landed (the provisional one
+  // the server writes when the first message is sent, or the generated one that
+  // replaces it), so untitled rows are exactly the chats nothing was ever sent
+  // to. A just-submitted draft is carried by its stand-in title until the
+  // server's row catches up: first as a row of its own, then folded onto the
+  // real row for the moment it exists but is still untitled. Each remaining
+  // chat lands in exactly one section: archived (its own collapsed disclosure),
+  // else pinned (the "Pinned" heading at the top), else the main active list.
   const { archivedInstances, pinnedInstances, activeInstances } = useMemo(() => {
-    const sidebarInstances = instances.filter(
-      (c) => c.title !== null && c.title.trim() !== "" && (c.profileId ?? null) === activeProfileId,
+    const titled = (c: Instance) => c.title !== null && c.title.trim() !== "";
+    const draftTitle = draft?.instance.title ?? null;
+    const rows = instances.map((c) =>
+      draftTitle && c.id === draft?.instanceId && !titled(c) ? { ...c, title: draftTitle } : c,
+    );
+    if (draft && draft.instanceId === null) rows.unshift(draft.instance);
+    const sidebarInstances = rows.filter(
+      (c) => titled(c) && (c.profileId ?? null) === activeProfileId,
     );
     return {
       archivedInstances: sidebarInstances.filter((c) => c.archived),
       pinnedInstances: sidebarInstances.filter((c) => !c.archived && c.pinned),
       activeInstances: sidebarInstances.filter((c) => !c.archived && !c.pinned),
     };
-  }, [activeProfileId, instances]);
+  }, [activeProfileId, instances, draft]);
 
   const handleRequestDelete = useCallback((id: string) => setConfirmingDelete(id), []);
   const handleRequestClearArchive = useCallback(() => setConfirmingClearArchive(true), []);
@@ -1013,6 +1032,7 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
               instances={activeInstances}
               pinnedInstances={pinnedInstances}
               archivedInstances={archivedInstances}
+              pendingId={draftPending ? draft.standInInstanceId : null}
               selectedId={view.kind === "instance" ? view.id : null}
               isDrafting={view.kind === "drafting"}
               topInset={TITLE_BAR_WITH_INSET_HEIGHT}
