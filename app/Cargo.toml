@@ -7,7 +7,7 @@ version = "0.0.0"
 # These are template defaults no longer: the Linux bundler reads `description`
 # and `authors` straight into the .deb's Description and Maintainer fields, so
 # they show up in `apt show isolade`.
-description = "Run coding agents in sealed, throwaway microVMs"
+description = "Local-first coding agent workbench with secretless microVMs"
 authors = ["Isolade"]
 license = "Apache-2.0"
 repository = "https://github.com/isolade/isolade"

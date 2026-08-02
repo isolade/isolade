@@ -20,7 +20,7 @@
     "targets": ["app"],
     "publisher": "Isolade",
     "homepage": "https://isolade.com",
-    "shortDescription": "Coding agents in sealed microVMs",
+    "shortDescription": "Local-first coding agent workbench with secretless microVMs",
     "longDescription": "Isolade runs coding agents in sealed, throwaway microVMs on your own machine, so an agent can work unattended without reaching your files or your real secrets.",
     "category": "DeveloperTool",
     "resources": [

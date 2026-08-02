@@ -6,30 +6,8 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
-### Added
-
-- Isolade now installs on Linux distributions that `apt` does not serve. Releases
-  carry the same payload as a plain tarball beside the `.deb`, and the installer
-  reaches for it when there is no `apt`, unpacking into `/opt/isolade` and wiring
-  up the launcher entry and the `isolade` command. WebKitGTK 4.1 and GTK 3 remain
-  your distribution's to provide, so the installer asks the binary what it is
-  missing and names the package that supplies it. NixOS cannot run either
-  artifact unmodified, and now gets told that along with the two ways around it,
-  rather than an install that fails at launch.
-
 ### Fixed
 
-- The update notice now points at how to update rather than at the release
-  artifact. Downloading the macOS build through a browser is the one route that
-  leaves it quarantined and refusing to launch, so the notice was walking people
-  into it, and on Linux the artifact it offered was a `.deb` that a tarball
-  install has no use for. Both the banner and the About pane now open the
-  installation instructions, where the same one-liner covers every platform.
-- The Linux package now describes itself. `apt show isolade` reported "A Tauri
-  App" from a maintainer called "you", both left over from the project template,
-  where it now carries a real description, maintainer, homepage and license.
-- The Linux app now has its own icon in launchers, instead of falling back to
-  whatever your desktop shows for an application with no icon at all.
 - On macOS, the window can now be dragged from the title-bar area while Settings
   is open.
 
