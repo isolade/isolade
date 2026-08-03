@@ -48,9 +48,9 @@ describe("PromptConfigStore", () => {
 
   it("round-trips a non-default base, and never writes the default", () => {
     const { store, file } = tempStore();
-    store.write({ prelude: "Only mine.", base: "none" });
-    expect(read(file)).toContain('base = "none"');
-    expect(store.read()).toEqual({ prelude: "Only mine.", base: "none" });
+    store.write({ prelude: "Only mine.", base: "minimal" });
+    expect(read(file)).toContain('base = "minimal"');
+    expect(store.read()).toEqual({ prelude: "Only mine.", base: "minimal" });
     // The default must not litter the file.
     store.write({ prelude: "Only mine.", base: "isolade" });
     expect(read(file)).not.toContain("base =");

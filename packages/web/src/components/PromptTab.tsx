@@ -7,23 +7,34 @@ import type { PromptConfig } from "../lib/contracts";
 
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-// Ordered best-default-first. Labels name what the agent gets rather than what
-// Isolade does to it, since that is the part a reader has to reason about.
-const BASE_OPTIONS: { value: PromptConfig["base"]; label: string; hint: string }[] = [
+// Ordered best-default-first. Each hint has to stand on its own: it is the only
+// explanation an option gets, so anything true of just that choice belongs here
+// rather than in a separate note the reader has to connect back up.
+const BASE_OPTIONS: {
+  value: PromptConfig["base"];
+  label: string;
+  hint: string;
+  /** How the instructions below relate to this base. */
+  preludeNote: string;
+}[] = [
   {
     value: "isolade",
-    label: "Isolade's",
+    label: "Optimized",
     hint: "Written for the sandbox: what agents may do without asking, which model they are running, how to attribute commits.",
+    preludeNote:
+      "Added below the base prompt, and taking precedence over it wherever the two disagree.",
   },
   {
     value: "cli",
-    label: "The agent's own",
+    label: "Agent default",
     hint: "Whatever prompt Claude Code or Codex ships with, untouched. Longer, and written for someone working on their own machine.",
+    preludeNote: "Added below the base prompt.",
   },
   {
-    value: "none",
-    label: "None",
-    hint: "No base prompt. Your instructions below are the whole thing.",
+    value: "minimal",
+    label: "Minimal",
+    hint: "Almost nothing: your instructions below are the prompt. Codex chats also keep a short note about its patch format, without which its edits can land in the wrong place.",
+    preludeNote: "These are the whole prompt.",
   },
 ];
 
@@ -134,13 +145,6 @@ export default function PromptTab({ activeProfileId }: { activeProfileId: string
             </span>
           </label>
         ))}
-        {cfg.base !== "cli" && (
-          <p className="text-xs text-muted-foreground/80">
-            Codex chats keep a short note about its patch format either way. Its file-editing tool
-            applies a change at the first place that looks like a match, so without it edits can
-            land in the wrong place.
-          </p>
-        )}
       </div>
 
       <div className="max-w-2xl space-y-1.5">
@@ -153,9 +157,7 @@ export default function PromptTab({ activeProfileId }: { activeProfileId: string
           className="min-h-40 text-xs"
         />
         <p className="text-xs text-muted-foreground">
-          {cfg.base === "isolade"
-            ? "Added below the base prompt, and taking precedence over it wherever the two disagree."
-            : "Added below the base prompt."}
+          {BASE_OPTIONS.find((option) => option.value === cfg.base)?.preludeNote}
         </p>
       </div>
 

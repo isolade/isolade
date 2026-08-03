@@ -92,17 +92,17 @@ describe("buildSystemPrompt", () => {
       });
     });
 
-    it('"none" replaces the CLI\'s prompt with the prelude alone', () => {
-      expect(build("Only my rules.", "none")).toEqual({
+    it('"minimal" replaces the CLI\'s prompt with the prelude alone', () => {
+      expect(build("Only my rules.", "minimal")).toEqual({
         text: "Only my rules.",
         mode: "replace",
       });
     });
 
-    it('"none" with no prelude asks for no prompt at all', () => {
+    it('"minimal" with no prelude asks for no prompt at all', () => {
       // An empty replace is meaningful rather than a no-op: `--system-prompt ""`
       // is what suppresses the CLI's own prompt without substituting anything.
-      expect(build(null, "none")).toEqual({ text: "", mode: "replace" });
+      expect(build(null, "minimal")).toEqual({ text: "", mode: "replace" });
     });
 
     const codexBase = (prelude: string | null, base: PromptBase) =>
@@ -110,7 +110,7 @@ describe("buildSystemPrompt", () => {
 
     it('on codex, "none" replaces the prompt but keeps the patch rules', () => {
       // Which is what makes the option usable there rather than a file shredder.
-      const p = codexBase("Only my rules.", "none");
+      const p = codexBase("Only my rules.", "minimal");
       expect(p.mode).toBe("replace");
       expect(p.text).toContain("# Editing files");
       expect(p.text).toContain("Only my rules.");

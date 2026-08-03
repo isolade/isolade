@@ -8,13 +8,14 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Added
 
-- Settings → Prompt now lets a profile choose its agents' base prompt: Isolade's
-  own, the one Claude Code or Codex ships, or none at all. Your instructions are
-  added below whichever you pick, so "none" makes them the entire prompt. Stored
-  as `base` in the profile's `config.toml`. Codex chats keep a short note about
-  its patch format in the first two cases, because its file-editing tool applies
-  a change at the first place that looks like a match and edits can otherwise
-  land in the wrong place.
+- Settings → Prompt now lets a profile choose its agents' base prompt:
+  "Optimized" (Isolade's own, written for the sandbox), "Agent default"
+  (whatever Claude Code or Codex ships, untouched), or "Minimal". Your
+  instructions are added below whichever you pick, so Minimal makes them
+  essentially the whole prompt. Stored as `base` in the profile's `config.toml`.
+  Minimal is not quite empty on Codex: it keeps a short note about the patch
+  format, because Codex applies an edit at the first place that looks like a
+  match and can otherwise change the wrong lines.
 
 ### Changed
 

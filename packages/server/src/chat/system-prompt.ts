@@ -168,11 +168,12 @@ export function buildSystemPrompt(opts: {
   // profile's instructions on top.
   if (opts.base === "cli") return { text: prelude ?? "", mode: "append" };
 
-  // "None": replace the harness prompt with the prelude alone, unheaded — there is
-  // nothing above it for a heading to separate it from. On codex that still means
-  // the patch rules, since dropping those trades a long prompt for wrong edits;
-  // their own `# Editing files` heading marks the boundary.
-  if (opts.base === "none") {
+  // "Minimal": replace the harness prompt with the prelude alone, unheaded — there
+  // is nothing above it for a heading to separate it from. Named "minimal" rather
+  // than "none" because on codex it still carries the patch rules: dropping those
+  // trades a long prompt for wrong edits. Their `# Editing files` heading marks the
+  // boundary.
+  if (opts.base === "minimal") {
     return {
       text: [...patchRules, ...(prelude ? [prelude] : [])].join("\n\n"),
       mode: "replace",

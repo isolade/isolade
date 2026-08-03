@@ -775,7 +775,7 @@ describe("ClaudeBackend stream-json parsing", () => {
     return command;
   };
 
-  it('base "none" passes an empty --system-prompt, which suppresses the CLI\'s own', async () => {
+  it('base "minimal" passes an empty --system-prompt, which suppresses the CLI\'s own', async () => {
     // Empty is NOT "no flag": omitting it would silently hand the chat the stock
     // prompt, which is a different option in the UI.
     const command = await commandFor({ text: "", mode: "replace" });

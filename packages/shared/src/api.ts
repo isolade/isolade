@@ -591,9 +591,9 @@ export const EMPTY_RUNTIME_CONFIG: RuntimeConfig = {
 // in the profile. Edited on the Prompt settings section, saved to config.toml's
 // `[prompt]` table. Empty string means "no prelude".
 // Which base prompt sits in front of the profile's prelude. "isolade" is our own
-// sandbox brief, "cli" is whatever Claude Code or Codex ships, "none" is nothing
-// at all. The prelude is appended in every case.
-export const promptBaseSchema = z.enum(["isolade", "cli", "none"]);
+// sandbox brief, "cli" is whatever Claude Code or Codex ships, "minimal" is as
+// close to nothing as the provider allows. The prelude is added in every case.
+export const promptBaseSchema = z.enum(["isolade", "cli", "minimal"]);
 export type PromptBase = z.infer<typeof promptBaseSchema>;
 
 export const promptConfigSchema = z.object({
