@@ -53,6 +53,25 @@ const TOOL_PRESENTATIONS: Record<string, ToolPresentation> = {
   WebSearch: { icon: Globe },
   Task: { icon: Bot },
   Agent: { icon: Bot },
+  // A skill call names the skill in `skill`, and findings arrive in `findings`,
+  // neither of which summarizeChatToolInput reads — so both need a noun or they
+  // render as a bare icon on an empty line.
+  Skill: { icon: Sparkles, noun: "Skill" },
+  // Denied now, but kept for the transcripts of chats that ran with it.
+  ReportFindings: { icon: ListChecks, noun: "Findings" },
+  // Monitor's input carries a `command`, so it labels itself like a shell call.
+  Monitor: { icon: Terminal },
+  // The plan and task trackers. Both agents' current tools are denied (see
+  // DISALLOWED_TOOLS and CODEX_CONFIG_OVERRIDES), but chats that ran before that
+  // still have these calls in their history, and a transcript is read long after
+  // the tool that wrote it went away. `TodoWrite` is the tracker's older name,
+  // kept for the same reason.
+  TaskCreate: { icon: ListChecks, noun: "Todos" },
+  TaskUpdate: { icon: ListChecks, noun: "Todos" },
+  TaskGet: { icon: ListChecks, noun: "Task" },
+  TaskList: { icon: ListChecks, noun: "Tasks" },
+  TaskStop: { icon: ListChecks, noun: "Stop task" },
+  TaskOutput: { icon: ListChecks, noun: "Task output" },
   TodoWrite: { icon: ListChecks, noun: "Todos" },
   // Codex names its calls itself (codexToolName in codex-backend.ts humanizes
   // the thread item type), so its shell and web search need their own entries

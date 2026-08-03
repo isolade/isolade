@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
+import { buildSystemPrompt } from "../chat/system-prompt";
 import type { ChatModelDefinition, ChatResumeSnapshot } from "../contracts";
 import {
   CHAT_MODELS,
@@ -27,6 +28,7 @@ export function createChatsRouter(ctx: RouteContext): Hono {
     providerSwitchStore,
     uploadStore,
     instances,
+    profiles,
     chatStreamHub,
     claudeBackend,
     codexBackend,
@@ -420,6 +422,15 @@ export function createChatsRouter(ctx: RouteContext): Hono {
         model: chat.model,
         effort: chat.effort,
         sessionId,
+        // A probe can relaunch a reaped process and keep it as the chat's live
+        // one, so it has to launch with the same prompt a turn would use.
+        systemPrompt: buildSystemPrompt({
+          provider: chat.provider,
+          model: chat.model,
+          ...(instance.profileId
+            ? profiles.getPromptConfig(instance.profileId)
+            : { prelude: null, base: "optimized" as const }),
+        }),
       });
       return c.json(breakdown);
     } catch (err) {

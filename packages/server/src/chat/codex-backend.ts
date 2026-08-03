@@ -18,6 +18,7 @@ import {
   usageTokenCount,
 } from "./backend";
 import { type CodexConnection, CodexManager } from "./codex-manager";
+import type { IsoladeSystemPrompt } from "./system-prompt";
 import { buildTitlePrompt, CODEX_TITLE_MODEL, cleanTitle } from "./title-generator";
 
 // How long a single title turn may run before we give up and let the caller
@@ -36,6 +37,25 @@ interface CodexModelListEntry {
   model?: string;
   serviceTiers?: { id: string }[];
   additionalSpeedTiers?: string[];
+}
+
+// The thread params that carry Isolade's prompt. Shared by start, resume and fork
+// so the three cannot drift, since a thread that resumes without them would
+// silently keep the prompt it was created with.
+//
+// Deliberately no `personality` override, and it should stay that way. It exists
+// to strip codex's ~2KB personality section, which lives inside the prompt that
+// `baseInstructions` replaces wholesale — so where we replace, it has nothing left
+// to act on (A/B'd on the wire: identical requests but for session ids), and where
+// we layer it would quietly contradict the "Unmodified" option's promise to
+// leave the shipped prompt untouched. Every case is therefore either a no-op or
+// wrong.
+export function instructionParams(
+  prompt: IsoladeSystemPrompt | undefined,
+): Record<string, unknown> {
+  if (!prompt?.text) return {};
+  const field = prompt.mode === "append" ? "developerInstructions" : "baseInstructions";
+  return { [field]: prompt.text };
 }
 
 export class CodexBackend implements ChatBackend {
@@ -89,10 +109,11 @@ export class CodexBackend implements ChatBackend {
     conn: CodexConnection,
     chatId: string,
     sessionId: string | undefined,
+    systemPrompt: IsoladeSystemPrompt | undefined,
   ): Promise<string> {
     if (sessionId) {
       try {
-        await this.ensureThreadLive(conn, sessionId);
+        await this.ensureThreadLive(conn, sessionId, systemPrompt);
         return sessionId;
       } catch (err) {
         if (!isMissingRolloutError(err)) throw err;
@@ -101,13 +122,50 @@ export class CodexBackend implements ChatBackend {
         );
       }
     }
-    const threadId = await this.startThread(conn);
+    const threadId = await this.startThread(conn, systemPrompt);
     this.chatManager.updateSessionId(chatId, undefined, threadId);
     return threadId;
   }
 
-  private async startThread(conn: CodexConnection): Promise<string> {
-    const result = (await conn.send("thread/start", { ephemeral: false })) as {
+  // Two ways to give codex a prompt, and they are different KINDS of thing, not
+  // two spellings of the same one:
+  //
+  //   baseInstructions       becomes the request's `instructions` slot, replacing
+  //                          codex's own prompt (and clearing the per-model
+  //                          instruction template, models-manager/model_info.rs).
+  //                          What "Isolade's" and "None" both want. Safe only
+  //                          because buildSystemPrompt puts CODEX_PATCH_RULES in
+  //                          that text: tool specs are sent regardless, so
+  //                          apply_patch keeps its grammar, but how much context a
+  //                          hunk needs is stated only in the prompt we replaced.
+  //
+  //   developerInstructions  becomes a developer-ROLE MESSAGE in the conversation
+  //                          input (core/src/session/mod.rs pushes it into
+  //                          developer_sections → build_developer_update_item),
+  //                          rebuilt from session config every turn, leaving
+  //                          codex's own prompt intact. What "The agent's own"
+  //                          wants, and there the only option available.
+  //
+  // Which is why the prelude is not always sent this way. For the two replace
+  // cases it stays inside baseInstructions alongside our core, so the "where they
+  // conflict, follow these instead" precedence is plain text in one block rather
+  // than an argument across a channel boundary between an instructions slot and a
+  // conversation item.
+  //
+  // `thread/resume` and `thread/fork` accept both fields too, and applying them
+  // there is what keeps a thread's prompt current: verified against the installed
+  // codex by resuming a thread started with one sentinel and overriding with
+  // another, which changed the request's `instructions`. (An earlier comment here
+  // claimed both were start-only, read from a checked-out codex tree that does not
+  // match the installed build. `turn/start` really does accept neither.)
+  private async startThread(
+    conn: CodexConnection,
+    systemPrompt: IsoladeSystemPrompt | undefined,
+  ): Promise<string> {
+    const result = (await conn.send("thread/start", {
+      ephemeral: false,
+      ...instructionParams(systemPrompt),
+    })) as {
       thread: { id: string };
     };
     const threadId = result.thread.id;
@@ -129,11 +187,15 @@ export class CodexBackend implements ChatBackend {
     chatId: string,
     threadId: string,
     lastTurnId: string,
+    systemPrompt: IsoladeSystemPrompt | undefined,
   ): Promise<string> {
     const result = (await conn.send("thread/fork", {
       threadId,
       lastTurnId,
       ephemeral: false,
+      // A fork is a fresh thread, so it takes the current prompt rather than
+      // inheriting whatever its parent started with.
+      ...instructionParams(systemPrompt),
     })) as { thread: { id: string } };
     const forkedId = result.thread.id;
     // The fork is live in this app-server's memory, same as a fresh start.
@@ -148,12 +210,28 @@ export class CodexBackend implements ChatBackend {
   // thread/resume to reload it, otherwise turn/start fails with
   // "thread not found: <id>". Resumed at most once per connection; concurrent
   // callers share the single in-flight resume.
-  private ensureThreadLive(conn: CodexConnection, threadId: string): Promise<void> {
+  //
+  // The resume re-applies the instructions, which is how an existing thread picks
+  // up an edited prompt at all. The liveness cache is what makes that work rather
+  // than a wasted parameter: codex applies an instruction override only when it
+  // has not already loaded the thread, and silently ignores one for a thread that
+  // is already running (it has a "provided and ignored while running" warning for
+  // exactly that). Resuming only on a cache miss means we ask precisely when it
+  // takes effect.
+  //
+  // The bound worth knowing: that miss happens per CONNECTION, so a prompt change
+  // reaches an existing thread on the next reconnect (VM restart, dropped stream)
+  // or on a fork, not on the next turn.
+  private ensureThreadLive(
+    conn: CodexConnection,
+    threadId: string,
+    systemPrompt: IsoladeSystemPrompt | undefined,
+  ): Promise<void> {
     const map = this.livenessMap(conn);
     const existing = map.get(threadId);
     if (existing) return existing;
     const p = conn
-      .send("thread/resume", { threadId })
+      .send("thread/resume", { threadId, ...instructionParams(systemPrompt) })
       .then(() => {})
       .catch((err: unknown) => {
         // Drop the cached failure so a later turn can retry the resume.
@@ -222,6 +300,9 @@ export class CodexBackend implements ChatBackend {
     effort: ChatEffort;
     // Run this turn on the fast (priority) service tier, at its premium rates.
     fast?: boolean;
+    // Only consulted when this turn starts a NEW thread: codex accepts developer
+    // instructions at thread/start and nowhere else. See startThread.
+    systemPrompt?: IsoladeSystemPrompt;
     sessionId?: string; // codexThreadId
     userMessageId?: string;
     fork?: { anchorId: string }; // anchorId = the turn id to fork through
@@ -248,8 +329,14 @@ export class CodexBackend implements ChatBackend {
     try {
       threadId =
         opts.fork && opts.sessionId
-          ? await this.forkThread(conn, opts.chatId, opts.sessionId, opts.fork.anchorId)
-          : await this.resolveThread(conn, opts.chatId, opts.sessionId);
+          ? await this.forkThread(
+              conn,
+              opts.chatId,
+              opts.sessionId,
+              opts.fork.anchorId,
+              opts.systemPrompt,
+            )
+          : await this.resolveThread(conn, opts.chatId, opts.sessionId, opts.systemPrompt);
     } catch (err) {
       await this.refreshAuthAfterPossibleStaleState(opts.vmId, err);
       throw err;
@@ -887,7 +974,7 @@ export class CodexBackend implements ChatBackend {
     const conn = active?.conn ?? (await this.manager.getOrCreate(opts.vmId));
     const threadId = active?.threadId ?? opts.sessionId;
     if (!threadId) return false;
-    if (!active) await this.ensureThreadLive(conn, threadId);
+    if (!active) await this.ensureThreadLive(conn, threadId, undefined);
     const result = await conn.send("thread/read", {
       threadId,
       includeTurns: true,

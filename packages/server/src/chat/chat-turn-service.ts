@@ -24,6 +24,7 @@ import {
 } from "./handoff";
 import type { ProviderSwitchStore } from "./provider-switch-store";
 import type { ChatStreamHub } from "./stream-hub";
+import { buildSystemPrompt } from "./system-prompt";
 
 const DEFAULT_DELIVERY_CONFIRMATION_TIMEOUT_MS = 10_000;
 
@@ -438,23 +439,25 @@ export class ChatTurnService {
         );
         deliveryConfirmationTimer.unref?.();
         try {
-          // Environment-level prelude: prepended to the first user
-          // message of a new chat (no provider session yet) and sent
-          // to the backend only. The DB still holds the user's
-          // original `content`, so the prelude is invisible in the
-          // UI's message list. Wrapped in <prelude> tags so the model
-          // can tell it apart from the user's own text. (An edit of the
-          // first message also lands here: its recomputed session is just
-          // as fresh, so it needs the prelude again.)
-          const prelude =
-            sessionId || !instance.profileId ? null : profiles.getPrelude(instance.profileId);
-          // Compose the message actually sent to the model: optional prelude,
-          // optional cross-provider handoff envelope, optional attachments block
-          // (cites each file's absolute VM path), then the user's own text. The
-          // DB row keeps only `content`, so none of the injected framing shows
-          // in the UI.
+          // Isolade's system prompt for this turn: our own core plus the
+          // profile's prelude. Sent every turn rather than only the first, and
+          // as system-level text rather than prepended to a user message, so it
+          // survives the provider's automatic summarization instead of depending
+          // on a summarizer to paraphrase it. Providers apply it at process /
+          // thread start and ignore it afterwards; see ChatBackend.sendMessage.
+          const systemPrompt = buildSystemPrompt({
+            provider: chat.provider,
+            model: turnModel,
+            ...(instance.profileId
+              ? profiles.getPromptConfig(instance.profileId)
+              : { prelude: null, base: "optimized" as const }),
+          });
+          // Compose the message actually sent to the model: optional
+          // cross-provider handoff envelope, optional attachments block (cites
+          // each file's absolute VM path), then the user's own text. The DB row
+          // keeps only `content`, so none of the injected framing shows in the
+          // UI.
           const parts: string[] = [];
-          if (prelude) parts.push(`<prelude>\n${prelude}\n</prelude>`);
           const attachmentsPreamble = uploads.length > 0 ? buildAttachmentsPreamble(uploads) : null;
           if (activatingSwitch) {
             // Build the provider-neutral handoff from the source branch (every
@@ -466,7 +469,12 @@ export class ChatTurnService {
               contextWindow: targetModelDef?.contextWindow ?? chat.modelContextWindow ?? 200_000,
             };
             const estimate = estimateFirstTargetRequest(
-              { prelude, handoff, attachmentsPreamble, userMessage: content },
+              {
+                systemPrompt: systemPrompt.text,
+                handoff,
+                attachmentsPreamble,
+                userMessage: content,
+              },
               capacity,
             );
             // A current user message that alone exceeds the target's hard limit
@@ -564,7 +572,12 @@ export class ChatTurnService {
               // history reduction can fix, so refuse rather than send a request
               // the target will reject.
               const after = estimateFirstTargetRequest(
-                { prelude, handoff, attachmentsPreamble, userMessage: content },
+                {
+                  systemPrompt: systemPrompt.text,
+                  handoff,
+                  attachmentsPreamble,
+                  userMessage: content,
+                },
                 capacity,
               );
               if (after.bucket === "oversized") {
@@ -599,6 +612,7 @@ export class ChatTurnService {
             // never charged. The flag is cleared wherever a model change strands
             // it, so this is the belt to that braces.
             fast: chat.fastMode && findChatModel(turnModel)?.fastPricing != null,
+            systemPrompt,
             sessionId,
             userMessageId: userMessage.id,
             fork,

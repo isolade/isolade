@@ -10,6 +10,40 @@ interface PendingRequest {
 type NotificationHandler = (params: unknown) => void;
 type Unsubscribe = () => void;
 
+/**
+ * The `-c` overrides every chat's app-server runs with.
+ *
+ * Exported so codex-stub-api.test.ts drives the same posture we ship rather than
+ * its own copy, which matters most for the two that shrink the tool specs: codex
+ * sends those on every request whatever base instructions we set, so they are the
+ * bulk of a turn's fixed cost.
+ *
+ * `agents.enabled=false` hides codex's built-in subagent tools so chats can't spawn
+ * subagents. We plan to replace this with our own custom subagents tool later.
+ *
+ * `features.goals=false` drops get_goal/create_goal/update_goal and
+ * `tools.update_plan.enabled=false` drops update_plan — planning and bookkeeping
+ * surfaces rather than capability, switched off here to match the task family we
+ * deny on Claude (see DISALLOWED_TOOLS). `tools.experimental_request_user_input`
+ * is codex's counterpart to Claude's AskUserQuestion, denied for the same reason:
+ * nothing here can present the picker. Together they take the specs from ~8.5KB to
+ * ~2.8KB, leaving exec_command, write_stdin, view_image and web_search.
+ *
+ * Note the nested `.enabled` on two of them: those keys are structs, and passing a
+ * bare boolean makes the app-server refuse to start rather than warn. web_search has
+ * no switch at all in 0.146.0 — `tools.web_search` is a deprecated alias that parses
+ * to nothing — so it stays, matching the WebSearch we keep on Claude.
+ */
+export const CODEX_CONFIG_OVERRIDES = [
+  "features.memories=false",
+  "approval_policy=never",
+  "sandbox_mode=danger-full-access",
+  "agents.enabled=false",
+  "features.goals=false",
+  "tools.update_plan.enabled=false",
+  "tools.experimental_request_user_input.enabled=false",
+] as const;
+
 export class CodexConnection {
   private reqId = 0;
   private pending = new Map<number, PendingRequest>();
@@ -29,10 +63,8 @@ export class CodexConnection {
   constructor(vmId: string, sandboxClient: SandboxApi) {
     this.exitPromise = sandboxClient.execStream(
       vmId,
-      // `agents.enabled=false` hides codex's built-in subagent tools so chats
-      // can't spawn subagents. We plan to replace this with our own custom
-      // subagents tool later.
-      "codex app-server --listen stdio:// --disable apps -c features.memories=false -c approval_policy=never -c sandbox_mode=danger-full-access -c agents.enabled=false",
+      // See CODEX_CONFIG_OVERRIDES for what each override buys.
+      `codex app-server --listen stdio:// --disable apps ${CODEX_CONFIG_OVERRIDES.map((o) => `-c ${o}`).join(" ")}`,
       {
         stdin: this.stdin,
         stdout: (chunk) => this._handleStdout(chunk),

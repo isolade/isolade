@@ -3,19 +3,20 @@ import { type PromptConfig, promptConfigSchema } from "@isolade/shared";
 import { writeConfigTable } from "./config-editor";
 import { profileConfigSchema, promptTableSchema } from "./profile-config";
 
-// Per-profile chat augmentation. Its one field, `prelude`, is prepended
-// (invisibly) to the first user message of every new chat in the profile — the
-// DB stores the original content; only the message sent to the chat backend is
-// augmented (see ProfileManager.getPrelude / loadProfileConfig).
+// Per-profile prompt settings: the `prelude` that always applies, and `base`,
+// which picks what precedes it — Isolade's own brief, the agent CLI's stock
+// prompt, or nothing (see buildSystemPrompt / ProfileManager.getPromptConfig).
 //
 // It lives in the profile's config.toml as a `[prompt]` table, read/written
-// through config-editor (comment-preserving, multi-line-string aware). An empty
-// prelude drops the table rather than leaving `prelude = ""` behind.
+// through config-editor (comment-preserving, multi-line-string aware). A table
+// with nothing but defaults is dropped rather than left behind as empty keys.
 
 type PromptTable = ReturnType<typeof promptTableSchema.parse>;
 
+const EMPTY: PromptConfig = { prelude: "", base: "optimized" };
+
 function tableToConfig(table: PromptTable): PromptConfig {
-  return { prelude: table.prelude ?? "" };
+  return { prelude: table.prelude ?? "", base: table.base ?? "optimized" };
 }
 
 export class PromptConfigStore {
@@ -24,26 +25,32 @@ export class PromptConfigStore {
   /** Current config. Never throws: an absent / unreadable / corrupt file (or a
    * config without a `[prompt]` table) reads as an empty prelude. */
   read(): PromptConfig {
-    if (!existsSync(this.configPath)) return { prelude: "" };
+    if (!existsSync(this.configPath)) return EMPTY;
     try {
       const parsed = profileConfigSchema.parse(
         Bun.TOML.parse(readFileSync(this.configPath, "utf-8")) ?? {},
       );
-      return parsed.prompt ? tableToConfig(parsed.prompt) : { prelude: "" };
+      return parsed.prompt ? tableToConfig(parsed.prompt) : EMPTY;
     } catch {
-      return { prelude: "" };
+      return EMPTY;
     }
   }
 
   /** Validate and persist the config, returning the parsed (normalized) value. */
   write(config: PromptConfig): PromptConfig {
     const parsed = promptConfigSchema.parse(config);
-    // An empty prelude drops the whole `[prompt]` table.
-    writeConfigTable(
-      this.configPath,
-      "prompt",
-      parsed.prelude ? { prelude: parsed.prelude } : undefined,
-    );
+    // Only non-default values are written, so an untouched profile keeps a clean
+    // config.toml and the whole `[prompt]` table disappears rather than sitting
+    // there restating the defaults.
+    const nonDefaultBase = parsed.base !== "optimized";
+    const table =
+      parsed.prelude || nonDefaultBase
+        ? {
+            ...(parsed.prelude ? { prelude: parsed.prelude } : {}),
+            ...(nonDefaultBase ? { base: parsed.base } : {}),
+          }
+        : undefined;
+    writeConfigTable(this.configPath, "prompt", table);
     return parsed;
   }
 }

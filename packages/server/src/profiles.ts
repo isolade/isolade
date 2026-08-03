@@ -12,7 +12,7 @@ import {
   writeDockerfile,
   writeProfileConfigForm,
 } from "./config-editor";
-import type { ModelOverrides, ProfileConfigForm, ProfileConfigView } from "./contracts";
+import type { ModelOverrides, ProfileConfigForm, ProfileConfigView, PromptBase } from "./contracts";
 import type { Db } from "./db";
 import { schema } from "./db";
 import { GitConfigManager } from "./git-config";
@@ -460,14 +460,18 @@ export class ProfileManager {
 
   // ---- config-derived reads ----
 
-  /** The optional `prelude` from config.toml, prepended to the first message
-   * of every new chat. Null when unset or unconfigured. */
-  getPrelude(id: string): string | null {
-    if (!profileHasConfig(id)) return null;
+  /** The profile's `[prompt]` settings from config.toml: its prelude and which
+   * base prompt precedes it. An unconfigured or unreadable profile gets the
+   * defaults (no prelude, Isolade's own prompt), so a broken config degrades to
+   * standard behaviour rather than to an unprompted agent. */
+  getPromptConfig(id: string): { prelude: string | null; base: PromptBase } {
+    const defaults = { prelude: null, base: "optimized" as const };
+    if (!profileHasConfig(id)) return defaults;
     try {
-      return loadProfileConfig(id).prelude;
+      const config = loadProfileConfig(id);
+      return { prelude: config.prelude, base: config.promptBase };
     } catch {
-      return null;
+      return defaults;
     }
   }
 

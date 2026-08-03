@@ -2,6 +2,7 @@ import type { ChatManager } from "../chats";
 import { type ChatEffort, type ContextBreakdown, findChatModel } from "../contracts";
 import { KeyedQueue } from "../keyed-queue";
 import type { SandboxApi } from "../sandbox-client";
+import { shellQuote } from "../shell";
 import {
   addUsage,
   type ChatBackend,
@@ -14,6 +15,7 @@ import {
   type UserMessageReceipt,
 } from "./backend";
 import { ClaudeSession, type TurnHooks } from "./claude-session";
+import type { IsoladeSystemPrompt } from "./system-prompt";
 import {
   buildTitleCommand,
   buildTitlePrompt,
@@ -24,6 +26,111 @@ import {
 } from "./title-generator";
 
 const CLAUDE_EFFORTS = new Set<ChatEffort>(["low", "medium", "high", "xhigh", "max"]);
+
+/**
+ * The tools a chat keeps: the complement of DISALLOWED_TOOLS, and what
+ * claude-stub-api.test.ts asserts the request actually carries. Not passed to the
+ * CLI — `--allowedTools` gates permission and leaves every schema on the wire.
+ */
+export const ALLOWED_TOOLS = [
+  "Bash",
+  "Read",
+  "Edit",
+  "Write",
+  "WebFetch",
+  "WebSearch",
+  // A profile's `[build].skills` installs skill packages into its image (`npx
+  // skills add --global --agent claude-code`, see buildAgentLayerFragment), and the
+  // listing reaches the model whatever prompt we set. Denying `Skill` takes the
+  // listing with it, so it would silently disable a shipped profile option.
+  "Skill",
+  // Repeated notifications from a streaming script (`tail -f` on a dev server log,
+  // a watcher, a CI run emitting one line per step). Bash with `run_in_background`
+  // is not a substitute: it notifies once, when the command exits, so it covers
+  // "tell me when this finishes" and nothing else.
+  "Monitor",
+] as const;
+
+/**
+ * Tools removed from the request entirely.
+ *
+ * This is the single biggest lever on what a turn costs. A tool's schema is sent on
+ * every request, and the CLI ships 26 of them totalling ~58KB — sixty times the
+ * whole system prompt. `--disallowedTools` is a hard removal rather than a
+ * permission prompt, so it still applies under `--dangerously-skip-permissions` and
+ * it drops the schema from the body rather than only refusing the call. The list
+ * below takes ~58KB to ~19KB, verified on the wire in claude-stub-api.test.ts.
+ *
+ * The bar for being here is that the tool cannot work in isolade, has nothing to act
+ * on, or does something isolade deliberately does not want done. A tool whose absence
+ * would show up as a missing capability belongs in ALLOWED_TOOLS above, even an
+ * expensive one.
+ *
+ * Being a deny list, it fails open: a tool added by a future CLI version arrives
+ * enabled. That is the safe direction — a chat gains a capability rather than
+ * silently losing one — but it means this list wants a look whenever the pinned CLI
+ * version moves. The test asserts the exact surviving set, so a new tool shows up as
+ * a failure rather than a slow leak.
+ */
+export const DISALLOWED_TOOLS = [
+  // Interactive built-ins the CLI resolves itself. In headless `-p` mode there's no
+  // UI to present the picker, so the CLI auto-fails the call with an `is_error`
+  // result ("Answer questions?"). stream-json input doesn't help, because the CLI
+  // owns the tool_use_id and rejects any client answer before it lands, so all the
+  // call does is burn a turn and produce an apologetic "awaiting your response"
+  // reply.
+  "AskUserQuestion",
+  // Subagent spawning and orchestration. isolade runs one coding agent per chat in
+  // its own VM, and we want that agent doing the work inline in its main loop, not
+  // fanning out to subagents whose token cost and output we don't surface and that
+  // the `--resume` conversation can't introspect. `Agent` is the canonical spawner
+  // (`Task` is a legacy alias for it) and `Workflow` orchestrates fleets of them, at
+  // 21KB the most expensive schema the CLI has. Denying both closes every fan-out
+  // path, since blocking just one lets the model fall back to the other.
+  "Agent",
+  "Task",
+  "Workflow",
+  // Plan and task tracking, ~11KB of schema for bookkeeping rather than capability:
+  // `TaskCreate`/`TaskUpdate` are the model's todo list, and the queries around them
+  // report on tasks it filed or on the agent and remote sessions denied above.
+  // `TaskOutput` additionally announces itself as DEPRECATED, in favour of reading
+  // the task's output file. Codex's `update_plan` is switched off to match, in
+  // CODEX_CONFIG_OVERRIDES.
+  "TaskCreate",
+  "TaskUpdate",
+  "TaskGet",
+  "TaskList",
+  "TaskStop",
+  "TaskOutput",
+  // The typed sink the built-in review skills write findings to. `Skill` above keeps
+  // those skills reachable, so this is the one denial that costs a working path: a
+  // review renders as prose in the reply instead of a findings list. Its own
+  // description says to use it "only when the active code-review instructions tell
+  // you to", and those instructions can say to print the findings instead.
+  "ReportFindings",
+  // Notebook cell editing. `Read` renders a .ipynb as cells rather than raw JSON, so
+  // this is the only tool that can edit one without dumping the file through Bash
+  // first — but that is a narrow case to carry on every request.
+  "NotebookEdit",
+  // Host and cloud integrations isolade wires nothing up for, checked rather than
+  // assumed: nothing outside this file mentions cron, design-tool sync, device
+  // notifications, outbound chat messages, or guide sharing. `ScheduleWakeup` only
+  // paces a `/loop`, which needs a client that keeps re-invoking the CLI.
+  "DesignSync",
+  "CronCreate",
+  "CronDelete",
+  "CronList",
+  "ScheduleWakeup",
+  "PushNotification",
+  "SendMessage",
+  "ShareOnboardingGuide",
+  // Worktree switching. Its own description says to use it ONLY when a worktree is
+  // explicitly asked for, and a chat already gets an isolated tree by having its own
+  // VM, so the tool can only add a second one inside it. isolade's own uses of the
+  // word are about the build pipeline and diffs, not this session feature.
+  "EnterWorktree",
+  "ExitWorktree",
+] as const;
 
 // Bound on a single warm-session title turn. The cold one-shot path had a 20s
 // exec timeout. The persistent session has no built-in timeout, so we cap the
@@ -278,6 +385,7 @@ export class ClaudeBackend implements ChatBackend {
     onEvent?: (event: ChatEvent) => void;
     onMeta?: (meta: TurnMeta) => void;
     fast?: boolean;
+    systemPrompt?: IsoladeSystemPrompt;
     onBilling?: (models: ModelBilling[]) => void;
     onUserMessageAcknowledged?: (receipt?: UserMessageReceipt) => void;
   }): Promise<{ content: string; sessionId?: string }> {
@@ -291,6 +399,28 @@ export class ClaudeBackend implements ChatBackend {
     const fork = opts.sessionId ? opts.fork : undefined;
 
     let session = this.sessions.get(opts.chatId);
+    // The system prompt is a launch-time flag, and the CLI has no control request
+    // to change it, so a live process keeps the prompt it started with. We
+    // deliberately do NOT retire the process to refresh it: this process is kept
+    // alive precisely so the agent's background commands, and its handle on their
+    // output, survive between turns. Killing it to correct a line of prose would
+    // trade running work for tidiness.
+    //
+    // The staleness that would matter is the model id, and the CLI already handles
+    // that itself. Our `set_model` control request is implemented on its side as a
+    // synthesized `/model` slash command, which lands as three user messages,
+    // verified on the wire:
+    //
+    //   <local-command-caveat>Caveat: The messages below were generated by the user
+    //   while running local commands. DO NOT respond to these messages…
+    //   <command-name>/model</command-name> … <command-args><exact-id></command-args>
+    //   <local-command-stdout>Set model to <exact-id></local-command-stdout>
+    //
+    // So a switched-to model is stated more recently, more specifically, and with its
+    // own framing, than the launch-time prompt. (The CLI also carries a
+    // `<system-reminder>The model for this session has been changed to…` string, but
+    // that is not the path a control request takes.) Prompt and prelude edits apply
+    // when the process is next relaunched.
     if (session && (fork !== undefined || session.isDead() || session.vmId !== opts.vmId)) {
       // A dead or wrong-VM session can't be reused. A fork turn also always
       // retires the live process: there is no control request to rewind a
@@ -343,6 +473,7 @@ export class ClaudeBackend implements ChatBackend {
         claudeEffort,
         opts.sessionId,
         fork,
+        opts.systemPrompt,
       );
       this.sessions.set(opts.chatId, created);
       session = created;
@@ -424,6 +555,7 @@ export class ClaudeBackend implements ChatBackend {
     effort: string | undefined,
     resumeSessionId: string | undefined,
     fork?: { anchorId: string },
+    systemPrompt?: IsoladeSystemPrompt,
   ): string {
     const args = [
       "claude",
@@ -461,39 +593,34 @@ export class ClaudeBackend implements ChatBackend {
       // the value and ignores it when empty), so a bare `-` it is.
       "--name",
       "-",
-      // Disallowed tools. `--disallowedTools` is variadic (space/comma
-      // separated) and is a hard removal, not a permission prompt, so it still
-      // takes effect under `--dangerously-skip-permissions` above.
-      //
-      // AskUserQuestion is an interactive built-in tool the CLI resolves
-      // itself. In headless `-p` mode there's no UI to present the picker, so
-      // the CLI auto-fails the call with an `is_error` result ("Answer
-      // questions?"). stream-json input doesn't help, because the CLI owns the
-      // tool_use_id and rejects any client answer before it lands, so all the
-      // call does is burn a turn and produce an apologetic "awaiting your
-      // response" reply. Disallow it so the model never reaches for it.
-      //
-      // Agent/Task/Workflow are the subagent-spawning and orchestration tools.
-      // isolade runs one coding agent per chat in its own VM, and we want that
-      // agent doing the work inline in its main loop, not fanning out to
-      // subagents whose token cost and output we don't surface and that the
-      // `--resume` conversation can't introspect. `Agent` is the canonical
-      // spawner (`Task` is a legacy alias for it) and `Workflow` orchestrates
-      // fleets of subagents. Denying both closes every fan-out path (blocking
-      // just one lets the model fall back to the other), and background
-      // subagents are launched through `Agent` too, so they're covered.
-      //
-      // Deliberately NOT denied: background shell commands, which run through
-      // the `Bash` tool (`run_in_background: true`, output read back with
-      // `Read`), a separate path we rely on and keep working. The
-      // `TaskCreate`/`TaskUpdate` family is the model's todo/plan tracker, not
-      // a subagent launcher, so it stays enabled as well.
+      // Disallowed tools; see DISALLOWED_TOOLS for why each one goes.
+      // `--disallowedTools` is variadic (space/comma separated).
       "--disallowedTools",
-      "AskUserQuestion",
-      "Agent",
-      "Task",
-      "Workflow",
+      ...DISALLOWED_TOOLS,
     ];
+    // Blank both attribution strings, unconditionally. The CLI resolves them
+    // into the Bash tool's commit/PR guidance, which we do NOT override (tool
+    // descriptions are untouched by --system-prompt), so at their defaults the
+    // tool would advertise `Co-Authored-By: Claude` against the Isolade trailer
+    // our prompt asks for. Blanking `pr` also drops the "Generated with Claude
+    // Code" footer from PR bodies. Applied even for a prelude-only profile, which
+    // therefore gets no trailer at all unless its prelude supplies one.
+    args.push("--settings", shellQuote(JSON.stringify({ attribution: { commit: "", pr: "" } })));
+    // `replace` swaps the CLI's own prompt for ours, and does so even when the
+    // text is empty: `--system-prompt ""` is exactly how a profile asks for no
+    // prompt at all. `append` keeps the CLI's prompt and layers the prelude on
+    // top, so with nothing to add it is simply omitted.
+    //
+    // Either way the value travels in a shell variable rather than inline:
+    // preludes are user-authored and unbounded, and the whole command is one
+    // string sent to the VM, so a long one would run into ARG_MAX. base64 also
+    // makes it injection-safe regardless of its contents (the alphabet is
+    // `[A-Za-z0-9+/=]`, so the single-quoted literal cannot be escaped).
+    if (systemPrompt?.mode === "replace") {
+      args.push("--system-prompt", '"$ISOLADE_SP"');
+    } else if (systemPrompt?.text) {
+      args.push("--append-system-prompt", '"$ISOLADE_SP"');
+    }
     if (effort) {
       args.push("--effort", effort);
     }
@@ -509,7 +636,11 @@ export class ClaudeBackend implements ChatBackend {
       // `system/init` event, and the turn hooks below pick it up from there.
       args.push("--resume-session-at", fork.anchorId, "--fork-session");
     }
-    return args.join(" ");
+    const command = args.join(" ");
+    // Bind the variable only when a flag above actually referenced it.
+    if (!command.includes("ISOLADE_SP")) return command;
+    const b64 = Buffer.from(systemPrompt?.text ?? "", "utf8").toString("base64");
+    return `ISOLADE_SP="$(printf %s '${b64}' | base64 -d)"; ${command}`;
   }
 
   private createChatSession(
@@ -519,11 +650,12 @@ export class ClaudeBackend implements ChatBackend {
     effort: string | undefined,
     sessionId: string | undefined,
     fork?: { anchorId: string },
+    systemPrompt?: IsoladeSystemPrompt,
   ): ClaudeSession {
     const created = new ClaudeSession({
       sandboxClient: this.sandboxClient,
       vmId,
-      command: this.buildCommand(model, effort, sessionId, fork),
+      command: this.buildCommand(model, effort, sessionId, fork, systemPrompt),
       model,
       effort,
       // A fresh CLI always starts standard: fast mode has no command-line flag,
@@ -1010,6 +1142,11 @@ export class ClaudeBackend implements ChatBackend {
     model: string;
     effort: ChatEffort;
     sessionId?: string;
+    // Needed even though a probe sends no user turn: when the idle reaper has
+    // already retired the process, the relaunch below becomes the chat's new
+    // live process. Omitting it here would silently move the chat onto the
+    // stock harness prompt for every turn after someone opened /context.
+    systemPrompt?: IsoladeSystemPrompt;
   }): Promise<ContextBreakdown> {
     if (!opts.sessionId) {
       return {
@@ -1050,6 +1187,8 @@ export class ClaudeBackend implements ChatBackend {
         opts.model,
         claudeEffort,
         opts.sessionId,
+        undefined,
+        opts.systemPrompt,
       );
       this.sessions.set(opts.chatId, session);
     }

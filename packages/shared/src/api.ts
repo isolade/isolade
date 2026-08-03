@@ -590,8 +590,21 @@ export const EMPTY_RUNTIME_CONFIG: RuntimeConfig = {
 // The prelude prepended (invisibly) to the first user message of every new chat
 // in the profile. Edited on the Prompt settings section, saved to config.toml's
 // `[prompt]` table. Empty string means "no prelude".
+// Which base prompt sits in front of the profile's prelude, named as the UI names
+// them: "optimized" is Isolade's own sandbox brief, "minimal" is as close to
+// nothing as the provider allows, "unmodified" is whatever Claude Code or Codex
+// ships left alone, and "extended" is that same shipped prompt plus the few
+// corrections Isolade has to make to it. The prelude is added in every case.
+//
+// Ordered as the UI orders them: the two where Isolade replaces the prompt, then
+// the two where it keeps it — the same split as IsoladeSystemPrompt's
+// replace/append mode.
+export const promptBaseSchema = z.enum(["optimized", "minimal", "unmodified", "extended"]);
+export type PromptBase = z.infer<typeof promptBaseSchema>;
+
 export const promptConfigSchema = z.object({
   prelude: z.string(),
+  base: promptBaseSchema.default("optimized"),
 });
 export type PromptConfig = z.infer<typeof promptConfigSchema>;
 

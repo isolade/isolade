@@ -657,6 +657,149 @@ describe("ClaudeBackend stream-json parsing", () => {
     await tick();
   });
 
+  it("passes the system prompt through a shell var and blanks CLI attribution", async () => {
+    const proc = new FakeProc();
+    const backend = new ClaudeBackend(
+      { execStream: proc.execStream } as unknown as SandboxClient,
+      fakeChatManager(() => {}),
+    );
+    // A prelude can be long and is user-authored, so it travels base64-encoded
+    // in a shell variable rather than inline: the whole command is one string
+    // sent to the VM, and an inline value would risk ARG_MAX and quoting.
+    const systemPrompt = {
+      text: "You are a coding agent in Isolade.\n\n# Project instructions\n'quoted'",
+      mode: "replace" as const,
+    };
+    const pending = backend.probeContext({
+      vmId: "vm",
+      chatId: "chat",
+      model: "claude-sonnet-4-5",
+      effort: "high",
+      sessionId: "s",
+      systemPrompt,
+    });
+    await tick();
+
+    expect(proc.command).toContain('--system-prompt "$ISOLADE_SP"');
+    const encoded = /ISOLADE_SP="\$\(printf %s '([A-Za-z0-9+/=]+)' \| base64 -d\)"/.exec(
+      proc.command,
+    );
+    expect(encoded).not.toBeNull();
+    expect(Buffer.from(encoded![1]!, "base64").toString("utf8")).toBe(systemPrompt.text);
+    // Otherwise the untouched Bash tool description would keep advertising
+    // `Co-Authored-By: Claude` against our Assisted-by trailer.
+    expect(proc.command).toContain(
+      `--settings '${JSON.stringify({ attribution: { commit: "", pr: "" } })}'`,
+    );
+
+    const control = proc.controls("get_context_usage")[0];
+    proc.succeedControl(control, {
+      totalTokens: 1,
+      maxTokens: 2,
+      rawMaxTokens: 2,
+      percentage: 50,
+      categories: [],
+    });
+    await pending;
+    backend.disposeChat("chat");
+    proc.exit(0);
+    await tick();
+  });
+
+  it("still blanks CLI attribution for a prelude-only prompt", async () => {
+    // A prelude-only profile supplies no Isolade trailer, and the CLI's own is
+    // suppressed regardless, so such a profile gets no trailer unless its prelude
+    // adds one. Deliberate: Isolade never wants the harness's attribution.
+    const proc = new FakeProc();
+    const backend = new ClaudeBackend(
+      { execStream: proc.execStream } as unknown as SandboxClient,
+      fakeChatManager(() => {}),
+    );
+    const pending = backend.probeContext({
+      vmId: "vm",
+      chatId: "chat",
+      model: "claude-sonnet-4-5",
+      effort: "high",
+      sessionId: "s",
+      systemPrompt: { text: "Only my rules.", mode: "replace" as const },
+    });
+    await tick();
+
+    expect(proc.command).toContain('--system-prompt "$ISOLADE_SP"');
+    expect(proc.command).toContain("--settings");
+
+    const control = proc.controls("get_context_usage")[0];
+    proc.succeedControl(control, {
+      totalTokens: 1,
+      maxTokens: 2,
+      rawMaxTokens: 2,
+      percentage: 50,
+      categories: [],
+    });
+    await pending;
+    backend.disposeChat("chat");
+    proc.exit(0);
+    await tick();
+  });
+
+  // The three base-prompt choices reduce to three distinct command shapes. Each
+  // is asserted separately because the flag, not just the text, is what makes the
+  // CLI keep or discard its own prompt.
+  const commandFor = async (systemPrompt: { text: string; mode: "replace" | "append" }) => {
+    const proc = new FakeProc();
+    const backend = new ClaudeBackend(
+      { execStream: proc.execStream } as unknown as SandboxClient,
+      fakeChatManager(() => {}),
+    );
+    const pending = backend.probeContext({
+      vmId: "vm",
+      chatId: "chat",
+      model: "claude-sonnet-4-5",
+      effort: "high",
+      sessionId: "s",
+      systemPrompt,
+    });
+    await tick();
+    const command = proc.command;
+    proc.succeedControl(proc.controls("get_context_usage")[0], {
+      totalTokens: 1,
+      maxTokens: 2,
+      rawMaxTokens: 2,
+      percentage: 50,
+      categories: [],
+    });
+    await pending;
+    backend.disposeChat("chat");
+    proc.exit(0);
+    await tick();
+    return command;
+  };
+
+  it('base "minimal" passes an empty --system-prompt, which suppresses the CLI\'s own', async () => {
+    // Empty is NOT "no flag": omitting it would silently hand the chat the stock
+    // prompt, which is a different option in the UI.
+    const command = await commandFor({ text: "", mode: "replace" });
+    expect(command).toContain('--system-prompt "$ISOLADE_SP"');
+    expect(command).toContain("printf %s '' | base64 -d");
+    expect(command).not.toContain("--append-system-prompt");
+  });
+
+  it('base "unmodified" appends instead of replacing, keeping the CLI\'s prompt', async () => {
+    const command = await commandFor({ text: "Only my rules.", mode: "append" });
+    expect(command).toContain('--append-system-prompt "$ISOLADE_SP"');
+    // A bare --system-prompt would discard the prompt this option exists to keep.
+    expect(command).not.toMatch(/(?<!-)--system-prompt/);
+  });
+
+  it('base "unmodified" with nothing to add passes no prompt flag at all', async () => {
+    // Appending an empty string is a no-op, so the flag is simply omitted.
+    const command = await commandFor({ text: "", mode: "append" });
+    expect(command).not.toContain("system-prompt");
+    expect(command).not.toContain("ISOLADE_SP");
+    // Attribution is still suppressed, as it is on every chat.
+    expect(command).toContain("--settings");
+  });
+
   it("generateTitle runs `claude -p` in the VM and parses the result", async () => {
     let seenCommand = "";
     const client = {

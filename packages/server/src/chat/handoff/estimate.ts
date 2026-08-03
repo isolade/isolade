@@ -91,9 +91,13 @@ function classify(estimatedTotalTokens: number, limits: HandoffLimits): HandoffB
 }
 
 // Estimate the complete first target request from its assembled parts. Measures
-// the full prompt (prelude + envelope + handoff + attachments + current
+// the whole request (system prompt + envelope + handoff + attachments + current
 // message) for the bucket, and the current turn alone for the
 // unfixable-by-reduction rejection.
+//
+// The system prompt is counted in both figures even though it is not part of the
+// rendered user message: it rides on the same request, and no amount of history
+// reduction removes it, so it belongs in the irreducible floor too.
 export function estimateFirstTargetRequest(
   parts: FirstTargetPromptParts,
   capacity: TargetCapacity,
@@ -101,18 +105,23 @@ export function estimateFirstTargetRequest(
 ): HandoffEstimate {
   const limits = resolveLimits(capacity, constants);
 
-  const fullPrompt = renderFirstTargetPrompt(parts);
+  const withSystemPrompt = (userMessage: string): string =>
+    [parts.systemPrompt, userMessage].filter((s) => s.length > 0).join("\n\n");
+
+  const fullPrompt = withSystemPrompt(renderFirstTargetPrompt(parts));
   const estimatedInputTokens = estimateTokens(fullPrompt, constants);
   const estimatedTotalTokens =
     constants.baselineReserveTokens + estimatedInputTokens + constants.outputReserveTokens;
 
-  // The current turn with no history: prelude + attachments + user message.
-  const currentTurnText = renderFirstTargetPrompt({
-    prelude: parts.prelude,
-    handoff: { version: parts.handoff.version, source: parts.handoff.source, items: [] },
-    attachmentsPreamble: parts.attachmentsPreamble,
-    userMessage: parts.userMessage,
-  });
+  // The current turn with no history: system prompt + attachments + message.
+  const currentTurnText = withSystemPrompt(
+    renderFirstTargetPrompt({
+      systemPrompt: parts.systemPrompt,
+      handoff: { version: parts.handoff.version, source: parts.handoff.source, items: [] },
+      attachmentsPreamble: parts.attachmentsPreamble,
+      userMessage: parts.userMessage,
+    }),
+  );
   const currentTurnTotal =
     constants.baselineReserveTokens +
     estimateTokens(currentTurnText, constants) +
