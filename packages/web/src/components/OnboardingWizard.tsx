@@ -22,7 +22,7 @@ import {
   setProfileConfigForm,
   setRuntimeConfig,
 } from "../lib/api";
-import type { ProfileSummary } from "../lib/contracts";
+import type { ProfileStatus, ProfileSummary } from "../lib/contracts";
 import { BuildLogs } from "./BuildTab";
 import { ProviderSignIn } from "./ProvidersTab";
 
@@ -68,6 +68,9 @@ export default function OnboardingWizard({ onClose, onProfileCreated }: Onboardi
   // guided profile creation, and a run that quietly reconfigured a profile you
   // were already using would be a surprising way to spend a click.
   const [created, setCreated] = useState<ProfileSummary | null>(null);
+  // The build's status, reported up by the step that polls it, because the way
+  // onwards from that step lives in the card's footer rather than in the step.
+  const [buildStatus, setBuildStatus] = useState<ProfileStatus>("building");
 
   // Landing the user in the profile they just built, since one they cannot see
   // is a confusing thing to be left holding. Switching is a stored id plus a
@@ -89,7 +92,17 @@ export default function OnboardingWizard({ onClose, onProfileCreated }: Onboardi
   };
 
   return (
-    <WizardCard steps={STEPS} current={step} onClose={finish}>
+    <WizardCard
+      steps={STEPS}
+      current={step}
+      onClose={finish}
+      // Only the build step has a way onwards to offer. Sign-in advances itself
+      // when a provider answers, and the first step's two answers are the choice
+      // it is asking for.
+      action={
+        step === "build" ? <SignInAction ready={buildStatus === "ready"} onDone={advance} /> : null
+      }
+    >
       {step === "branch" && (
         <BranchStep
           onCreated={(profile) => {
@@ -100,7 +113,7 @@ export default function OnboardingWizard({ onClose, onProfileCreated }: Onboardi
         />
       )}
       {step === "build" && created && (
-        <BuildStep profileId={created.id} onDone={advance} onClose={finish} />
+        <BuildStep profileId={created.id} onStatus={setBuildStatus} />
       )}
       {step === "signin" && created && <SignInStep profileId={created.id} onDone={advance} />}
     </WizardCard>
@@ -108,16 +121,22 @@ export default function OnboardingWizard({ onClose, onProfileCreated }: Onboardi
 }
 
 /** The frame: one card, one question, and an indicator so the length of the
- *  thing is knowable from the first screen. Closeable at every step. */
+ *  thing is knowable from the first screen. Closeable at every step.
+ *
+ *  A step's way onwards goes in `action`, at the bottom beside Close, rather
+ *  than inside the step. The card then has exactly one row of controls, and a
+ *  step cannot grow a second button that also closes the card. */
 function WizardCard({
   steps,
   current,
   onClose,
+  action,
   children,
 }: {
   steps: StepId[];
   current: StepId;
   onClose: () => void;
+  action?: React.ReactNode;
   children: React.ReactNode;
 }) {
   const index = Math.max(0, steps.indexOf(current));
@@ -147,7 +166,7 @@ function WizardCard({
         </div>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">{children}</div>
-      <div className="flex justify-end border-t border-border px-5 py-3">
+      <div className="flex items-center justify-end gap-3 border-t border-border px-5 py-3">
         <button
           type="button"
           onClick={onClose}
@@ -155,6 +174,7 @@ function WizardCard({
         >
           Close
         </button>
+        {action}
       </div>
     </div>
   );
@@ -491,16 +511,30 @@ export function CustomStep({
   );
 }
 
+/** The way on from the build, in the card's footer. Present from the moment the
+ *  build starts and disabled until it succeeds, so the step it leads to is
+ *  visible while the waiting happens rather than appearing at the end. */
+export function SignInAction({ ready, onDone }: { ready: boolean; onDone: () => void }) {
+  return (
+    <Button size="sm" className="h-8 text-xs" disabled={!ready} onClick={onDone}>
+      Sign in
+    </Button>
+  );
+}
+
 /** Step 2. The build, which is slow the first time for reasons worth naming, so
- *  the wait reads as a wait rather than as a hang. Closing does not cancel it. */
+ *  the wait reads as a wait rather than as a hang. Closing does not cancel it.
+ *
+ *  It reports its status up rather than offering the way onwards itself: that
+ *  button is the card's, at the bottom. This step used to end in one of its own,
+ *  which while a build ran was a second control that closed the card, beside the
+ *  Close already there. */
 export function BuildStep({
   profileId,
-  onDone,
-  onClose,
+  onStatus,
 }: {
   profileId: string;
-  onDone: () => void;
-  onClose: () => void;
+  onStatus?: (status: ProfileStatus) => void;
 }) {
   const [profile, setProfile] = useState<ProfileSummary | null>(null);
   // Bumped to reconnect the log stream after a retry, the same way the Build
@@ -534,6 +568,12 @@ export function BuildStep({
   }, [profileId, poll]);
 
   const status = profile?.status ?? "building";
+  // Reported rather than returned, since the footer button that acts on it is
+  // rendered by the card above this step.
+  useEffect(() => {
+    onStatus?.(status);
+  }, [status, onStatus]);
+
   return (
     <div className="flex h-[26rem] flex-col gap-3">
       {status === "ready" ? (
@@ -584,39 +624,25 @@ export function BuildStep({
         />
       </div>
 
-      <div className="flex items-center gap-3">
-        {status === "ready" && (
-          <Button size="sm" className="h-8 text-xs" onClick={onDone}>
-            Sign in
-          </Button>
-        )}
-        {status === "error" && (
-          <>
-            <Button
-              size="sm"
-              className="h-8 text-xs"
-              disabled={retrying}
-              onClick={() => void retry()}
-            >
-              {retrying ? <Loader2 className="mr-1 size-3.5 animate-spin" /> : null}
-              Try again
-            </Button>
-            <span className="text-muted-foreground text-xs">
-              Or close this and fix the Dockerfile under Settings, Dockerfile. Nothing is lost: the
-              profile is there, and rebuilding picks up where this left off.
-            </span>
-          </>
-        )}
-        {status === "building" && (
-          <button
-            type="button"
-            onClick={onClose}
-            className="text-muted-foreground text-xs underline-offset-2 hover:underline"
+      {/* Only a failure has anything to offer here. Waiting needs no button, and
+          the way on from a build that worked is the card's, at the bottom. */}
+      {status === "error" && (
+        <div className="flex items-center gap-3">
+          <Button
+            size="sm"
+            className="h-8 text-xs"
+            disabled={retrying}
+            onClick={() => void retry()}
           >
-            Leave this running
-          </button>
-        )}
-      </div>
+            {retrying ? <Loader2 className="mr-1 size-3.5 animate-spin" /> : null}
+            Try again
+          </Button>
+          <span className="text-muted-foreground text-xs">
+            Or close this and fix the Dockerfile under Settings, Dockerfile. Nothing is lost: the
+            profile is there, and rebuilding picks up where this left off.
+          </span>
+        </div>
+      )}
     </div>
   );
 }

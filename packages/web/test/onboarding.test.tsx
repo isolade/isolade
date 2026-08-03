@@ -4,6 +4,7 @@ import OnboardingWizard, {
   BuildStep,
   ChooserStep,
   CustomStep,
+  SignInAction,
   STEPS,
 } from "../src/components/OnboardingWizard";
 import { shouldSelfOpen } from "../src/lib/useOnboarding";
@@ -61,7 +62,7 @@ describe("setting up your own", () => {
   });
 
   it("shows the Dockerfile it would write, before writing it", () => {
-    // The preview sits beside the questions, so the file is something the user
+    // The preview sits under the questions, so the file is something the user
     // has read once by the time it is theirs to edit.
     expect(html).toContain("FROM ubuntu:24.04");
   });
@@ -101,9 +102,7 @@ describe("opening itself", () => {
 
 describe("the build step", () => {
   // Rendered directly, since reaching it through the card needs a real build.
-  const html = renderToStaticMarkup(
-    <BuildStep profileId="p1" onDone={() => {}} onClose={() => {}} />,
-  );
+  const html = renderToStaticMarkup(<BuildStep profileId="p1" />);
 
   it("shows the build output rather than only its outcome", () => {
     // Watching it is the difference between a wait and a hang, and on a failure
@@ -113,6 +112,36 @@ describe("the build step", () => {
 
   it("says the wait is expected, and that leaving does not stop it", () => {
     expect(html).toContain("first build is the slow one");
-    expect(html).toContain("Leave this running");
+    expect(html).toContain("closing this card does not stop it");
+  });
+
+  it("offers nothing that closes the card, since the card has that", () => {
+    // It used to end in "Leave this running", which closed the card, directly
+    // above the Close that also closes it.
+    expect(html).not.toContain("Leave this running");
+    expect(html).not.toContain("<button");
+  });
+});
+
+describe("the way on from the build", () => {
+  it("is there from the start, and waits for a build that worked", () => {
+    // In the card's footer rather than in the step, so the wait does not reserve
+    // a row for a button that only appears at the end of it.
+    expect(renderToStaticMarkup(<SignInAction ready={false} onDone={() => {}} />)).toContain(
+      'disabled=""',
+    );
+    expect(renderToStaticMarkup(<SignInAction ready onDone={() => {}} />)).not.toContain(
+      'disabled=""',
+    );
+  });
+});
+
+describe("the card's controls", () => {
+  it("keeps them in one row at the bottom", () => {
+    // Close on the first step, Close and the way on from the build. Never two
+    // buttons that do the same thing.
+    const html = renderToStaticMarkup(<OnboardingWizard onClose={() => {}} />);
+    expect(html.match(/Close/g)).toHaveLength(1);
+    expect(html).not.toContain("Sign in<");
   });
 });
