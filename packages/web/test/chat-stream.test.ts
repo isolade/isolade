@@ -138,6 +138,124 @@ describe("runChatTurn", () => {
     }
   });
 
+  it("resumes when the initial response body fails after revealing the turn id", async () => {
+    let posts = 0;
+    let resumes = 0;
+    const mock = installMockFetch({
+      routes: [
+        {
+          method: "POST",
+          pathRegex: /\/messages$/,
+          respond: () => {
+            posts++;
+            return streamedResponse(async (controller) => {
+              const encoder = new TextEncoder();
+              controller.enqueue(
+                encoder.encode(`event: message_id\ndata: ${JSON.stringify("body-failed")}\n\n`),
+              );
+              controller.enqueue(
+                encoder.encode(`id: 0\nevent: delta\ndata: ${JSON.stringify("kept")}\n\n`),
+              );
+              await new Promise((resolve) => setTimeout(resolve, 0));
+              controller.error(new TypeError("socket reset"));
+            });
+          },
+        },
+        {
+          method: "GET",
+          pathRegex: /\/messages\/body-failed\/stream/,
+          respond: () => {
+            resumes++;
+            return new Response(sseBody([{ event: "done", data: "" }]), {
+              headers: { "Content-Type": "text/event-stream" },
+            });
+          },
+        },
+      ],
+    });
+    const events: ChatTurnEvent[] = [];
+    try {
+      await runChatTurn({
+        apiBase: "http://test",
+        instanceId: "i1",
+        chatId: "c1",
+        content: "hello",
+        userMessageId: "stable-user",
+        onEvent: (event) => events.push(event),
+        signal: new AbortController().signal,
+        maxRetries: 1,
+        backoffBaseMs: 0,
+      });
+
+      expect(posts).toBe(1);
+      expect(resumes).toBe(1);
+      expect(events.at(-1)).toEqual({ kind: "done" });
+      expect(events.some((event) => event.kind === "disconnected")).toBe(false);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  it("repeats the initial POST when its body fails before revealing the turn id", async () => {
+    let posts = 0;
+    const mock = installMockFetch({
+      routes: [
+        {
+          method: "POST",
+          pathRegex: /\/messages$/,
+          respond: () => {
+            posts++;
+            if (posts === 1) {
+              return streamedResponse(async (controller) => {
+                const encoder = new TextEncoder();
+                controller.enqueue(
+                  encoder.encode(
+                    `event: user_message\ndata: ${JSON.stringify({
+                      id: "stable-user",
+                      chatId: "c1",
+                      role: "user",
+                      parentId: null,
+                      content: "hello",
+                      createdAt: new Date(0).toISOString(),
+                    })}\n\n`,
+                  ),
+                );
+                await new Promise((resolve) => setTimeout(resolve, 0));
+                controller.error(new TypeError("socket reset"));
+              });
+            }
+            return new Response(
+              sseBody([
+                { event: "message_id", data: JSON.stringify("body-failed-early") },
+                { event: "done", data: "" },
+              ]),
+              { headers: { "Content-Type": "text/event-stream" } },
+            );
+          },
+        },
+      ],
+    });
+    const events: ChatTurnEvent[] = [];
+    try {
+      await runChatTurn({
+        apiBase: "http://test",
+        instanceId: "i1",
+        chatId: "c1",
+        content: "hello",
+        userMessageId: "stable-user",
+        onEvent: (event) => events.push(event),
+        signal: new AbortController().signal,
+        maxRetries: 1,
+        backoffBaseMs: 0,
+      });
+
+      expect(posts).toBe(2);
+      expect(events.at(-1)).toEqual({ kind: "done" });
+    } finally {
+      mock.restore();
+    }
+  });
+
   it("posts retained and added upload ids to the edit endpoint", async () => {
     let requestPath = "";
     let requestBody: unknown;
@@ -528,9 +646,9 @@ describe("runChatTurn", () => {
         backoffBaseMs: 1,
         backoffCapMs: 5,
       });
-      // After exhausting retries, we emit a synthetic error.
+      // Retry exhaustion is a reader disconnect, not a server terminal error.
       const last = events[events.length - 1];
-      expect(last.kind).toBe("error");
+      expect(last.kind).toBe("disconnected");
       // POST counts as the first attempt (attempt 0). Then we get
       // maxRetries=2 resume attempts (attempts 1 and 2). After
       // attempt 2's failure we exit the loop.
@@ -671,6 +789,57 @@ describe("resumeChatTurn", () => {
     }
   });
 
+  it("keeps progress made before throwing bodies out of the failure budget", async () => {
+    let attempts = 0;
+    const mock = installMockFetch({
+      routes: [
+        {
+          method: "GET",
+          pathRegex: /\/messages\/throwing-progress\/stream/,
+          respond: () => {
+            const seq = attempts++;
+            if (seq === 4) {
+              return new Response(sseBody([{ event: "done", data: "" }]), {
+                headers: { "Content-Type": "text/event-stream" },
+              });
+            }
+            return streamedResponse(async (controller) => {
+              controller.enqueue(
+                new TextEncoder().encode(
+                  `id: ${seq}\nevent: delta\ndata: ${JSON.stringify(`part-${seq}`)}\n\n`,
+                ),
+              );
+              await new Promise((resolve) => setTimeout(resolve, 0));
+              controller.error(new TypeError("socket reset"));
+            });
+          },
+        },
+      ],
+    });
+    const events: ChatTurnEvent[] = [];
+    try {
+      await resumeChatTurn({
+        apiBase: "http://test",
+        instanceId: "i1",
+        chatId: "c1",
+        messageId: "throwing-progress",
+        afterSeq: -1,
+        onEvent: (event) => events.push(event),
+        signal: new AbortController().signal,
+        maxRetries: 1,
+        backoffBaseMs: 0,
+      });
+
+      expect(attempts).toBe(5);
+      expect(events.at(-1)).toEqual({ kind: "done" });
+      expect(
+        events.filter((event) => event.kind === "event").map((event) => event.payload),
+      ).toEqual(["part-0", "part-1", "part-2", "part-3"]);
+    } finally {
+      mock.restore();
+    }
+  });
+
   it("returns a synthetic error when the server reports 404", async () => {
     const mock = installMockFetch({
       routes: [
@@ -725,10 +894,25 @@ describe("cancelChatTurn", () => {
       ],
     });
     try {
-      cancelChatTurn("http://test", "i1", "c1", "cancel-me");
-      // Best-effort, wait a beat for the fetch to fire.
-      await new Promise((r) => setTimeout(r, 20));
+      expect(await cancelChatTurn("http://test", "i1", "c1", "cancel-me")).toBe(true);
       expect(deleted).toBe(true);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  it("does not claim an unsuccessful request cancelled the provider turn", async () => {
+    const mock = installMockFetch({
+      routes: [
+        {
+          method: "DELETE",
+          pathRegex: /\/messages\/still-running$/,
+          respond: () => new Response("unavailable", { status: 503 }),
+        },
+      ],
+    });
+    try {
+      expect(await cancelChatTurn("http://test", "i1", "c1", "still-running")).toBe(false);
     } finally {
       mock.restore();
     }

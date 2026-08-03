@@ -64,6 +64,7 @@ export function ProductionChatHarness() {
   const parameters = useMemo(() => new URLSearchParams(window.location.search), []);
   const chatCount = Number(parameters.get("chats") ?? 2);
   const crossProviderPicker = parameters.get("crossProviderPicker") === "1";
+  const initialInFlightMessageId = parameters.get("inFlight");
   // The running turn each chat row reports, which the parent would get from the
   // chat poll. Kept out of the rows below so a test can move one row without
   // rebuilding the others and re-rendering every pane.
@@ -95,10 +96,13 @@ export function ProductionChatHarness() {
           modelContextWindow: null,
           compacted: null,
           activeLeafId: null,
+          ...(index === 0 && initialInFlightMessageId
+            ? { inFlightMessageId: initialInFlightMessageId }
+            : {}),
           createdAt: new Date(index * 1_000),
         };
       }),
-    [chatCount, crossProviderPicker],
+    [chatCount, crossProviderPicker, initialInFlightMessageId],
   );
   const chats = useMemo<ChatRow[]>(
     () =>

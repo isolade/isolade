@@ -138,6 +138,14 @@ async function openProductionHarness(
   return transcriptRequests;
 }
 
+async function speedReconnectBackoff(page: Page) {
+  await page.addInitScript(`
+    const nativeSetTimeout = window.setTimeout.bind(window);
+    window.setTimeout = (handler, timeout = 0, ...args) =>
+      nativeSetTimeout(handler, Math.min(timeout, 5), ...args);
+  `);
+}
+
 async function resetMetrics(page: Page) {
   await page.evaluate(() => window.__isoladeRendererHarness?.resetMetrics());
 }
@@ -380,6 +388,322 @@ test.describe("message renderer browser gate", () => {
     await expect(page.getByText("The reply nobody was watching.")).toBeVisible();
     // And it settles like any other turn once the stream ends.
     await expect(page.getByLabel("Working", { exact: false })).toHaveCount(0);
+  });
+
+  test("opens one reader when reconciliation wins the hydration race", async ({ page }) => {
+    const messageId = "chat-a-racing-turn";
+    let transcriptRequests = 0;
+    let releaseHydration!: () => void;
+    const hydrationHeld = new Promise<void>((resolve) => {
+      releaseHydration = resolve;
+    });
+    await page.route("**/api/instances/*/chats/*/transcript?*", async (route) => {
+      transcriptRequests++;
+      // Hydration registers first. Hold it so chat-row reconciliation discovers
+      // and follows the same turn first, then let the stale hydration response
+      // try to attach after a reader already owns the chat.
+      if (transcriptRequests === 1) await hydrationHeld;
+      await route.fulfill({
+        json: {
+          ...transcriptFixture("chat-a", 2),
+          inFlight: {
+            messageId,
+            lastSeq: -1,
+            chunks: [],
+            startedAt: new Date().toISOString(),
+          },
+        },
+      });
+    });
+
+    let streamRequests = 0;
+    let releaseStream!: () => void;
+    const streamHeld = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    await page.route(`**/messages/${messageId}/stream?*`, async (route) => {
+      streamRequests++;
+      await streamHeld;
+      await route.fulfill({
+        contentType: "text/event-stream",
+        body: [
+          "event: snapshot",
+          `data: ${JSON.stringify({
+            messageId,
+            lastSeq: -1,
+            chunks: [],
+            metaEvents: [],
+            status: "done",
+            message: null,
+          })}`,
+          "",
+          "event: done",
+          "data: ",
+          "",
+          "",
+        ].join("\n"),
+      });
+    });
+
+    await page.goto(`/test/browser/harness/index.html?production=1&chats=1&inFlight=${messageId}`);
+    await page.waitForFunction(
+      () => document.documentElement.dataset.productionHarnessReady === "true",
+    );
+    await expect.poll(() => transcriptRequests).toBeGreaterThanOrEqual(2);
+    await expect.poll(() => streamRequests).toBe(1);
+
+    releaseHydration();
+    await page.evaluate(() => window.__isoladeProductionChatHarness?.waitFrames(3));
+    // The hydration response used to overwrite abortRef and open a second GET.
+    expect(streamRequests).toBe(1);
+
+    releaseStream();
+    await expect(page.getByLabel("Working", { exact: false })).toHaveCount(0);
+  });
+
+  test("bounds reader handoffs when a running turn makes no progress", async ({ page }) => {
+    await speedReconnectBackoff(page);
+    const messageId = "chat-a-unreachable-turn";
+    await page.route("**/api/instances/*/chats/*/transcript?*", async (route) => {
+      await route.fulfill({
+        json: {
+          ...transcriptFixture("chat-a", 2),
+          inFlight: {
+            messageId,
+            lastSeq: -1,
+            chunks: [{ kind: "text", text: "Output before the connection failed." }],
+            startedAt: new Date().toISOString(),
+          },
+        },
+      });
+    });
+    let streamRequests = 0;
+    await page.route(`**/messages/${messageId}/stream?*`, async (route) => {
+      streamRequests++;
+      await route.fulfill({
+        contentType: "text/event-stream",
+        body: "event: ping\ndata: null\n\n",
+      });
+    });
+
+    await page.goto(`/test/browser/harness/index.html?production=1&chats=1&inFlight=${messageId}`);
+    await page.waitForFunction(
+      () => document.documentElement.dataset.productionHarnessReady === "true",
+    );
+    await expect(page.getByText("Reload to check its latest output.")).toHaveCount(1);
+    await expect(page.getByLabel("Working", { exact: false })).toHaveCount(0);
+    await expect(page.getByText("Output before the connection failed.")).toBeVisible();
+
+    // Nine attempts in the original reader and nine in the one allowed handoff.
+    expect(streamRequests).toBe(18);
+    await page.waitForTimeout(150);
+    expect(streamRequests).toBe(18);
+  });
+
+  test("does not paint an interruption when Stop fails", async ({ page }) => {
+    const messageId = "chat-a-failed-stop";
+    await page.route("**/api/instances/*/chats/*/transcript?*", async (route) => {
+      await route.fulfill({
+        json: {
+          ...transcriptFixture("chat-a", 2),
+          inFlight: {
+            messageId,
+            lastSeq: -1,
+            chunks: [{ kind: "text", text: "Still running" }],
+            startedAt: new Date().toISOString(),
+          },
+        },
+      });
+    });
+    let releaseStream!: () => void;
+    const streamRelease = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    await page.route(`**/messages/${messageId}/stream?*`, async (route) => {
+      await streamRelease;
+      const completed = {
+        messageId,
+        lastSeq: 0,
+        chunks: [{ kind: "text", text: "Still running and then completed." }],
+        metaEvents: [],
+        status: "done",
+        message: null,
+      };
+      await route.fulfill({
+        contentType: "text/event-stream",
+        body: `event: snapshot\ndata: ${JSON.stringify(completed)}\n\nevent: done\ndata: null\n\n`,
+      });
+    });
+    await page.route("**/api/instances/*/chats/*/messages/*", async (route) => {
+      if (route.request().method() === "DELETE") await route.fulfill({ status: 503 });
+      else await route.fallback();
+    });
+
+    await page.goto(`/test/browser/harness/index.html?production=1&chats=1&inFlight=${messageId}`);
+    await page.waitForFunction(
+      () => document.documentElement.dataset.productionHarnessReady === "true",
+    );
+    await page.getByRole("button", { name: "Stop" }).click();
+    await expect(page.getByText("Agent interrupted")).toHaveCount(0);
+    await expect(page.getByLabel("Working", { exact: false })).toHaveCount(1);
+
+    releaseStream();
+    await expect(page.getByText("Still running and then completed.")).toBeVisible();
+    await expect(page.getByText("Agent interrupted")).toHaveCount(0);
+    await expect(page.getByLabel("Working", { exact: false })).toHaveCount(0);
+  });
+
+  test("preserves the version pager across a reader handoff", async ({ page }) => {
+    await speedReconnectBackoff(page);
+    const replacementAssistantId = "chat-a-retried-assistant";
+    const inlineUserId = "chat-a-inline-user";
+    await page.route("**/api/instances/*/chats/*/transcript?*", async (route) => {
+      const transcript = transcriptFixture("chat-a", 2);
+      transcript.messages[1]!.version = {
+        index: 1,
+        count: 1,
+        previousId: null,
+        nextId: null,
+      };
+      await route.fulfill({
+        json: {
+          ...transcript,
+          chunksByMessage: {
+            [transcript.messages[1]!.id]: [
+              { kind: "text", text: "Original answer." },
+              {
+                kind: "user_message",
+                id: inlineUserId,
+                content: "Original follow-up",
+                capabilities: { edit: true },
+              },
+              { kind: "text", text: "Original continuation." },
+            ],
+          },
+        },
+      });
+    });
+    await page.route(`**/messages/${inlineUserId}/edit*`, async (route) => {
+      await route.fulfill({
+        contentType: "text/event-stream",
+        body:
+          `event: user_message\ndata: ${JSON.stringify({
+            id: "chat-a-edited-inline-user",
+            chatId: "chat-a",
+            role: "user",
+            content: "Edited follow-up",
+            parentId: "chat-a-production-m0",
+            createdAt: new Date().toISOString(),
+            version: null,
+          })}\n\n` + `event: message_id\ndata: ${JSON.stringify(replacementAssistantId)}\n\n`,
+      });
+    });
+    let resumeRequests = 0;
+    let releaseFirstResume!: () => void;
+    const firstResumeRelease = new Promise<void>((resolve) => {
+      releaseFirstResume = resolve;
+    });
+    await page.route(`**/messages/${replacementAssistantId}/stream?*`, async (route) => {
+      resumeRequests++;
+      if (resumeRequests === 1) await firstResumeRelease;
+      if (resumeRequests <= 9) {
+        await route.fulfill({
+          contentType: "text/event-stream",
+          body: "event: ping\ndata: null\n\n",
+        });
+        return;
+      }
+      const completed = {
+        messageId: replacementAssistantId,
+        lastSeq: 0,
+        chunks: [{ kind: "text", text: "Edited continuation after reconnect." }],
+        metaEvents: [],
+        status: "done",
+        message: {
+          id: replacementAssistantId,
+          chatId: "chat-a",
+          role: "assistant",
+          content: "Edited continuation after reconnect.",
+          parentId: "chat-a-edited-inline-user",
+          createdAt: new Date().toISOString(),
+          version: null,
+        },
+      };
+      await route.fulfill({
+        contentType: "text/event-stream",
+        body: `event: snapshot\ndata: ${JSON.stringify(completed)}\n\nevent: done\ndata: null\n\n`,
+      });
+    });
+
+    await page.goto("/test/browser/harness/index.html?production=1&chats=1");
+    await page.waitForFunction(
+      () => document.documentElement.dataset.productionHarnessReady === "true",
+    );
+    const inlineMessage = page.locator(`[data-steered-user-message="${inlineUserId}"]`);
+    await inlineMessage.hover();
+    await inlineMessage.getByRole("button", { name: "Edit message" }).click();
+    await inlineMessage.locator("textarea").fill("Edited follow-up");
+    await inlineMessage.getByRole("button", { name: "Send" }).click();
+    await expect.poll(() => resumeRequests).toBe(1);
+    await page.evaluate(
+      (id) => window.__isoladeProductionChatHarness?.setChatInFlight("chat-a", id),
+      replacementAssistantId,
+    );
+    releaseFirstResume();
+
+    await expect(page.getByText("Edited continuation after reconnect.")).toBeVisible();
+    await expect(page.getByText("2/2", { exact: true })).toBeVisible();
+    expect(resumeRequests).toBe(10);
+  });
+
+  test("waits to attach a discovered turn until its pane is visible", async ({ page }) => {
+    const messageId = "chat-b-hidden-turn";
+    let chatBHasTurn = false;
+    let chatBTranscriptRequests = 0;
+    await page.route("**/api/instances/*/chats/*/transcript?*", async (route) => {
+      const match = new URL(route.request().url()).pathname.match(/\/chats\/([^/]+)\/transcript$/);
+      const chatId = match?.[1] ?? "chat-a";
+      if (chatId === "chat-b") chatBTranscriptRequests++;
+      await route.fulfill({
+        json: {
+          ...transcriptFixture(chatId, 2),
+          inFlight:
+            chatId === "chat-b" && chatBHasTurn
+              ? { messageId, lastSeq: -1, chunks: [], startedAt: new Date().toISOString() }
+              : null,
+        },
+      });
+    });
+    let streamRequests = 0;
+    await page.route(`**/messages/${messageId}/stream?*`, async (route) => {
+      streamRequests++;
+      await route.fulfill({
+        contentType: "text/event-stream",
+        body: `event: snapshot\ndata: ${JSON.stringify({
+          messageId,
+          lastSeq: -1,
+          chunks: [],
+          metaEvents: [],
+          status: "done",
+          message: null,
+        })}\n\nevent: done\ndata: null\n\n`,
+      });
+    });
+
+    await page.goto("/test/browser/harness/index.html?production=1&chats=2");
+    await page.waitForFunction(
+      () => document.documentElement.dataset.productionHarnessReady === "true",
+    );
+    chatBHasTurn = true;
+    await page.evaluate(
+      (id) => window.__isoladeProductionChatHarness?.setChatInFlight("chat-b", id),
+      messageId,
+    );
+    await expect.poll(() => chatBTranscriptRequests).toBeGreaterThanOrEqual(2);
+    expect(streamRequests).toBe(0);
+
+    await page.evaluate(() => window.__isoladeProductionChatHarness?.switchChat("chat-b"));
+    await expect.poll(() => streamRequests).toBe(1);
   });
 
   test("keeps expanded-sidebar tabs flush with the panel edge", async ({ page }) => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { unfollowedTurnId } from "../src/components/chat/turn-attachment";
+import { TurnLifecycle, unfollowedTurnId } from "../src/components/chat/turn-attachment";
 
 const held = (...ids: string[]) => {
   const set = new Set(ids);
@@ -14,7 +14,7 @@ describe("unfollowedTurnId", () => {
     expect(
       unfollowedTurnId({
         inFlightMessageId: "assistant-2",
-        streaming: false,
+        active: false,
         holdsMessage: held("user-1", "assistant-1", "user-2"),
       }),
     ).toBe("assistant-2");
@@ -26,7 +26,7 @@ describe("unfollowedTurnId", () => {
     expect(
       unfollowedTurnId({
         inFlightMessageId: "assistant-2",
-        streaming: true,
+        active: true,
         holdsMessage: held(),
       }),
     ).toBeNull();
@@ -38,7 +38,7 @@ describe("unfollowedTurnId", () => {
     expect(
       unfollowedTurnId({
         inFlightMessageId: "assistant-2",
-        streaming: false,
+        active: false,
         holdsMessage: held("assistant-2"),
       }),
     ).toBeNull();
@@ -47,8 +47,39 @@ describe("unfollowedTurnId", () => {
   it("names nothing on a chat between turns, or one whose row predates the field", () => {
     for (const inFlightMessageId of [null, undefined]) {
       expect(
-        unfollowedTurnId({ inFlightMessageId, streaming: false, holdsMessage: held() }),
+        unfollowedTurnId({ inFlightMessageId, active: false, holdsMessage: held() }),
       ).toBeNull();
     }
+  });
+});
+
+describe("TurnLifecycle", () => {
+  it("lets only one synchronous contender claim an idle chat", () => {
+    const lifecycle = new TurnLifecycle();
+    const hydration = lifecycle.claim();
+
+    expect(hydration).not.toBeNull();
+    expect(lifecycle.claim()).toBeNull();
+    expect(lifecycle.active).toBe(true);
+  });
+
+  it("does not let stale cleanup release a replacement turn", () => {
+    const lifecycle = new TurnLifecycle();
+    const original = lifecycle.claim()!;
+    const replacement = lifecycle.replace();
+
+    expect(lifecycle.release(original)).toBe(false);
+    expect(lifecycle.owns(replacement)).toBe(true);
+    expect(lifecycle.release(replacement)).toBe(true);
+    expect(lifecycle.active).toBe(false);
+  });
+
+  it("can hand the bootstrap turn's existing lease to its first reader", () => {
+    const lifecycle = new TurnLifecycle(true);
+    const bootstrap = lifecycle.current;
+
+    expect(bootstrap).not.toBeNull();
+    expect(lifecycle.claim()).toBeNull();
+    expect(lifecycle.release(bootstrap!)).toBe(true);
   });
 });
