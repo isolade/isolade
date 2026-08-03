@@ -86,7 +86,8 @@ export function resolveFontFamily(value: string): string {
 const AGENT_FONT_KEY = "isolade.font.agent";
 const USER_FONT_KEY = "isolade.font.user";
 // Legacy boolean that toggled the agent font between serif (false) and
-// sans-serif (true). Read once to seed the agent font for existing users.
+// sans-serif (true). Read once to keep serif for users who had picked it back
+// when serif was the default.
 const LEGACY_SANS_SERIF_KEY = "isolade.sansSerif";
 
 function stringSetting(key: string, read: () => string) {
@@ -104,11 +105,11 @@ const agentFontSetting = stringSetting(AGENT_FONT_KEY, () => {
   try {
     const v = window.localStorage.getItem(AGENT_FONT_KEY);
     if (v) return v;
-    if (window.localStorage.getItem(LEGACY_SANS_SERIF_KEY) === "true") {
-      return "sans-serif";
+    if (window.localStorage.getItem(LEGACY_SANS_SERIF_KEY) === "false") {
+      return "serif";
     }
   } catch {}
-  return "serif";
+  return "sans-serif";
 });
 
 const userFontSetting = stringSetting(USER_FONT_KEY, () => {

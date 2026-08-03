@@ -8,6 +8,9 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Changed
 
+- Agent messages are now set in a sans-serif face by default. If you had picked
+  serif, that sticks, and Settings still offers serif and any font on your
+  machine.
 - A profile's instructions are now part of the system prompt rather than being
   prepended to a chat's first message, so they hold for the whole chat and
   outrank the rest of it. You can also pick the prompt they join: Isolade's own,
