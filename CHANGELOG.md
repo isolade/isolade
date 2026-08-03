@@ -6,6 +6,8 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+## [0.6.0] - 2026-08-03
+
 ### Added
 
 - New installs now guide you through creating and building a first profile, either
