@@ -255,6 +255,16 @@ export function buildSystemPrompt(opts: {
   const patchRules = isClaude ? [] : [CODEX_PATCH_RULES];
   const preludeBlocks = prelude ? [`${PRELUDE_HEADING}\n${prelude}`] : [];
 
+  // "Minimal": replace the harness prompt with the prelude alone, unheaded — there
+  // is nothing above it for a heading to separate it from. Called "minimal" rather
+  // than "none" because on codex it still carries the patch rules: dropping those
+  // trades a long prompt for wrong edits. Their `# Editing files` heading marks the
+  // boundary.
+  if (opts.base === "minimal") {
+    const minimal = [...patchRules, ...(prelude ? [prelude] : [])].join("\n\n");
+    return { text: pad(minimal, opts.provider, "replace"), mode: "replace" };
+  }
+
   // "The agent's own": leave the harness prompt entirely alone and layer only the
   // profile's instructions on top.
   if (opts.base === "unmodified") {
@@ -299,16 +309,6 @@ export function buildSystemPrompt(opts: {
       ...(prelude ? [PRELUDE_PRECEDENCE, ...preludeBlocks] : []),
     ].join("\n\n");
     return { text: pad(overlay, opts.provider, "append"), mode: "append" };
-  }
-
-  // "Minimal": replace the harness prompt with the prelude alone, unheaded — there
-  // is nothing above it for a heading to separate it from. Called "minimal" rather
-  // than "none" because on codex it still carries the patch rules: dropping those
-  // trades a long prompt for wrong edits. Their `# Editing files` heading marks the
-  // boundary.
-  if (opts.base === "minimal") {
-    const minimal = [...patchRules, ...(prelude ? [prelude] : [])].join("\n\n");
-    return { text: pad(minimal, opts.provider, "replace"), mode: "replace" };
   }
 
   // Ordered stable-to-volatile, because the prompt cache matches on the longest

@@ -10,8 +10,8 @@ const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 // Ordered best-default-first, then by whether Isolade replaces the prompt or keeps
 // it — the same split as the replace/append mode in IsoladeSystemPrompt. One line
 // each, since the hint is the only explanation an option gets and a reader is
-// choosing between four of them. Extended and Unmodified open the same way on
-// purpose: they differ only in what follows.
+// choosing between four of them. No two hints open alike, so the list can be
+// scanned on first words rather than read four times over.
 const BASE_OPTIONS: { value: PromptConfig["base"]; label: string; hint: string }[] = [
   {
     value: "optimized",
@@ -24,14 +24,14 @@ const BASE_OPTIONS: { value: PromptConfig["base"]; label: string; hint: string }
     hint: "Removes almost the entire system prompt, leaving only your own instructions behind.",
   },
   {
-    value: "extended",
-    label: "Extended",
-    hint: "The prompt Claude Code or Codex ships, plus the little Isolade has to correct.",
-  },
-  {
     value: "unmodified",
     label: "Unmodified",
-    hint: "The prompt Claude Code or Codex ships, and nothing else (not recommended).",
+    hint: "The prompt Claude Code or Codex ships, and nothing else.",
+  },
+  {
+    value: "extended",
+    label: "Extended",
+    hint: "Adds the few corrections Isolade needs on top of the stock prompt.",
   },
 ];
 
@@ -151,9 +151,7 @@ export default function PromptTab({ activeProfileId }: { activeProfileId: string
       <div className="max-w-2xl space-y-1.5">
         <div className="space-y-0.5">
           <span className="text-sm font-medium">Your instructions</span>
-          <p className="text-xs text-muted-foreground">
-            Added below the base prompt, and in effect for the whole chat.
-          </p>
+          <p className="text-xs text-muted-foreground">Added below the base prompt.</p>
         </div>
         <Textarea
           value={cfg.prelude}

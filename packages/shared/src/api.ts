@@ -592,14 +592,14 @@ export const EMPTY_RUNTIME_CONFIG: RuntimeConfig = {
 // `[prompt]` table. Empty string means "no prelude".
 // Which base prompt sits in front of the profile's prelude, named as the UI names
 // them: "optimized" is Isolade's own sandbox brief, "minimal" is as close to
-// nothing as the provider allows, "extended" is what Claude Code or Codex ships
-// plus the few corrections Isolade has to make to it, and "unmodified" is that
-// same shipped prompt left alone. The prelude is added in every case.
+// nothing as the provider allows, "unmodified" is whatever Claude Code or Codex
+// ships left alone, and "extended" is that same shipped prompt plus the few
+// corrections Isolade has to make to it. The prelude is added in every case.
 //
 // Ordered as the UI orders them: the two where Isolade replaces the prompt, then
 // the two where it keeps it — the same split as IsoladeSystemPrompt's
 // replace/append mode.
-export const promptBaseSchema = z.enum(["optimized", "minimal", "extended", "unmodified"]);
+export const promptBaseSchema = z.enum(["optimized", "minimal", "unmodified", "extended"]);
 export type PromptBase = z.infer<typeof promptBaseSchema>;
 
 export const promptConfigSchema = z.object({
