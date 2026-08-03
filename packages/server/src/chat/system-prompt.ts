@@ -149,6 +149,28 @@ the location is unambiguous.`;
  * before them. Appending the prelude last keeps two chats in a profile sharing
  * a prefix instead of diverging at the first block.
  */
+/**
+ * Claude concatenates the blocks of its system array with nothing in between, and
+ * the block before ours is the SDK identity line ("You are a Claude agent, built
+ * on Anthropic's Claude Agent SDK."). Unpadded, the model reads
+ * "...Claude Agent SDK.You are a coding agent in Isolade". Claude Code's own
+ * prompt opens with a bare newline for exactly this reason — see
+ * getSimpleIntroSection in constants/prompts.ts, which carries an eslint-disable
+ * for a rule named `custom-rules/prompt-spacing`.
+ *
+ * Only when replacing: appending is joined by the CLI with a blank line already.
+ *
+ * Codex needs none of this. It gives each section its own content part rather than
+ * one blob, and does not pad between its own sections either, so padding there
+ * would only add trailing whitespace. Both facts are pinned in
+ * codex-stub-api.test.ts.
+ */
+function pad(text: string, provider: ChatProvider, mode: IsoladeSystemPrompt["mode"]): string {
+  // An empty replace is a flag (`--system-prompt ""`), not content, so leave it be.
+  if (text.length === 0 || provider !== "anthropic" || mode !== "replace") return text;
+  return `\n${text}`;
+}
+
 export function buildSystemPrompt(opts: {
   provider: ChatProvider;
   model: string;
@@ -166,7 +188,9 @@ export function buildSystemPrompt(opts: {
 
   // "The agent's own": leave the harness prompt entirely alone and layer only the
   // profile's instructions on top.
-  if (opts.base === "cli") return { text: prelude ?? "", mode: "append" };
+  if (opts.base === "cli") {
+    return { text: pad(prelude ?? "", opts.provider, "append"), mode: "append" };
+  }
 
   // "Minimal": replace the harness prompt with the prelude alone, unheaded — there
   // is nothing above it for a heading to separate it from. Named "minimal" rather
@@ -174,10 +198,8 @@ export function buildSystemPrompt(opts: {
   // trades a long prompt for wrong edits. Their `# Editing files` heading marks the
   // boundary.
   if (opts.base === "minimal") {
-    return {
-      text: [...patchRules, ...(prelude ? [prelude] : [])].join("\n\n"),
-      mode: "replace",
-    };
+    const minimal = [...patchRules, ...(prelude ? [prelude] : [])].join("\n\n");
+    return { text: pad(minimal, opts.provider, "replace"), mode: "replace" };
   }
 
   const text = [
@@ -192,5 +214,5 @@ export function buildSystemPrompt(opts: {
     ...patchRules,
     ...(prelude ? [PRELUDE_PRECEDENCE, ...preludeBlocks] : []),
   ].join("\n\n");
-  return { text, mode: "replace" };
+  return { text: pad(text, opts.provider, "replace"), mode: "replace" };
 }

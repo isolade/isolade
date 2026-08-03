@@ -93,8 +93,9 @@ describe("buildSystemPrompt", () => {
     });
 
     it('"minimal" replaces the CLI\'s prompt with the prelude alone', () => {
+      // Leading newline is the adjacency padding, see the block below.
       expect(build("Only my rules.", "minimal")).toEqual({
-        text: "Only my rules.",
+        text: "\nOnly my rules.",
         mode: "replace",
       });
     });
@@ -133,6 +134,62 @@ describe("buildSystemPrompt", () => {
       expect(p.mode).toBe("replace");
       expect(p.text).toContain("You are a coding agent in Isolade");
       expect(p.text).toContain("# Editing files");
+    });
+  });
+
+  describe("adjacency with harness text", () => {
+    // Neither provider inserts a separator, so our text has to bring its own.
+    it("leads with a newline when replacing Claude's prompt", () => {
+      // The SDK identity block sits immediately before ours and concatenates:
+      // "...Claude Agent SDK." + "You are a coding agent...". Claude Code's own
+      // prompt opens with a bare newline for the same reason.
+      for (const base of ["isolade", "minimal"] as PromptBase[]) {
+        const text = buildSystemPrompt({
+          provider: "anthropic",
+          model: "claude-opus-5",
+          prelude: "Mine.",
+          base,
+        }).text;
+        expect(text.startsWith("\n")).toBe(true);
+        expect(text.startsWith("\n\n")).toBe(false);
+      }
+    });
+
+    it("adds no padding where the harness already separates", () => {
+      // Claude appending: the CLI joins with a blank line itself. Codex either way:
+      // it gives each section its own content part rather than one concatenated
+      // blob, and does not pad between its own sections either.
+      expect(
+        buildSystemPrompt({
+          provider: "anthropic",
+          model: "claude-opus-5",
+          prelude: "Mine.",
+          base: "cli",
+        }).text,
+      ).toBe("Mine.");
+      for (const base of ["cli", "minimal", "isolade"] as PromptBase[]) {
+        const text = buildSystemPrompt({
+          provider: "openai",
+          model: "gpt-5.6-sol",
+          prelude: "Mine.",
+          base,
+        }).text;
+        expect(text.startsWith("\n")).toBe(false);
+        expect(text.endsWith("\n")).toBe(false);
+      }
+    });
+
+    it("leaves an empty prompt empty, since that is a flag rather than content", () => {
+      // `--system-prompt ""` is how "no prompt" is expressed; a lone newline
+      // would turn it into a content block saying nothing.
+      expect(
+        buildSystemPrompt({
+          provider: "anthropic",
+          model: "claude-opus-5",
+          prelude: null,
+          base: "minimal",
+        }).text,
+      ).toBe("");
     });
   });
 

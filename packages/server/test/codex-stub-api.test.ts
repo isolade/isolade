@@ -199,6 +199,24 @@ describe.skipIf(!hasCodex)("codex against a stub API", () => {
     expect(developerText.some((text) => text.includes(SENTINEL))).toBe(true);
   }, 60_000);
 
+  it("keeps our text in its own content part, so it needs no spacing of its own", async () => {
+    // Why buildSystemPrompt pads for Claude but not codex. Claude's system blocks
+    // concatenate, so its own prompt opens with a bare newline to survive the SDK
+    // identity line above it. Codex instead gives each section a separate content
+    // part, and does not pad between its OWN sections either — so padding here
+    // would just add trailing whitespace.
+    const request = await captureTurn({ developerInstructions: SENTINEL });
+    const parts = (request.input ?? [])
+      .map((item) => item as { role?: string; content?: { text?: string }[] })
+      .filter((item) => item.role === "developer")
+      .flatMap((item) => item.content ?? [])
+      .map((part) => part.text ?? "");
+
+    expect(parts).toContain(SENTINEL);
+    // Codex's own sections are siblings, not neighbours in one blob.
+    expect(parts.filter((text) => text.startsWith("<permissions instructions>")).length).toBe(1);
+  }, 60_000);
+
   it("sends its tool specs either way, so replacing the prompt costs guidance only", async () => {
     // The premise of replacing codex's prompt at all: capability travels with the
     // tools, not the prose. If this ever fails, buildSystemPrompt has to carry
