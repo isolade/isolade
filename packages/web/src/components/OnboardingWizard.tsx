@@ -122,7 +122,10 @@ function WizardCard({
 }) {
   const index = Math.max(0, steps.indexOf(current));
   return (
-    <div className="flex max-h-[80vh] w-full max-w-4xl flex-col rounded-xl border border-border bg-background shadow-lg">
+    // Narrow and tall rather than wide and short: one column of questions reads
+    // top to bottom, where a wide card spread the same questions into two and
+    // made every line of prose a different length.
+    <div className="flex max-h-[88vh] w-full max-w-xl flex-col rounded-xl border border-border bg-background shadow-lg">
       <div className="flex items-center justify-between border-b border-border px-5 py-3">
         <div className="flex flex-col gap-0.5">
           <span className="font-medium text-sm">{STEP_TITLES[current]}</span>
@@ -326,7 +329,7 @@ export function CustomStep({
   }, [filled, names, dockerfile, name, onCreated]);
 
   return (
-    <div className="grid grid-cols-[1fr_22rem] gap-5">
+    <div className="space-y-5">
       <div className="min-w-0 space-y-5">
         <div className="space-y-2">
           <label htmlFor="onboarding-name" className="font-medium text-sm">
@@ -447,39 +450,14 @@ export function CustomStep({
             </div>
           ))}
         </div>
-
-        <div className="flex items-center gap-3">
-          <Button
-            size="sm"
-            className="h-8 text-xs"
-            disabled={busy}
-            onClick={() => void createOwn()}
-          >
-            {busy ? <Loader2 className="mr-1 size-3.5 animate-spin" /> : null}
-            Build this
-          </Button>
-          <button
-            type="button"
-            onClick={() => onBack()}
-            className="text-muted-foreground text-xs underline-offset-2 hover:underline"
-          >
-            Back
-          </button>
-        </div>
-
-        {error && (
-          <p className="flex items-start gap-1.5 text-destructive text-xs">
-            <AlertTriangle className="mt-px size-3.5 shrink-0" />
-            {error}
-          </p>
-        )}
       </div>
 
-      {/* What the answers add up to, live, so the file is something the user has
-          already read once by the time it is theirs to edit. */}
+      {/* What the answers add up to, live, under the questions that produced it,
+          so the file is something the user has already read once by the time it
+          is theirs to edit. */}
       <div className="flex min-w-0 flex-col gap-2">
         <span className="font-medium text-sm">Dockerfile</span>
-        <pre className="min-h-0 flex-1 overflow-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-[11px] leading-relaxed">
+        <pre className="max-h-64 overflow-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-[11px] leading-relaxed">
           {dockerfile}
         </pre>
         <p className="text-muted-foreground text-xs">
@@ -488,6 +466,27 @@ export function CustomStep({
           you what it needed.
         </p>
       </div>
+
+      <div className="flex items-center gap-3">
+        <Button size="sm" className="h-8 text-xs" disabled={busy} onClick={() => void createOwn()}>
+          {busy ? <Loader2 className="mr-1 size-3.5 animate-spin" /> : null}
+          Build this
+        </Button>
+        <button
+          type="button"
+          onClick={() => onBack()}
+          className="text-muted-foreground text-xs underline-offset-2 hover:underline"
+        >
+          Back
+        </button>
+      </div>
+
+      {error && (
+        <p className="flex items-start gap-1.5 text-destructive text-xs">
+          <AlertTriangle className="mt-px size-3.5 shrink-0" />
+          {error}
+        </p>
+      )}
     </div>
   );
 }
