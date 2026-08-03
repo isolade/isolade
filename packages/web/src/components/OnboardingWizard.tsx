@@ -24,6 +24,7 @@ import {
 } from "../lib/api";
 import type { ProfileStatus, ProfileSummary } from "../lib/contracts";
 import { BuildLogs } from "./BuildTab";
+import { CodeEditor } from "./CodeEditor";
 import { ProviderSignIn } from "./ProvidersTab";
 
 // The guided setup a new install opens onto. It performs the prerequisites nobody
@@ -37,21 +38,29 @@ import { ProviderSignIn } from "./ProvidersTab";
 /** The steps a run has. The same ones every time, in the same order, whatever
  *  the install already has: a step that moves between runs is a step nobody can
  *  picture. */
-type StepId = "signin" | "branch" | "build";
+type StepId = "signin" | "branch" | "dockerfile" | "build";
 
 const STEP_TITLES: Record<StepId, string> = {
   signin: "Sign in to an agent",
   branch: "Choose what to work on",
+  dockerfile: "Review the Dockerfile",
   build: "Build the environment",
 };
 
 /** The steps, in this order, every run.
  *
+ * The Dockerfile has a step of its own because it is the thing a newcomer stalls
+ * on, and a file worth reading is worth a screen rather than a column beside the
+ * questions that wrote it. It comes before the build for the obvious reason: the
+ * build is of that file, and an edit after it has run is an edit that costs
+ * another build. The demo goes through it too, since a run that changes shape
+ * with the answers is a run nobody can picture.
+ *
  * Sign-in is last because it cannot be anywhere else: the in-app login runs the
  * provider's CLI inside a throwaway VM booted from a built profile image
  * (`app.ts`, `loginImage`), so there is nothing to sign in inside until a build
  * has happened. A build needs no credentials, so the dependency runs one way. */
-export const STEPS: StepId[] = ["branch", "build", "signin"];
+export const STEPS: StepId[] = ["branch", "dockerfile", "build", "signin"];
 
 export interface OnboardingWizardProps {
   /** Fired on close, however it closes. The caller records the dismissal. */
@@ -71,6 +80,13 @@ export default function OnboardingWizard({ onClose, onProfileCreated }: Onboardi
   // The build's status, reported up by the step that polls it, because the way
   // onwards from that step lives in the card's footer rather than in the step.
   const [buildStatus, setBuildStatus] = useState<ProfileStatus>("building");
+  // The Dockerfile, handed over by whichever way the run went (composed from the
+  // answers, or the demo's) and editable on its own step. Held here rather than
+  // read back from the server, since the step that wrote it knows it and the
+  // footer button that builds it has to see the edits.
+  const [dockerfile, setDockerfileDraft] = useState("");
+  const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
 
   // Landing the user in the profile they just built, since one they cannot see
   // is a confusing thing to be left holding. Switching is a stored id plus a
@@ -85,32 +101,59 @@ export default function OnboardingWizard({ onClose, onProfileCreated }: Onboardi
     onClose();
   }, [created, onClose]);
 
-  const advance = () => {
+  const advance = useCallback(() => {
     const next = STEPS[STEPS.indexOf(step) + 1];
     if (next) setStep(next);
     else finish();
-  };
+  }, [step, finish]);
+
+  // Leaving the Dockerfile step saves whatever is in the editor and starts the
+  // build from it. Saving unconditionally rather than tracking a dirty flag: the
+  // file already holds this text, so writing it again costs one request and is
+  // one fewer thing to get wrong.
+  const startBuild = useCallback(async () => {
+    if (!created) return;
+    setStarting(true);
+    setStartError(null);
+    try {
+      await setDockerfile(created.id, dockerfile);
+      await rebuildProfile(created.id);
+      advance();
+    } catch (err) {
+      setStartError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setStarting(false);
+    }
+  }, [created, dockerfile, advance]);
 
   return (
     <WizardCard
       steps={STEPS}
       current={step}
       onClose={finish}
-      // Only the build step has a way onwards to offer. Sign-in advances itself
+      // The way onwards, for the two steps that have one. Sign-in advances itself
       // when a provider answers, and the first step's two answers are the choice
       // it is asking for.
       action={
-        step === "build" ? <SignInAction ready={buildStatus === "ready"} onDone={advance} /> : null
+        step === "dockerfile" ? (
+          <BuildAction busy={starting} onStart={() => void startBuild()} />
+        ) : step === "build" ? (
+          <SignInAction ready={buildStatus === "ready"} onDone={advance} />
+        ) : null
       }
     >
       {step === "branch" && (
         <BranchStep
-          onCreated={(profile) => {
+          onCreated={(profile, composed) => {
             setCreated(profile);
+            setDockerfileDraft(composed);
             onProfileCreated?.(profile);
             advance();
           }}
         />
+      )}
+      {step === "dockerfile" && (
+        <DockerfileStep value={dockerfile} onChange={setDockerfileDraft} error={startError} />
       )}
       {step === "build" && created && (
         <BuildStep profileId={created.id} onStatus={setBuildStatus} />
@@ -180,7 +223,57 @@ function WizardCard({
   );
 }
 
-/** Step 3. A frame over the real sign-in, plus the one sentence that stops
+/** Step 2. The file the build is of, on a screen of its own, highlighted and
+ *  editable with the same editor as Settings, Dockerfile. Editing here is the
+ *  cheap moment to do it: the build has not run yet, so a change costs nothing.
+ *
+ *  Controlled by the card, which holds the text and writes it on the way out. */
+export function DockerfileStep({
+  value,
+  onChange,
+  error,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  error?: string | null;
+}) {
+  return (
+    <div className="flex flex-col gap-3">
+      <p className="text-muted-foreground text-xs">
+        Written from your answers, and yours to change. It installs no project dependencies on
+        purpose, so the first build cannot fail on them: an agent can do that in the VM and tell you
+        what it needed, which is a line to add here once you know. This same file is under Settings,
+        Dockerfile afterwards.
+      </p>
+      <CodeEditor
+        value={value}
+        onChange={onChange}
+        language="dockerfile"
+        ariaLabel="Dockerfile"
+        placeholder="FROM ubuntu:24.04…"
+        className="min-h-[24rem]"
+      />
+      {error && (
+        <p className="flex items-start gap-1.5 text-destructive text-xs">
+          <AlertTriangle className="mt-px size-3.5 shrink-0" />
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** The way on from the Dockerfile: save what is in the editor, then build it. */
+export function BuildAction({ busy, onStart }: { busy: boolean; onStart: () => void }) {
+  return (
+    <Button size="sm" className="h-8 text-xs" disabled={busy} onClick={onStart}>
+      {busy ? <Loader2 className="mr-1 size-3.5 animate-spin" /> : null}
+      Build this
+    </Button>
+  );
+}
+
+/** Step 4. A frame over the real sign-in, plus the one sentence that stops
  *  "sign in" reading as "create an account with Isolade". */
 function SignInStep({ profileId, onDone }: { profileId: string; onDone: () => void }) {
   return (
@@ -200,18 +293,20 @@ function SignInStep({ profileId, onDone }: { profileId: string; onDone: () => vo
 }
 
 /** Step 1, first screen: which way this run is going. The choice lives inside
- *  the step rather than being a step of its own, so a run is the same three
+ *  the step rather than being a step of its own, so a run is the same four
  *  steps whichever way it goes. */
 export function ChooserStep({
   onCreated,
   onCustom,
 }: {
-  onCreated: (profile: ProfileSummary) => void;
+  onCreated: (profile: ProfileSummary, dockerfile: string) => void;
   onCustom: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // The profile is written but not built. The build starts from the Dockerfile
+  // step, so an edit there is in the first build rather than a second one.
   const createDemo = useCallback(async () => {
     setBusy(true);
     setError(null);
@@ -221,8 +316,7 @@ export function ChooserStep({
       await setProfileConfigForm(profile.id, demo.form);
       await setDockerfile(profile.id, demo.dockerfile);
       await setRuntimeConfig(profile.id, demo.runtime);
-      await rebuildProfile(profile.id);
-      onCreated(profile);
+      onCreated(profile, demo.dockerfile);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setBusy(false);
@@ -300,7 +394,7 @@ export function CustomStep({
   onCreated,
   onBack,
 }: {
-  onCreated: (profile: ProfileSummary) => void;
+  onCreated: (profile: ProfileSummary, dockerfile: string) => void;
   onBack: () => void;
 }) {
   const [name, setName] = useState("");
@@ -339,9 +433,10 @@ export function CustomStep({
         dockerfile: "./Dockerfile",
         skills: [],
       });
+      // Written, not built. The next step shows this file, and the build starts
+      // from there with whatever it says by then.
       await setDockerfile(profile.id, dockerfile);
-      await rebuildProfile(profile.id);
-      onCreated(profile);
+      onCreated(profile, dockerfile);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setBusy(false);
@@ -472,25 +567,10 @@ export function CustomStep({
         </div>
       </div>
 
-      {/* What the answers add up to, live, under the questions that produced it,
-          so the file is something the user has already read once by the time it
-          is theirs to edit. */}
-      <div className="flex min-w-0 flex-col gap-2">
-        <span className="font-medium text-sm">Dockerfile</span>
-        <pre className="max-h-64 overflow-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-[11px] leading-relaxed">
-          {dockerfile}
-        </pre>
-        <p className="text-muted-foreground text-xs">
-          Yours after this, under Settings, Dockerfile. It installs no project dependencies on
-          purpose, so the first build cannot fail on them: the agent can do that in the VM and tell
-          you what it needed.
-        </p>
-      </div>
-
       <div className="flex items-center gap-3">
         <Button size="sm" className="h-8 text-xs" disabled={busy} onClick={() => void createOwn()}>
           {busy ? <Loader2 className="mr-1 size-3.5 animate-spin" /> : null}
-          Build this
+          Write the Dockerfile
         </Button>
         <button
           type="button"
@@ -648,7 +728,11 @@ export function BuildStep({
 }
 
 /** Step 1. The chooser, then the form if that is the way it went. */
-export function BranchStep({ onCreated }: { onCreated: (profile: ProfileSummary) => void }) {
+export function BranchStep({
+  onCreated,
+}: {
+  onCreated: (profile: ProfileSummary, dockerfile: string) => void;
+}) {
   const [own, setOwn] = useState(false);
   return own ? (
     <CustomStep onCreated={onCreated} onBack={() => setOwn(false)} />

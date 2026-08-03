@@ -9,7 +9,8 @@ _Changes landed on `main` that haven't shipped in a release yet._
 ### Added
 
 - New installs now guide you through creating and building a first profile, either
-  from the ready-made Excalidraw demo or your own repositories and toolchains.
+  from the ready-made Excalidraw demo or your own repositories and toolchains. It
+  writes the Dockerfile and shows it to you to edit before the first build.
   Guided setup is also available from Settings > Profiles.
 
 ### Changed

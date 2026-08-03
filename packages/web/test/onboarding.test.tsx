@@ -4,13 +4,14 @@ import OnboardingWizard, {
   BuildStep,
   ChooserStep,
   CustomStep,
+  DockerfileStep,
   SignInAction,
   STEPS,
 } from "../src/components/OnboardingWizard";
 import { shouldSelfOpen } from "../src/lib/useOnboarding";
 
 // The guided setup. What is worth pinning is the shape of a run: the
-// same three steps every time, a choice before any questions, and a card that
+// same four steps every time, a choice before any questions, and a card that
 // only puts itself on screen when there is nothing to work with.
 
 describe("the card", () => {
@@ -19,14 +20,15 @@ describe("the card", () => {
     // created once the run knows what it is making.
     const html = renderToStaticMarkup(<OnboardingWizard onClose={() => {}} />);
     expect(html).toContain("The Excalidraw demo");
-    expect(html).toContain("Step 1 of 3");
+    expect(html).toContain("Step 1 of 4");
   });
 
-  it("always runs the same three steps, in the same order", () => {
-    // Sign-in boots a VM from a built image, so it cannot precede the build, and
-    // a profile the wizard just created is never already signed in. One shape
-    // for every run.
-    expect(STEPS).toEqual(["branch", "build", "signin"]);
+  it("always runs the same four steps, in the same order", () => {
+    // The Dockerfile is read before the build is of it, since an edit afterwards
+    // costs a second build. Sign-in boots a VM from a built image, so it cannot
+    // precede the build, and a profile the wizard just created is never already
+    // signed in. One shape for every run.
+    expect(STEPS).toEqual(["branch", "dockerfile", "build", "signin"]);
   });
 });
 
@@ -61,10 +63,11 @@ describe("setting up your own", () => {
     expect(html).toContain("Debian 13");
   });
 
-  it("shows the Dockerfile it would write, before writing it", () => {
-    // The preview sits under the questions, so the file is something the user
-    // has read once by the time it is theirs to edit.
-    expect(html).toContain("FROM ubuntu:24.04");
+  it("asks its questions without the file they compose", () => {
+    // The Dockerfile has a step of its own now, so this screen is questions only
+    // rather than questions beside a preview of the answer.
+    expect(html).not.toContain("FROM ubuntu:24.04");
+    expect(html).toContain("Write the Dockerfile");
   });
 
   it("requires nothing: an empty workspace is a valid profile", () => {
@@ -75,6 +78,30 @@ describe("setting up your own", () => {
     // Node arrives in every image, so offering it would suggest a choice that
     // does not exist.
     expect(html).not.toContain(">Node<");
+  });
+});
+
+describe("the Dockerfile step", () => {
+  const html = renderToStaticMarkup(
+    <DockerfileStep value={"FROM ubuntu:24.04\nRUN apt-get update\n"} onChange={() => {}} />,
+  );
+
+  it("shows the file, highlighted the way Settings shows it", () => {
+    // The same CodeEditor, so the tokens carry the same `hljs-` classes as the
+    // Dockerfile section and the chat's code blocks.
+    expect(html).toContain("FROM ubuntu:24.04");
+    expect(html).toContain("hljs-");
+  });
+
+  it("lets it be edited before anything is built", () => {
+    // A build has not run yet at this point, so a change here costs nothing,
+    // where the same change after the build costs another one.
+    expect(html).toContain("<textarea");
+    expect(html).not.toContain("readonly");
+  });
+
+  it("says where the file lives afterwards", () => {
+    expect(html).toContain("Settings, Dockerfile");
   });
 });
 
