@@ -37,6 +37,9 @@ _Changes landed on `main` that haven't shipped in a release yet._
 - Chats now recover more reliably when a running reply's connection drops,
   including replies started from queued messages. A failed Stop request no
   longer hides a turn that is still running.
+- Sending a message into a running reply no longer scatters copies of the
+  "Agent interrupted" divider through the rest of the reply. One interruption
+  leaves one divider.
 
 ## [0.5.0] - 2026-08-02
 

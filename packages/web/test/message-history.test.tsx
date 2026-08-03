@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { createRef } from "react";
+import { createRef, isValidElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { StreamView } from "../src/components/chat/blocks";
+import type { StreamChunk } from "../src/components/chat/chunks";
 import { MessageHistory } from "../src/components/chat/MessageHistory";
 import { UserMessage } from "../src/components/chat/UserMessage";
 import type { TranscriptMessage } from "../src/lib/contracts";
@@ -193,6 +195,33 @@ describe("MessageHistory", () => {
     expect(html.indexOf("Change direction")).toBeLessThan(
       html.indexOf("Continuing with the new direction."),
     );
+  });
+
+  it("gives every chunk in a turn its own render key", () => {
+    // An interruption marker and the steering message that caused it carry the
+    // same id by design, and both are laid out in one array, so the kind has to
+    // be part of the key or React sees one key twice and is free to drop a
+    // block. The keys are read off the element tree because renderToStaticMarkup
+    // resolves to the production JSX runtime here, which does not check them.
+    const chunks: StreamChunk[] = [
+      { kind: "text", text: "Working." },
+      { kind: "thought", id: "steer-1", provider: "claude", text: "Rethinking", status: "done" },
+      { kind: "interruption", id: "steer-1" },
+      { kind: "user_message", id: "steer-1", content: "Change direction" },
+      { kind: "text", text: "Continuing with the new direction." },
+    ];
+    const tree = StreamView.type({
+      chunks,
+      showDebug: false,
+      instanceId: "instance-test",
+      userFontFamily: "user-font",
+    });
+    const keys = (tree.props as { children: ReactNode[] }).children
+      .filter(isValidElement)
+      .map((child) => child.key);
+
+    expect(keys).toHaveLength(chunks.length);
+    expect(new Set(keys).size).toBe(keys.length);
   });
 
   it("uses capabilities to expose editing without changing in-turn message presentation", () => {
