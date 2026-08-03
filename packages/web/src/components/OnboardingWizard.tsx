@@ -19,8 +19,8 @@ import {
   getProfile,
   rebuildProfile,
   setDockerfile,
+  setNetworkConfig,
   setProfileConfigForm,
-  setRuntimeConfig,
 } from "../lib/api";
 import type { ProfileStatus, ProfileSummary } from "../lib/contracts";
 import { BuildLogs } from "./BuildTab";
@@ -315,7 +315,9 @@ export function ChooserStep({
       const profile = await createProfile(demo.name);
       await setProfileConfigForm(profile.id, demo.form);
       await setDockerfile(profile.id, demo.dockerfile);
-      await setRuntimeConfig(profile.id, demo.runtime);
+      // The dev server's port, forwarded from the moment an instance exists, so
+      // the preview is ready for it before anything is listening.
+      await setNetworkConfig(profile.id, demo.network);
       onCreated(profile, demo.dockerfile);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -340,9 +342,9 @@ export function ChooserStep({
               The Excalidraw demo
             </span>
             <p className="text-muted-foreground text-xs">
-              Excalidraw, cloned and built for you, with its dev server ready to start. Nothing on
-              your machine is touched, and the drawing app shows up in the preview once an agent
-              runs it.
+              Excalidraw, cloned and built for you, dependencies and all. Nothing on your machine is
+              touched. Ask an agent to start its dev server and the drawing app appears in a Browser
+              tab, on a port forwarded for it already.
             </p>
           </div>
           <Button

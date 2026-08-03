@@ -1,4 +1,4 @@
-import type { ProfileConfigForm, RuntimeConfig } from "@isolade/shared";
+import type { NetworkConfig, ProfileConfigForm } from "@isolade/shared";
 
 // The demo profile the onboarding wizard can install, so someone can watch an
 // agent work without first authoring anything.
@@ -17,6 +17,11 @@ import type { ProfileConfigForm, RuntimeConfig } from "@isolade/shared";
 export const DEMO_PROFILE_NAME = "Excalidraw";
 
 export const DEMO_REPO_NAME = "excalidraw";
+
+/** The port excalidraw's dev server binds. Forwarded from the moment an instance
+ *  is created rather than when something starts listening, so the preview is
+ *  already pointed at it when the server does come up. */
+export const DEMO_PORT = 3000;
 
 /** Uid the demo's agent user takes. Fixed rather than left to `useradd`, so the
  *  yarn cache mount below can be owned by it: BuildKit gives a cache mount to
@@ -58,6 +63,11 @@ COPY --from=${DEMO_REPO_NAME} --chown=agent:agent . .
 
 USER agent
 
+# Vite's config here sets \`open: true\`, and a VM has no browser to open, so
+# every \`yarn start\` would end its own startup with a failure to launch one.
+# Set once in the image rather than expected of whoever runs the command.
+ENV BROWSER=none
+
 # Dependencies are installed here rather than on first boot, so an instance
 # starts with a working tree ready to run. The cache mount means a rebuild
 # re-uses the download instead of fetching the tree again.
@@ -79,19 +89,25 @@ export const DEMO_CONFIG_FORM: ProfileConfigForm = {
 };
 
 /**
- * The dev server runs from the async start phase, so an instance comes up with
- * port 3000 listening and the ports panel offering it as a one-click preview,
- * rather than the agent having to think of starting it. Async because a dev
- * server never exits, so a sync entry would hold the instance at boot forever.
+ * The forward, opened when an instance is created, and nothing else.
  *
- * BROWSER=none because Vite's config sets `open: true`, and inside a VM there is
- * no browser to open, which otherwise puts a failure in the logs on every boot.
+ * The dev server is deliberately not started for you. It used to run from the
+ * profile's async start phase, which made the demo a thing that was already
+ * running, and the one thing the demo is for is watching an agent do something.
+ * "Start the dev server" is a good first thing to ask for: one command, an
+ * obvious result, and the result appears in the preview beside the chat.
+ *
+ * The forward is what makes that work without a detour. A forward can be open on
+ * a port nothing is listening on yet (it binds on the host and dials the guest
+ * per connection), so declaring the port here means the Browser tab is already
+ * pointed at excalidraw when it starts answering, instead of sending someone to
+ * the Ports panel to press Forward first.
  */
-export const DEMO_RUNTIME_CONFIG: RuntimeConfig = {
-  caches: [],
-  setup: { sync: [], async: [] },
-  start: {
-    sync: [],
-    async: [`cd /workspace/${DEMO_REPO_NAME} && BROWSER=none yarn start`],
-  },
+export const DEMO_NETWORK_CONFIG: NetworkConfig = {
+  internet: "open",
+  allowedDomains: [],
+  allowLocalNetwork: false,
+  allowHost: false,
+  ports: [DEMO_PORT],
+  hostPorts: [],
 };

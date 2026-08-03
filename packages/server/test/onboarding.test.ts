@@ -12,7 +12,13 @@ import {
   TOOL_CATEGORIES,
   TOOLCHAINS,
 } from "@isolade/shared";
-import { DEMO_CONFIG_FORM, DEMO_DOCKERFILE, DEMO_REPO_NAME } from "../src/onboarding-demo";
+import {
+  DEMO_CONFIG_FORM,
+  DEMO_DOCKERFILE,
+  DEMO_NETWORK_CONFIG,
+  DEMO_PORT,
+  DEMO_REPO_NAME,
+} from "../src/onboarding-demo";
 import { expandHomePath } from "../src/profile-config";
 import { createOnboardingRouter } from "../src/routes/onboarding";
 
@@ -300,7 +306,7 @@ describe("the routes", () => {
     expect(res.status).toBe(200);
     const demo = onboardingDemoSchema.parse(await res.json());
     expect(demo.form.repos[0]?.source).toContain("excalidraw");
-    expect(demo.runtime.start.async[0]).toContain("BROWSER=none");
+    expect(demo.network.ports).toEqual([DEMO_PORT]);
   });
 });
 
@@ -315,6 +321,22 @@ describe("the demo definition", () => {
     // The demo is a definition we own and test, so it can do what a scaffold for
     // an unknown project must not: run something that can fail.
     expect(DEMO_DOCKERFILE).toContain("yarn install");
+  });
+
+  it("forwards the dev server's port without starting the dev server", () => {
+    // The demo exists to be watched doing something, and "start the dev server"
+    // is that something. The forward is open before anything listens, so the
+    // preview has it the moment an agent runs the command, with no trip to the
+    // Ports panel in between.
+    expect(DEMO_NETWORK_CONFIG.ports).toEqual([DEMO_PORT]);
+    const instructions = DEMO_DOCKERFILE.split("\n").filter((line) => !line.trim().startsWith("#"));
+    expect(instructions.join("\n")).not.toContain("yarn start");
+  });
+
+  it("spares whoever runs that command Vite's attempt to open a browser", () => {
+    // Its config sets `open: true`, and a VM has no browser, so every start
+    // would end in a failure to launch one.
+    expect(DEMO_DOCKERFILE).toContain("ENV BROWSER=none");
   });
 
   it("hands the checkout to the user the agent runs as", () => {

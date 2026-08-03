@@ -650,6 +650,9 @@ export const onboardingDemoSchema = z.object({
   name: z.string(),
   form: profileConfigFormSchema,
   dockerfile: z.string(),
-  runtime: runtimeConfigSchema,
+  /** The demo's network posture, which exists for one line of it: the dev
+   *  server's port, forwarded from the moment an instance is created so the
+   *  preview works the instant something answers on it. */
+  network: networkConfigSchema,
 });
 export type OnboardingDemo = z.infer<typeof onboardingDemoSchema>;

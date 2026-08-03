@@ -5,8 +5,8 @@ import { onboardingDemoSchema, repoPathBodySchema, repoPathCheckSchema } from ".
 import {
   DEMO_CONFIG_FORM,
   DEMO_DOCKERFILE,
+  DEMO_NETWORK_CONFIG,
   DEMO_PROFILE_NAME,
-  DEMO_RUNTIME_CONFIG,
 } from "../onboarding-demo";
 import { expandHomePath, parseGitRemoteUrl } from "../profile-config";
 import type { RouteContext } from "./context";
@@ -81,7 +81,7 @@ export function createOnboardingRouter(_ctx: RouteContext): Hono {
         name: DEMO_PROFILE_NAME,
         form: DEMO_CONFIG_FORM,
         dockerfile: DEMO_DOCKERFILE,
-        runtime: DEMO_RUNTIME_CONFIG,
+        network: DEMO_NETWORK_CONFIG,
       }),
     ),
   );
