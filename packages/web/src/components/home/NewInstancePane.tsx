@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useComposerAuth } from "@/components/ComposerAuthGate";
 import { AttachmentStrip } from "@/components/chat/AttachmentStrip";
 import { FastModeToggle } from "@/components/FastModeToggle";
 import { MessageBox } from "@/components/MessageBox";
 import { ModelEffortPicker } from "@/components/ModelEffortPicker";
+import { availableModels, useAgentAuth } from "@/lib/agent-auth";
 import { beaconDeleteInstance, createInstance, deleteInstance } from "../../lib/api";
 import {
   readLastEffort,
@@ -84,18 +86,30 @@ export default function NewInstancePane({
     if (!modelDef) return;
     setEffort((prev) => clampEffortToModel(prev, modelDef));
   }, [modelDef]);
+  // Which providers this profile can actually start a chat on. A draft is not
+  // yet a chat, so an unavailable model here is only ever a stale selection to
+  // move off (the effect below), never one to keep showing.
+  const { available } = useAgentAuth();
   // Snap to a visible model when the current selection isn't offered — the
-  // catalog hasn't loaded the stored id yet, or the profile has hidden it.
-  // Prefer the default Claude model, then any frontier model, so the picker
-  // always reflects something the server will accept.
+  // catalog hasn't loaded the stored id yet, the profile has hidden it, or its
+  // provider isn't signed in. Prefer the default Claude model, then any frontier
+  // model, so the picker always reflects something the server will accept. With
+  // nothing signed in there is no such model, and the composer says so instead.
   useEffect(() => {
     if (chatModels.length === 0) return;
-    const { frontier, more } = splitModelsByTier(chatModels, modelOverrides);
+    const { frontier, more } = splitModelsByTier(
+      availableModels(chatModels, available),
+      modelOverrides,
+    );
     const visible = [...frontier, ...more];
     if (visible.some((m) => m.id === modelId)) return;
     const fallback = visible.find((m) => m.id === DEFAULT_ANTHROPIC_MODEL_ID) ?? visible[0];
     if (fallback) setModelId(fallback.id);
-  }, [chatModels, modelOverrides, modelId]);
+  }, [chatModels, modelOverrides, modelId, available]);
+  // With nothing signed in the box keeps every control it normally has, all of
+  // them off, under the sign-in overlay: what is unavailable is the composer the
+  // user already knows, not a different one.
+  const composerAuth = useComposerAuth(modelDef);
   const spawnPromiseRef = useRef<Promise<Instance> | null>(null);
   const pendingInstanceIdRef = useRef<string | null>(null);
   const submittedRef = useRef(false);
@@ -231,6 +245,10 @@ export default function NewInstancePane({
           onPaste={handlePaste}
           hasAttachments={attachments.items.length > 0}
           attachments={<AttachmentStrip items={attachments.items} onRemove={attachments.remove} />}
+          disabled={composerAuth.disabled}
+          sendDisabled={composerAuth.sendDisabled}
+          sendDisabledReason={composerAuth.sendDisabledReason}
+          cover={composerAuth.cover}
           // No `status`, `cost` or `context`: a draft has no chat behind it, so
           // there is no turn to time, no spend to report and nothing in a
           // context yet. Those slots stay empty rather than reading zero. Fast
@@ -244,10 +262,16 @@ export default function NewInstancePane({
               currentEffort={effort}
               onModelChange={handlePickModel}
               onEffortChange={handlePickEffort}
+              disabled={composerAuth.disabled}
             />
           }
           fastMode={
-            <FastModeToggle model={modelDef} fastMode={fastMode} onFastModeChange={setFastMode} />
+            <FastModeToggle
+              model={modelDef}
+              fastMode={fastMode}
+              onFastModeChange={setFastMode}
+              disabled={composerAuth.disabled}
+            />
           }
         />
       </div>
