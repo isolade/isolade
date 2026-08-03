@@ -14,6 +14,10 @@ _Changes landed on `main` that haven't shipped in a release yet._
   written for a disposable VM and now the default; the one Claude Code or Codex
   ships, either as it comes or with the few corrections Isolade needs on top; or
   none at all.
+- Agents are now told what the app around them can do, so a chat hands you a
+  server it started when you ask to see it, attaches a pull request it works on
+  to the title bar, and shows a screenshot or chart inline in its reply instead
+  of leaving you a path to open.
 - Chats now carry only the tools they can use, so every message costs less. A
   Claude chat sends about 18 KB before it says a word, down from 60 KB, and a Codex
   chat 2.8 KB, down from 10 KB.

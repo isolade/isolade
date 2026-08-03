@@ -47,6 +47,36 @@ describe("buildSystemPrompt", () => {
     expect(claude()).not.toContain("# Editing files");
   });
 
+  it("names the in-VM isolade CLI on both providers", () => {
+    // Nothing else in a chat mentions it: it is not a tool, not in either vendor
+    // prompt, and not in codex's <environment_context>. Untold, the agent cannot
+    // publish a port or attach a PR at all.
+    for (const prompt of [claude(), codex()]) {
+      expect(prompt).toContain("isolade ports add 5173");
+      expect(prompt).toContain("isolade pr add 123");
+      // The forward is offered for when the user wants to look, not told to be done
+      // on starting anything: most servers an agent starts are its own scaffolding.
+      expect(prompt).toContain("When the user wants to look at a server you started");
+    }
+  });
+
+  it("says a reply can render an image, with an absolute example path", () => {
+    // Both vendor prompts promise a monospace or CLI-styled surface, so a picture is
+    // not something either model can infer. The example is absolute because a relative
+    // destination resolves against the workspace root, not the agent's cwd.
+    for (const prompt of [claude(), codex()]) {
+      expect(prompt).toContain("![](/workspace/out/chart.png)");
+      expect(prompt).toContain("images included");
+    }
+  });
+
+  it("puts the isolade CLI before the patch rules, which own a heading", () => {
+    // `# Editing files` opens a section, so a bare paragraph after it reads as more
+    // advice about editing files.
+    const prompt = codex();
+    expect(prompt.indexOf("isolade ports add")).toBeLessThan(prompt.indexOf("# Editing files"));
+  });
+
   it("appends the prelude last, under a heading, with explicit precedence", () => {
     const prompt = claude("Commit messages start with a verb.");
     const section = "# Project instructions\nCommit messages start with a verb.";
@@ -130,6 +160,27 @@ describe("buildSystemPrompt", () => {
       expect(p.text).toContain("You are running in Isolade");
       expect(p.text).toContain("no call is denied");
       expect(p.text).toContain('--trailer "Assisted-by: Isolade:claude-opus-5"');
+      // Kept here too: the vendor prompt cannot mention a CLI Isolade installs, and
+      // promises a monospace or CLI-styled surface rather than a rendered one.
+      expect(p.text).toContain("isolade ports add 5173");
+      expect(p.text).toContain("images included");
+    });
+
+    it("leaves both app capabilities out of the two bases Isolade does not write", () => {
+      // "Unmodified" means untouched and "minimal" means as close to nothing as the
+      // provider allows, so neither is a place to add capability guidance.
+      for (const base of ["minimal", "unmodified"] as PromptBase[]) {
+        for (const provider of ["anthropic", "openai"] as const) {
+          const text = buildSystemPrompt({
+            provider,
+            model: provider === "anthropic" ? "claude-opus-5" : "gpt-5.6-sol",
+            prelude: "Only my rules.",
+            base,
+          }).text;
+          expect(text).not.toContain("isolade ports");
+          expect(text).not.toContain("images included");
+        }
+      }
     });
 
     it('"extended" carries only what the vendor prompt gets wrong or omits', () => {
