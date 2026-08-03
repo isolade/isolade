@@ -255,13 +255,20 @@ export function buildSystemPrompt(opts: {
   const patchRules = isClaude ? [] : [CODEX_PATCH_RULES];
   const preludeBlocks = prelude ? [`${PRELUDE_HEADING}\n${prelude}`] : [];
 
-  // "Minimal": replace the harness prompt with the prelude alone, unheaded — there
-  // is nothing above it for a heading to separate it from. Called "minimal" rather
-  // than "none" because on codex it still carries the patch rules: dropping those
-  // trades a long prompt for wrong edits. Their `# Editing files` heading marks the
-  // boundary.
+  // "Minimal": replace the harness prompt with the prelude and nothing else. Called
+  // "minimal" rather than "none" because on codex it still carries the patch rules:
+  // dropping those trades a long prompt for wrong edits.
+  //
+  // The prelude goes unheaded where it is the whole prompt, since there is nothing
+  // above it for a heading to separate it from — but NOT on codex, where the patch
+  // rules come first. A heading opens a section rather than closing one, so a bare
+  // paragraph following `# Editing files` reads as more advice about editing files.
   if (opts.base === "minimal") {
-    const minimal = [...patchRules, ...(prelude ? [prelude] : [])].join("\n\n");
+    const heading = patchRules.length > 0;
+    const minimal = [
+      ...patchRules,
+      ...(prelude ? [heading ? `${PRELUDE_HEADING}\n${prelude}` : prelude] : []),
+    ].join("\n\n");
     return { text: pad(minimal, opts.provider, "replace"), mode: "replace" };
   }
 

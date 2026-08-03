@@ -182,13 +182,23 @@ describe("buildSystemPrompt", () => {
     const codexBase = (prelude: string | null, base: PromptBase) =>
       buildSystemPrompt({ provider: "openai", model: "gpt-5.6-sol", prelude, base });
 
-    it('on codex, "none" replaces the prompt but keeps the patch rules', () => {
+    it('on codex, "minimal" replaces the prompt but keeps the patch rules', () => {
       // Which is what makes the option usable there rather than a file shredder.
       const p = codexBase("Only my rules.", "minimal");
       expect(p.mode).toBe("replace");
       expect(p.text).toContain("# Editing files");
       expect(p.text).toContain("Only my rules.");
       expect(p.text).not.toContain("You are a coding agent in Isolade");
+    });
+
+    it('on codex, "minimal" still heads the prelude, since the patch rules precede it', () => {
+      // A heading opens a section rather than closing one, so an unheaded prelude
+      // after `# Editing files` reads as further advice about editing files. On
+      // Claude, where the prelude IS the whole prompt, it stays bare.
+      expect(codexBase("Only my rules.", "minimal").text).toContain(
+        "# Project instructions\nOnly my rules.",
+      );
+      expect(build("Only my rules.", "minimal").text).toBe("\nOnly my rules.");
     });
 
     it('on codex, "unmodified" adds nothing but the prelude', () => {

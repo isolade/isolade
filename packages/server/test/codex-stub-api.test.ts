@@ -2,7 +2,10 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { instructionParams } from "../src/chat/codex-backend";
 import { CODEX_CONFIG_OVERRIDES } from "../src/chat/codex-manager";
+import { buildSystemPrompt } from "../src/chat/system-prompt";
+import type { PromptBase } from "../src/contracts";
 
 // What codex actually puts on the wire, driven through the same JSON-RPC calls
 // CodexManager/CodexBackend make, against a stub that captures the request body.
@@ -213,6 +216,34 @@ async function captureResumedTurn(
   });
 }
 
+/**
+ * Start a thread, take one turn, then take a SECOND turn on the same live thread
+ * and return that turn's request.
+ *
+ * The second turn is the one that matters for `developerInstructions`: unlike
+ * `baseInstructions`, which occupies the request's own `instructions` slot every
+ * time, it is a conversation item written once at thread start. Whether it is still
+ * there on turn two is a property of codex's rollout, not of anything we send.
+ */
+async function captureSecondTurn(threadStart: Record<string, unknown>): Promise<Captured> {
+  return withServer(async ({ send, awaitId }) => {
+    const first = nextRequest();
+    send(2, "thread/start", { ephemeral: false, ...threadStart });
+    const started = await awaitId(2);
+    const threadId = (started?.result as { thread?: { id?: string } } | undefined)?.thread?.id;
+    expect(threadId).toBeTruthy();
+    send(3, "turn/start", { threadId, ...TURN });
+    await withTimeout(first);
+    const second = nextRequest();
+    send(4, "turn/start", {
+      threadId,
+      model: TURN.model,
+      input: [{ type: "text", text: "and again" }],
+    });
+    return await withTimeout(second);
+  });
+}
+
 const textOf = (item: unknown): string => {
   const content = (item as { content?: { text?: string }[] }).content ?? [];
   return content.map((part) => part.text ?? "").join("");
@@ -342,4 +373,70 @@ describe.skipIf(!hasCodex)("codex against a stub API", () => {
     expect(names).toContain("exec_command");
     expect(names).toContain("web_search");
   }, 60_000);
+
+  // The composed path, rather than the mechanics above: what buildSystemPrompt
+  // produces for a profile, mapped through the backend's own instructionParams, on
+  // the wire. Every assertion is about the prelude, because that is the part a user
+  // wrote and the part with the furthest to travel — profile config, through the
+  // prompt builder, into whichever slot the base implies.
+  describe("a profile's instructions reach codex", () => {
+    const PRELUDE = "ISOLADE_PRELUDE_SENTINEL: always run the linter.";
+    const paramsFor = (base: PromptBase) =>
+      instructionParams(
+        buildSystemPrompt({ provider: "openai", model: "gpt-5.6-sol", prelude: PRELUDE, base }),
+      );
+    const developerText = (request: Captured) =>
+      (request.input ?? [])
+        .map((item) => item as { role?: string; content?: { text?: string }[] })
+        .filter((item) => item.role === "developer")
+        .flatMap((item) => item.content ?? [])
+        .map((part) => part.text ?? "");
+
+    it("puts them in the instructions slot for the bases that replace the prompt", async () => {
+      for (const base of ["optimized", "minimal"] as PromptBase[]) {
+        const request = await captureTurn(paramsFor(base));
+        expect(request.instructions).toContain(PRELUDE);
+        // Under the heading, and last, so it outranks what precedes it.
+        expect(request.instructions).toContain(`${"#"} Project instructions\n${PRELUDE}`);
+        expect(request.instructions?.trimEnd().endsWith(PRELUDE)).toBe(true);
+        // And codex's own prompt is gone, which is what "replace" means.
+        expect(request.instructions).not.toContain(CODEX_OWN);
+      }
+    }, 120_000);
+
+    it("puts them in a developer item for the bases that keep the prompt", async () => {
+      for (const base of ["unmodified", "extended"] as PromptBase[]) {
+        const request = await captureTurn(paramsFor(base));
+        expect(request.instructions).toContain(CODEX_OWN);
+        const ours = developerText(request).find((text) => text.includes(PRELUDE));
+        expect(ours).toBeDefined();
+        expect(ours?.trimEnd().endsWith(PRELUDE)).toBe(true);
+        // Blank lines between blocks survive the trip, so the text the model reads is
+        // paragraphed the way buildSystemPrompt wrote it.
+        if (base === "extended") expect(ours).toContain("ask first.\n\nYou are running");
+      }
+    }, 120_000);
+
+    it("keeps them in force on later turns of the same thread", async () => {
+      // "In effect for the whole chat" is the claim the settings page makes. For
+      // `optimized` that is free; for `extended` it depends on the developer item
+      // persisting in the rollout, which is codex's behaviour rather than ours.
+      const replaced = await captureSecondTurn(paramsFor("optimized"));
+      expect(replaced.instructions).toContain(PRELUDE);
+
+      const layered = await captureSecondTurn(paramsFor("extended"));
+      expect(developerText(layered).some((text) => text.includes(PRELUDE))).toBe(true);
+    }, 180_000);
+
+    it("keeps them in force across a reconnect", async () => {
+      // CodexBackend.ensureThreadLive resumes a thread whose app-server has gone
+      // away, and passes the same instruction params. If they did not reapply, a
+      // reconnected chat would quietly lose the profile's instructions mid-chat.
+      const replaced = await captureResumedTurn(paramsFor("optimized"), paramsFor("optimized"));
+      expect(replaced.instructions).toContain(PRELUDE);
+
+      const layered = await captureResumedTurn(paramsFor("extended"), paramsFor("extended"));
+      expect(developerText(layered).some((text) => text.includes(PRELUDE))).toBe(true);
+    }, 180_000);
+  });
 });

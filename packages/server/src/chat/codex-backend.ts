@@ -50,7 +50,9 @@ interface CodexModelListEntry {
 // we layer it would quietly contradict the "Unmodified" option's promise to
 // leave the shipped prompt untouched. Every case is therefore either a no-op or
 // wrong.
-function instructionParams(prompt: IsoladeSystemPrompt | undefined): Record<string, unknown> {
+export function instructionParams(
+  prompt: IsoladeSystemPrompt | undefined,
+): Record<string, unknown> {
   if (!prompt?.text) return {};
   const field = prompt.mode === "append" ? "developerInstructions" : "baseInstructions";
   return { [field]: prompt.text };
