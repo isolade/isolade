@@ -77,6 +77,7 @@ import {
   type SessionMessageRow,
 } from "./chat/MessageHistory";
 import { QueuedMessages, reconcileQueuedMessageSnapshot } from "./chat/QueuedMessages";
+import { unfollowedTurnId } from "./chat/turn-attachment";
 import { ChatCost, ContextMeter, type TurnClock, TurnStatus } from "./chat/UsagePanel";
 import { FastModeToggle } from "./FastModeToggle";
 import { MessageBox } from "./MessageBox";
@@ -383,6 +384,25 @@ function Chat({
   showDebugRef.current = showDebug;
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
+  // Turns this view has seen the end of. The chat row it reads below is a poll
+  // behind, so it can still name a turn that has just finished, and a turn that
+  // ended without a message to show (stopped before it said anything, or failed)
+  // leaves nothing else to recognize it by. Only a terminal state counts: a lost
+  // connection is not one, and a turn that outlives it is the whole point of the
+  // reconciliation this feeds.
+  const settledTurnsRef = useRef(new Set<string>());
+  // A turn the server is running that nothing here is reading. The chat row
+  // carries it, so this sees a turn regardless of how it started: a queued
+  // message the server promoted when the last turn settled, one whose stream
+  // this tab lost, or one another window sent. Drives the reconciliation below,
+  // which is what attaches to it. Computed per render rather than memoized,
+  // since `settledTurnsRef` is not a dependency anything could list.
+  const unattachedTurnId = unfollowedTurnId({
+    inFlightMessageId: chat.inFlightMessageId,
+    streaming,
+    holdsMessage: (id) =>
+      settledTurnsRef.current.has(id) || messages.some((message) => message.id === id),
+  });
   const historyPagesRef = useRef(historyPages);
   historyPagesRef.current = historyPages;
   const sessionRowsRef = useRef(sessionRows);
@@ -1423,6 +1443,13 @@ function Chat({
           .filter((chunk): chunk is Extract<StreamChunk, { kind: "text" }> => chunk.kind === "text")
           .map((chunk) => chunk.text)
           .join("");
+      // This turn is over as far as this view is concerned, so the chat row's
+      // still-running copy of it must not send the reconciliation after it (see
+      // settledTurnsRef). A turn that ends with nothing to commit has no message
+      // row to stand for it, which is exactly when this is the only record.
+      const markTurnSettled = () => {
+        if (serverMessageId) settledTurnsRef.current.add(serverMessageId);
+      };
 
       const applyMetaEvent = (type: string, payload: unknown): boolean => {
         if (type === "usage") {
@@ -1604,6 +1631,7 @@ function Chat({
         }
         if (ev.kind === "done") {
           const id = serverMessageId ?? crypto.randomUUID();
+          markTurnSettled();
           finishingDrain = finishThenCommit(() =>
             commit(id, snapshotState.message?.content ?? accumulatedContent()),
           );
@@ -1611,6 +1639,7 @@ function Chat({
           return;
         }
         if (ev.kind === "error") {
+          markTurnSettled();
           // Cancel is signalled as { kind: "error" } from the hub
           // (the producer's AbortSignal got tripped). We treat the
           // partial output as a real (stopped) message rather than a
@@ -1734,7 +1763,9 @@ function Chat({
         } catch (err) {
           if (detachedControllersRef.current.has(ac)) return;
           if (ac.signal.aborted) {
-            // Local abort (Stop button / unmount). Commit partial.
+            // Local abort (Stop button / unmount). Commit partial. Stopping also
+            // cancels the turn server-side, so this view is done with it.
+            markTurnSettled();
             if (!terminalHandled && (chunks.length > 0 || snapshotState.message)) {
               const id = serverMessageId ?? crypto.randomUUID();
               commit(id, snapshotState.message?.content ?? accumulatedContent());
@@ -1763,6 +1794,7 @@ function Chat({
         if (!terminalHandled) {
           if (detachedControllersRef.current.has(ac)) return;
           if (ac.signal.aborted) {
+            markTurnSettled();
             if (chunks.length > 0 || snapshotState.message) {
               const id = serverMessageId ?? crypto.randomUUID();
               commit(id, snapshotState.message?.content ?? accumulatedContent());
@@ -2581,11 +2613,16 @@ function Chat({
     [chatId, instanceId, drainTurn],
   );
 
-  // Queue promotion is server-driven so it survives a browser disconnect.
-  // While this tab has queued work, reconcile the durable outbox and attach to
-  // any newly-started turn.
+  // Queue promotion is server-driven so it survives a browser disconnect. This
+  // reconciles the durable outbox against the server's and attaches to any turn
+  // this view is not already reading, and runs while there is either: queued work
+  // of this tab's own, or a turn the chat row says is running that nothing here
+  // is following. The second is what keeps a promoted turn from streaming into
+  // nothing: the queue entry that stood for it is gone the moment it becomes a
+  // real message, and it is gone early whenever the promotion is what the client
+  // asked for.
   useEffect(() => {
-    if (pending || queuedMessages.length === 0) return;
+    if (pending || (queuedMessages.length === 0 && unattachedTurnId === null)) return;
     let cancelled = false;
     let syncing = false;
     const sync = async () => {
@@ -2623,6 +2660,11 @@ function Chat({
           setActiveLeaf(missing.at(-1)?.id ?? activeLeafRef.current);
         }
         if (!page.inFlight) return;
+        // Another reader may have attached while this request was in flight: on a
+        // chat that is already streaming when it mounts, hydration races this.
+        // The controller is the record of one that exists, and unlike `streaming`
+        // it is there before the render that would tell us about it.
+        if (abortRef.current) return;
         streamingRef.current = true;
         // The promoted turn started on the server, so its clock does too.
         resumedTurnRef.current = { startedAt: page.inFlight.startedAt?.getTime() ?? null };
@@ -2639,7 +2681,15 @@ function Chat({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [attachResume, chatId, instanceId, pending, queuedMessages.length, setActiveLeaf]);
+  }, [
+    attachResume,
+    chatId,
+    instanceId,
+    pending,
+    queuedMessages.length,
+    unattachedTurnId,
+    setActiveLeaf,
+  ]);
 
   useEffect(() => {
     if (!streamingRef.current) return;

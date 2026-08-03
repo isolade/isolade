@@ -49,6 +49,9 @@ const ProductionChatPane = memo(function ProductionChatPane({
 export interface ProductionHarnessApi {
   metrics: () => MetricSnapshot;
   resetMetrics: () => Promise<void>;
+  // Stand in for the chat poll delivering a row whose turn is running, which is
+  // how a chat view learns about a turn nothing in it started.
+  setChatInFlight: (chatId: string, messageId: string | null) => Promise<void>;
   switchChat: (chatId: string) => Promise<void>;
   switchChatImmediately: (chatId: string) => {
     distanceFromBottom: number;
@@ -61,7 +64,11 @@ export function ProductionChatHarness() {
   const parameters = useMemo(() => new URLSearchParams(window.location.search), []);
   const chatCount = Number(parameters.get("chats") ?? 2);
   const crossProviderPicker = parameters.get("crossProviderPicker") === "1";
-  const chats = useMemo<ChatRow[]>(
+  // The running turn each chat row reports, which the parent would get from the
+  // chat poll. Kept out of the rows below so a test can move one row without
+  // rebuilding the others and re-rendering every pane.
+  const [inFlightByChat, setInFlightByChat] = useState<Record<string, string | null>>({});
+  const baseChats = useMemo<ChatRow[]>(
     () =>
       Array.from({ length: chatCount }, (_, index) => {
         const id = `chat-${String.fromCharCode(97 + index)}`;
@@ -93,6 +100,15 @@ export function ProductionChatHarness() {
       }),
     [chatCount, crossProviderPicker],
   );
+  const chats = useMemo<ChatRow[]>(
+    () =>
+      baseChats.map((chat) =>
+        chat.id in inFlightByChat
+          ? { ...chat, inFlightMessageId: inFlightByChat[chat.id] ?? null }
+          : chat,
+      ),
+    [baseChats, inFlightByChat],
+  );
   const chatModels = useMemo(() => {
     const ids = crossProviderPicker ? ["claude-opus-5", "gpt-5.6-sol"] : ["claude-sonnet-5"];
     return ids.flatMap((id) => {
@@ -109,6 +125,11 @@ export function ProductionChatHarness() {
         await frame();
         await frame();
         getRenderMetrics().reset();
+      },
+      async setChatInFlight(chatId, messageId) {
+        setInFlightByChat((previous) => ({ ...previous, [chatId]: messageId }));
+        await frame();
+        await frame();
       },
       async switchChat(chatId) {
         setActiveChat(chatId);

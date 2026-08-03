@@ -1273,6 +1273,83 @@ describe("chat streaming resilience", () => {
     ).toBe("confirmed");
   });
 
+  // Sending a queued message now races the promotion the settling turn triggers
+  // on its own. When the promotion wins, the message has no queued row left, and
+  // answering 404 told the client its message was nowhere while the turn it had
+  // become was already streaming. The client drops the queue entry it holds for a
+  // delivered message, and that entry is what keeps it looking for the new turn.
+  it("answers send-now for an already-promoted message with its delivery, not a 404", async () => {
+    const { instanceId, chatId } = await makeChat();
+    const before = backend.callCount;
+    let releaseActive!: () => void;
+    const activeBlocked = new Promise<void>((resolve) => {
+      releaseActive = resolve;
+    });
+    backend.setScript([
+      { kind: "wait", promise: activeBlocked },
+      { kind: "delta", text: "first" },
+    ]);
+    const activeResponse = await fetch(
+      `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/messages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: "promoted-first", content: "first prompt" }),
+      },
+    );
+    await waitForInFlight(chatId);
+    await fetch(`${baseUrl}/api/instances/${instanceId}/chats/${chatId}/queue`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: "promoted-queued", content: "queued prompt" }),
+    });
+
+    // Let the active turn settle, which promotes the queued message into a turn
+    // of its own. That turn holds, so it is still running when send-now lands.
+    let releasePromoted!: () => void;
+    const promotedBlocked = new Promise<void>((resolve) => {
+      releasePromoted = resolve;
+    });
+    backend.setScript([
+      { kind: "ack" },
+      { kind: "delta", text: "second" },
+      { kind: "wait", promise: promotedBlocked },
+    ]);
+    releaseActive();
+    await readAllSse(activeResponse);
+    for (let i = 0; i < 100 && backend.callCount < before + 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const promotedTurnId = await waitForInFlight(chatId);
+    try {
+      expect(chatManager.getQueuedMessage("promoted-queued")).toBeUndefined();
+
+      const nowResponse = await fetch(
+        `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/queue/promoted-queued/dispatch`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mode: "now" }),
+        },
+      );
+      expect(nowResponse.status).toBe(200);
+      expect(await nowResponse.json()).toMatchObject({
+        id: "promoted-queued",
+        content: "queued prompt",
+        status: "delivered",
+      });
+      // And the turn it became is the one a client is meant to pick up from here.
+      const running = await fetch(
+        `${baseUrl}/api/instances/${instanceId}/chats/${chatId}/transcript`,
+      ).then((response) => response.json());
+      expect(running.inFlight?.messageId).toBe(promotedTurnId);
+      expect(running.queuedMessages).toEqual([]);
+    } finally {
+      releasePromoted();
+      await chatStreamHub.drain();
+    }
+  });
+
   it("shows a Codex steering message at its position in the active turn", async () => {
     const { instanceId, chatId } = await makeChat(DEFAULT_OPENAI_MODEL_ID);
     let release!: () => void;

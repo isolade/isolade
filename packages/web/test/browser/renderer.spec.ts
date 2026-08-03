@@ -288,6 +288,100 @@ test.describe("message renderer browser gate", () => {
     expect(await clipboard()).toBe("Production question 0");
   });
 
+  // A turn is not always started by the view that shows the chat: a message sent
+  // while the agent is working is queued, and the server promotes it into a turn
+  // of its own when the current one ends. The chat row is what says so, and a
+  // view that ignored it sat there with a settled composer while the answer
+  // streamed into nothing and only turned up on a reload.
+  test("picks up a turn the server started on its own", async ({ page }) => {
+    const promotedTurn = "chat-a-promoted-turn";
+    let promoted = false;
+    await page.route("**/api/instances/*/chats/*/transcript?*", async (route) => {
+      const base = transcriptFixture("chat-a", 2);
+      await route.fulfill({
+        json: promoted
+          ? {
+              ...base,
+              messages: [
+                ...base.messages,
+                {
+                  id: "chat-a-promoted-user",
+                  chatId: "chat-a",
+                  role: "user",
+                  content: "And the question after that one",
+                  parentId: base.messages.at(-1)?.id ?? null,
+                  createdAt: new Date(9_000).toISOString(),
+                  version: null,
+                },
+              ],
+              inFlight: {
+                messageId: promotedTurn,
+                lastSeq: -1,
+                chunks: [],
+                startedAt: new Date().toISOString(),
+              },
+            }
+          : base,
+      });
+    });
+    // Held so the turn is still running when the view attaches, which is what
+    // the composer has to report.
+    let releaseReply!: () => void;
+    const heldReply = new Promise<void>((resolve) => {
+      releaseReply = resolve;
+    });
+    await page.route(`**/messages/${promotedTurn}/stream?*`, async (route) => {
+      await heldReply;
+      await route.fulfill({
+        status: 200,
+        contentType: "text/event-stream",
+        body: [
+          "event: snapshot",
+          `data: ${JSON.stringify({
+            messageId: promotedTurn,
+            lastSeq: -1,
+            chunks: [],
+            metaEvents: [],
+            status: "running",
+            message: null,
+          })}`,
+          "",
+          "id: 0",
+          "event: delta",
+          `data: ${JSON.stringify("The reply nobody was watching.")}`,
+          "",
+          "event: done",
+          "data: ",
+          "",
+          "",
+        ].join("\n"),
+      });
+    });
+    await page.goto("/test/browser/harness/index.html?production=1&chats=1");
+    await page.waitForFunction(
+      () => document.documentElement.dataset.productionHarnessReady === "true",
+    );
+    // A chat at rest: no turn, and nothing in the composer's send corner.
+    await expect(page.locator('[data-message-id="chat-a-production-m1"]')).toBeVisible();
+    await expect(page.getByLabel("Working", { exact: false })).toHaveCount(0);
+
+    promoted = true;
+    await page.evaluate(
+      (id) => window.__isoladeProductionChatHarness?.setChatInFlight("chat-a", id),
+      promotedTurn,
+    );
+
+    // The view goes and finds the turn: the question it answers arrives, and the
+    // composer says the agent is working on it.
+    await expect(page.getByText("And the question after that one")).toBeVisible();
+    await expect(page.getByLabel("Working", { exact: false })).toHaveCount(1);
+
+    releaseReply();
+    await expect(page.getByText("The reply nobody was watching.")).toBeVisible();
+    // And it settles like any other turn once the stream ends.
+    await expect(page.getByLabel("Working", { exact: false })).toHaveCount(0);
+  });
+
   test("keeps expanded-sidebar tabs flush with the panel edge", async ({ page }) => {
     await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
       await route.fulfill({

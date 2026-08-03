@@ -1,6 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
-import { chatCostBreakdownSchema, DEFAULT_ANTHROPIC_MODEL_ID } from "../src/contracts";
+import {
+  chatArraySchema,
+  chatCostBreakdownSchema,
+  DEFAULT_ANTHROPIC_MODEL_ID,
+} from "../src/contracts";
 import { schema } from "../src/db";
 import { createTestServer } from "./helpers";
 
@@ -310,6 +314,30 @@ describe("chat API", () => {
       } finally {
         await server2.cleanup();
       }
+    });
+
+    // How a chat view finds a turn nobody told it about: one the server promoted
+    // from the queue, or one whose stream this window lost. Parsed through the
+    // client's own schema, since anything it does not declare is dropped on
+    // arrival and the view would go on showing a settled composer.
+    it("names the running turn, in a shape the client keeps", async () => {
+      const instanceId = seedInstance();
+      const created = await fetch(`${baseUrl}/api/instances/${instanceId}/chats`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: DEFAULT_ANTHROPIC_MODEL_ID }),
+      });
+      const { id: chatId } = (await created.json()) as { id: string };
+      const rowFor = async (id: string) =>
+        chatArraySchema
+          .parse(await (await fetch(`${baseUrl}/api/chats`)).json())
+          .find((chat) => chat.id === id);
+
+      expect((await rowFor(chatId))?.inFlightMessageId ?? null).toBeNull();
+      chatManager.beginInFlightTurn(chatId, "assistant-running");
+      expect((await rowFor(chatId))?.inFlightMessageId).toBe("assistant-running");
+      chatManager.clearInFlightTurn(chatId, "assistant-running");
+      expect((await rowFor(chatId))?.inFlightMessageId).toBeNull();
     });
   });
 
