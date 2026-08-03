@@ -15,12 +15,12 @@ const read = (file: string) => readFileSync(file, "utf-8");
 describe("PromptConfigStore", () => {
   it("reads an empty prelude before anything is written", () => {
     const { store } = tempStore();
-    expect(store.read()).toEqual({ prelude: "", base: "isolade" });
+    expect(store.read()).toEqual({ prelude: "", base: "optimized" });
   });
 
   it("round-trips a prelude in the [prompt] table", () => {
     const { store, file } = tempStore();
-    const cfg = { prelude: "Always write tests.", base: "isolade" as const };
+    const cfg = { prelude: "Always write tests.", base: "optimized" as const };
     expect(store.write(cfg)).toEqual(cfg);
     expect(store.read()).toEqual(cfg);
     expect(read(file)).toContain("[prompt]");
@@ -30,7 +30,7 @@ describe("PromptConfigStore", () => {
   it("preserves a multi-line prelude as a real-newline literal block", () => {
     const { store, file } = tempStore();
     const prelude = 'Line 1\nLine 2 with "quotes"';
-    store.write({ prelude, base: "isolade" });
+    store.write({ prelude, base: "optimized" });
     expect(store.read().prelude).toBe(prelude);
     expect(read(file)).not.toContain("\\n");
   });
@@ -38,12 +38,12 @@ describe("PromptConfigStore", () => {
   it("drops the [prompt] table when the prelude is emptied", () => {
     const { store, file } = tempStore();
     writeFileSync(file, 'name = "demo"\n');
-    store.write({ prelude: "hi", base: "isolade" });
+    store.write({ prelude: "hi", base: "optimized" });
     expect(read(file)).toContain("[prompt]");
-    store.write({ prelude: "", base: "isolade" });
+    store.write({ prelude: "", base: "optimized" });
     expect(read(file)).not.toContain("[prompt]");
     expect(read(file)).toContain('name = "demo"');
-    expect(store.read()).toEqual({ prelude: "", base: "isolade" });
+    expect(store.read()).toEqual({ prelude: "", base: "optimized" });
   });
 
   it("round-trips a non-default base, and never writes the default", () => {
@@ -52,23 +52,23 @@ describe("PromptConfigStore", () => {
     expect(read(file)).toContain('base = "minimal"');
     expect(store.read()).toEqual({ prelude: "Only mine.", base: "minimal" });
     // The default must not litter the file.
-    store.write({ prelude: "Only mine.", base: "isolade" });
+    store.write({ prelude: "Only mine.", base: "optimized" });
     expect(read(file)).not.toContain("base =");
   });
 
   it("keeps the table for a non-default base with no prelude", () => {
-    // base=cli with an empty prelude is meaningful: it asks for the CLI's own
+    // base=unmodified with an empty prelude is meaningful: it asks for the CLI's own
     // prompt and nothing else, which is not the same as the default.
     const { store, file } = tempStore();
-    store.write({ prelude: "", base: "cli" });
+    store.write({ prelude: "", base: "unmodified" });
     expect(read(file)).toContain("[prompt]");
-    expect(read(file)).toContain('base = "cli"');
-    expect(store.read()).toEqual({ prelude: "", base: "cli" });
+    expect(read(file)).toContain('base = "unmodified"');
+    expect(store.read()).toEqual({ prelude: "", base: "unmodified" });
   });
 
   it("treats a corrupt file as an empty prelude rather than throwing", () => {
     const { store, file } = tempStore();
     writeFileSync(file, "not = = toml");
-    expect(store.read()).toEqual({ prelude: "", base: "isolade" });
+    expect(store.read()).toEqual({ prelude: "", base: "optimized" });
   });
 });

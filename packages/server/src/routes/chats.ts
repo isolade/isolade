@@ -429,7 +429,7 @@ export function createChatsRouter(ctx: RouteContext): Hono {
           model: chat.model,
           ...(instance.profileId
             ? profiles.getPromptConfig(instance.profileId)
-            : { prelude: null, base: "isolade" as const }),
+            : { prelude: null, base: "optimized" as const }),
         }),
       });
       return c.json(breakdown);

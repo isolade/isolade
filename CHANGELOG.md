@@ -6,39 +6,13 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
-### Added
-
-- Settings → Prompt now lets a profile choose its agents' base prompt:
-  "Optimized" (Isolade's own, written for the sandbox), "Agent default"
-  (whatever Claude Code or Codex ships, untouched), or "Minimal". Your
-  instructions are added below whichever you pick, so Minimal makes them
-  essentially the whole prompt. Stored as `base` in the profile's `config.toml`.
-  Minimal is not quite empty on Codex: it keeps a short note about the patch
-  format, because Codex applies an edit at the first place that looks like a
-  match and can otherwise change the wrong lines.
-
 ### Changed
 
-- Agents now run on a system prompt written for Isolade instead of the one their
-  CLI ships by default. The stock prompt assumes a terminal, a permission prompt
-  in front of every risky action, and a machine you care about keeping. None of
-  that describes a throwaway VM, so it has been replaced with a short brief that
-  says what is actually true: local work is free and needs no confirmation,
-  while pushing, opening PRs, and sending messages reach outside the VM and
-  should be checked first.
-- Agents are told exactly which model they are running, which they previously
-  could not always tell. Codex only tells its models they are "based on GPT-5",
-  so a Sol or Terra chat had no way to name itself.
-- Commits are attributed with an `Assisted-by: Isolade:<model-id>` trailer, and
-  the agent's own `Co-Authored-By` line and "Generated with" PR footer are off.
-  The model id is filled in for the agent rather than guessed by it.
-- A profile's prelude is now part of the system prompt rather than hidden in
-  your first message. It carries more weight there, applies for the whole chat
-  instead of only the first turn, and survives the long-conversation
-  summarization that could previously drop it. Prelude instructions also
-  explicitly override the defaults above them, so a profile can change any of
-  them. Editing a prelude affects new chats, and existing ones once their
-  session restarts.
+- A profile's instructions are now part of the system prompt rather than being
+  prepended to a chat's first message, so they hold for the whole chat and
+  outrank the rest of it. You can also pick the prompt they join: Isolade's own,
+  written for a disposable VM and now the default, the one Claude Code or Codex
+  ships, or none at all.
 
 ### Fixed
 

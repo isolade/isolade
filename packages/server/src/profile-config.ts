@@ -677,7 +677,7 @@ export function loadProfileConfig(profileId: string): ResolvedProfileConfig {
       exposeSandbox: config.expose_sandbox,
       seedProfiles: config.seed_profiles,
       prelude: config.prompt?.prelude || null,
-      promptBase: config.prompt?.base ?? "isolade",
+      promptBase: config.prompt?.base ?? "optimized",
       skills: build.skills,
       secrets: resolveSecretDeclarations(config.secrets),
       init: {

@@ -7,34 +7,25 @@ import type { PromptConfig } from "../lib/contracts";
 
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-// Ordered best-default-first. Each hint has to stand on its own: it is the only
-// explanation an option gets, so anything true of just that choice belongs here
-// rather than in a separate note the reader has to connect back up.
-const BASE_OPTIONS: {
-  value: PromptConfig["base"];
-  label: string;
-  hint: string;
-  /** How the instructions below relate to this base. */
-  preludeNote: string;
-}[] = [
+// Ordered best-default-first, then by who writes the prompt: the two where Isolade
+// does come before the one where it does not, which is also the replace/append
+// split in IsoladeSystemPrompt. One line each, since the hint is the only
+// explanation an option gets and a reader is choosing between three of them.
+const BASE_OPTIONS: { value: PromptConfig["base"]; label: string; hint: string }[] = [
   {
-    value: "isolade",
+    value: "optimized",
     label: "Optimized",
-    hint: "Written for the sandbox: what agents may do without asking, which model they are running, how to attribute commits.",
-    preludeNote:
-      "Added below the base prompt, and taking precedence over it wherever the two disagree.",
-  },
-  {
-    value: "cli",
-    label: "Agent default",
-    hint: "Whatever prompt Claude Code or Codex ships with, untouched. Longer, and written for someone working on their own machine.",
-    preludeNote: "Added below the base prompt.",
+    hint: "Designed to get the best out of agents working inside Isolade (recommended).",
   },
   {
     value: "minimal",
     label: "Minimal",
-    hint: "Almost nothing: your instructions below are the prompt. Codex chats also keep a short note about its patch format, without which its edits can land in the wrong place.",
-    preludeNote: "These are the whole prompt.",
+    hint: "Removes almost the entire system prompt, leaving only your own instructions behind.",
+  },
+  {
+    value: "unmodified",
+    label: "Unmodified",
+    hint: "The default prompt that ships with Claude Code or Codex (not recommended).",
   },
 ];
 
@@ -119,13 +110,17 @@ export default function PromptTab({ activeProfileId }: { activeProfileId: string
       <div className="max-w-2xl space-y-1">
         <h2 className="text-sm font-medium">Prompt</h2>
         <p className="text-xs text-muted-foreground">
-          The system prompt every agent in this profile runs on: a base prompt, then your own
-          instructions on top.
+          The system prompt every chat in this profile runs on.
         </p>
       </div>
 
       <div className="max-w-2xl space-y-2">
-        <span className="text-sm font-medium">Base prompt</span>
+        <div className="space-y-0.5">
+          <span className="text-sm font-medium">Base prompt</span>
+          <p className="text-xs text-muted-foreground">
+            What agents start from, before your own instructions.
+          </p>
+        </div>
         {BASE_OPTIONS.map((option) => (
           <label
             key={option.value}
@@ -148,7 +143,12 @@ export default function PromptTab({ activeProfileId }: { activeProfileId: string
       </div>
 
       <div className="max-w-2xl space-y-1.5">
-        <span className="text-sm font-medium">Your instructions</span>
+        <div className="space-y-0.5">
+          <span className="text-sm font-medium">Your instructions</span>
+          <p className="text-xs text-muted-foreground">
+            Added below the base prompt, and in effect for the whole chat.
+          </p>
+        </div>
         <Textarea
           value={cfg.prelude}
           placeholder="Standing instructions for every agent in this profile…"
@@ -156,9 +156,6 @@ export default function PromptTab({ activeProfileId }: { activeProfileId: string
           onChange={(e) => patch({ prelude: e.target.value })}
           className="min-h-40 text-xs"
         />
-        <p className="text-xs text-muted-foreground">
-          {BASE_OPTIONS.find((option) => option.value === cfg.base)?.preludeNote}
-        </p>
       </div>
 
       {saveError && <p className="text-xs text-destructive max-w-2xl">{saveError}</p>}

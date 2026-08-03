@@ -2,9 +2,9 @@ import { describe, expect, it } from "bun:test";
 import { buildSystemPrompt } from "../src/chat/system-prompt";
 import type { PromptBase } from "../src/contracts";
 
-const claude = (prelude: string | null = null, base: PromptBase = "isolade") =>
+const claude = (prelude: string | null = null, base: PromptBase = "optimized") =>
   buildSystemPrompt({ provider: "anthropic", model: "claude-opus-5", prelude, base }).text;
-const codex = (prelude: string | null = null, base: PromptBase = "isolade") =>
+const codex = (prelude: string | null = null, base: PromptBase = "optimized") =>
   buildSystemPrompt({ provider: "openai", model: "gpt-5.6-sol", prelude, base }).text;
 
 describe("buildSystemPrompt", () => {
@@ -20,7 +20,7 @@ describe("buildSystemPrompt", () => {
       provider: "anthropic",
       model: "claude-unreleased-9",
       prelude: null,
-      base: "isolade",
+      base: "optimized",
     }).text;
     expect(prompt).toContain("You are running claude-unreleased-9 (model ID: claude-unreleased-9)");
   });
@@ -79,14 +79,14 @@ describe("buildSystemPrompt", () => {
     const build = (prelude: string | null, base: PromptBase) =>
       buildSystemPrompt({ provider: "anthropic", model: "claude-opus-5", prelude, base });
 
-    it('"isolade" replaces the CLI\'s prompt with ours', () => {
-      const p = build(null, "isolade");
+    it('"optimized" replaces the CLI\'s prompt with ours', () => {
+      const p = build(null, "optimized");
       expect(p.mode).toBe("replace");
       expect(p.text).toContain("You are a coding agent in Isolade");
     });
 
-    it('"cli" keeps the CLI\'s prompt and layers the prelude on top', () => {
-      expect(build("Only my rules.", "cli")).toEqual({
+    it('"unmodified" keeps the CLI\'s prompt and layers the prelude on top', () => {
+      expect(build("Only my rules.", "unmodified")).toEqual({
         text: "Only my rules.",
         mode: "append",
       });
@@ -118,19 +118,19 @@ describe("buildSystemPrompt", () => {
       expect(p.text).not.toContain("You are a coding agent in Isolade");
     });
 
-    it('on codex, "cli" adds nothing but the prelude', () => {
+    it('on codex, "unmodified" adds nothing but the prelude', () => {
       // The one option that leaves codex's own prompt, and therefore its own patch
       // guidance, in place — so ours would be redundant.
-      expect(codexBase("Only my rules.", "cli")).toEqual({
+      expect(codexBase("Only my rules.", "unmodified")).toEqual({
         text: "Only my rules.",
         mode: "append",
       });
     });
 
-    it('on codex, "isolade" replaces the prompt rather than stacking on it', () => {
+    it('on codex, "optimized" replaces the prompt rather than stacking on it', () => {
       // Layering would hand codex chats the largest prompt of any option: ours on
       // top of their 7-24KB, which is the opposite of the point.
-      const p = codexBase(null, "isolade");
+      const p = codexBase(null, "optimized");
       expect(p.mode).toBe("replace");
       expect(p.text).toContain("You are a coding agent in Isolade");
       expect(p.text).toContain("# Editing files");
@@ -143,7 +143,7 @@ describe("buildSystemPrompt", () => {
       // The SDK identity block sits immediately before ours and concatenates:
       // "...Claude Agent SDK." + "You are a coding agent...". Claude Code's own
       // prompt opens with a bare newline for the same reason.
-      for (const base of ["isolade", "minimal"] as PromptBase[]) {
+      for (const base of ["optimized", "minimal"] as PromptBase[]) {
         const text = buildSystemPrompt({
           provider: "anthropic",
           model: "claude-opus-5",
@@ -164,10 +164,10 @@ describe("buildSystemPrompt", () => {
           provider: "anthropic",
           model: "claude-opus-5",
           prelude: "Mine.",
-          base: "cli",
+          base: "unmodified",
         }).text,
       ).toBe("Mine.");
-      for (const base of ["cli", "minimal", "isolade"] as PromptBase[]) {
+      for (const base of ["unmodified", "minimal", "optimized"] as PromptBase[]) {
         const text = buildSystemPrompt({
           provider: "openai",
           model: "gpt-5.6-sol",

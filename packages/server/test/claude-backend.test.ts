@@ -784,14 +784,14 @@ describe("ClaudeBackend stream-json parsing", () => {
     expect(command).not.toContain("--append-system-prompt");
   });
 
-  it('base "cli" appends instead of replacing, keeping the CLI\'s prompt', async () => {
+  it('base "unmodified" appends instead of replacing, keeping the CLI\'s prompt', async () => {
     const command = await commandFor({ text: "Only my rules.", mode: "append" });
     expect(command).toContain('--append-system-prompt "$ISOLADE_SP"');
     // A bare --system-prompt would discard the prompt this option exists to keep.
     expect(command).not.toMatch(/(?<!-)--system-prompt/);
   });
 
-  it('base "cli" with nothing to add passes no prompt flag at all', async () => {
+  it('base "unmodified" with nothing to add passes no prompt flag at all', async () => {
     // Appending an empty string is a no-op, so the flag is simply omitted.
     const command = await commandFor({ text: "", mode: "append" });
     expect(command).not.toContain("system-prompt");

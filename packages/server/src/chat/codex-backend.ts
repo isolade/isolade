@@ -47,7 +47,7 @@ interface CodexModelListEntry {
 // to strip codex's ~2KB personality section, which lives inside the prompt that
 // `baseInstructions` replaces wholesale — so where we replace, it has nothing left
 // to act on (A/B'd on the wire: identical requests but for session ids), and where
-// we layer it would quietly contradict the "Agent default" option's promise to
+// we layer it would quietly contradict the "Unmodified" option's promise to
 // leave the shipped prompt untouched. Every case is therefore either a no-op or
 // wrong.
 function instructionParams(prompt: IsoladeSystemPrompt | undefined): Record<string, unknown> {

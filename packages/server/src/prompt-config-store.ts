@@ -13,10 +13,10 @@ import { profileConfigSchema, promptTableSchema } from "./profile-config";
 
 type PromptTable = ReturnType<typeof promptTableSchema.parse>;
 
-const EMPTY: PromptConfig = { prelude: "", base: "isolade" };
+const EMPTY: PromptConfig = { prelude: "", base: "optimized" };
 
 function tableToConfig(table: PromptTable): PromptConfig {
-  return { prelude: table.prelude ?? "", base: table.base ?? "isolade" };
+  return { prelude: table.prelude ?? "", base: table.base ?? "optimized" };
 }
 
 export class PromptConfigStore {
@@ -42,7 +42,7 @@ export class PromptConfigStore {
     // Only non-default values are written, so an untouched profile keeps a clean
     // config.toml and the whole `[prompt]` table disappears rather than sitting
     // there restating the defaults.
-    const nonDefaultBase = parsed.base !== "isolade";
+    const nonDefaultBase = parsed.base !== "optimized";
     const table =
       parsed.prelude || nonDefaultBase
         ? {

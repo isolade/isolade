@@ -450,7 +450,7 @@ export class ChatTurnService {
             model: turnModel,
             ...(instance.profileId
               ? profiles.getPromptConfig(instance.profileId)
-              : { prelude: null, base: "isolade" as const }),
+              : { prelude: null, base: "optimized" as const }),
           });
           // Compose the message actually sent to the model: optional
           // cross-provider handoff envelope, optional attachments block (cites

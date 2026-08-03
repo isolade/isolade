@@ -277,7 +277,7 @@ describe.skipIf(!hasCodex)("codex against a stub API", () => {
   }, 60_000);
 
   it("keeps its personality section when we layer, since we send no override", async () => {
-    // The Agent default option promises the shipped prompt untouched, and
+    // The Unmodified option promises the shipped prompt untouched, and
     // `personality: "none"` would quietly remove ~2KB of it (17,730 -> 15,649
     // bytes). We send no such override anywhere: where we replace the prompt it is
     // a no-op, and here it would be a broken promise.

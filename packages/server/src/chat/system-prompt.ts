@@ -188,12 +188,12 @@ export function buildSystemPrompt(opts: {
 
   // "The agent's own": leave the harness prompt entirely alone and layer only the
   // profile's instructions on top.
-  if (opts.base === "cli") {
+  if (opts.base === "unmodified") {
     return { text: pad(prelude ?? "", opts.provider, "append"), mode: "append" };
   }
 
   // "Minimal": replace the harness prompt with the prelude alone, unheaded — there
-  // is nothing above it for a heading to separate it from. Named "minimal" rather
+  // is nothing above it for a heading to separate it from. Called "minimal" rather
   // than "none" because on codex it still carries the patch rules: dropping those
   // trades a long prompt for wrong edits. Their `# Editing files` heading marks the
   // boundary.

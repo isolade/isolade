@@ -465,7 +465,7 @@ export class ProfileManager {
    * defaults (no prelude, Isolade's own prompt), so a broken config degrades to
    * standard behaviour rather than to an unprompted agent. */
   getPromptConfig(id: string): { prelude: string | null; base: PromptBase } {
-    const defaults = { prelude: null, base: "isolade" as const };
+    const defaults = { prelude: null, base: "optimized" as const };
     if (!profileHasConfig(id)) return defaults;
     try {
       const config = loadProfileConfig(id);
