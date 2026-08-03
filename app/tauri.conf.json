@@ -1,7 +1,7 @@
 {
   "productName": "Isolade",
   "mainBinaryName": "Isolade",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "identifier": "dev.isolade",
   "build": {
     "frontendDist": "../packages/web/dist",
