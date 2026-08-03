@@ -285,7 +285,7 @@ describe("CodexBackend notification parsing", () => {
     // which is only safe because the text carries CODEX_PATCH_RULES.
     expect(mgr.conn.sent).toContainEqual({
       method: "thread/start",
-      params: { ephemeral: false, baseInstructions: "ISOLADE PROMPT", personality: "none" },
+      params: { ephemeral: false, baseInstructions: "ISOLADE PROMPT" },
     });
   });
 
@@ -309,9 +309,9 @@ describe("CodexBackend notification parsing", () => {
     });
 
     // developerInstructions leaves codex's base prompt — and so its own patch
-    // guidance — in place, so ours would be redundant here. `personality` is
-    // deliberately absent: it strips ~2KB from that prompt, which would contradict
-    // this option's promise to leave the shipped prompt untouched.
+    // guidance — in place, so ours would be redundant here. No `personality`
+    // override either: stripping ~2KB from that prompt would contradict this
+    // option's promise to leave the shipped prompt untouched.
     expect(mgr.conn.sent).toContainEqual({
       method: "thread/start",
       params: { ephemeral: false, developerInstructions: "MY PRELUDE" },
@@ -344,7 +344,7 @@ describe("CodexBackend notification parsing", () => {
 
     expect(mgr.conn.sent).toContainEqual({
       method: "thread/resume",
-      params: { threadId: "thread-1", baseInstructions: "ISOLADE PROMPT", personality: "none" },
+      params: { threadId: "thread-1", baseInstructions: "ISOLADE PROMPT" },
     });
     expect(mgr.conn.sent.some((s) => s.method === "thread/start")).toBe(false);
   });

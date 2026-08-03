@@ -276,11 +276,13 @@ describe.skipIf(!hasCodex)("codex against a stub API", () => {
     expect(request.instructions).toBe("RESUMED_WITH_THIS");
   }, 60_000);
 
-  it("strips its personality section when told none, which is why we gate it", async () => {
-    // Sent only alongside a replacing prompt. On "Agent default" it would quietly
-    // remove ~2KB from the very prompt that option promises to leave untouched.
-    const withPersonality = await captureTurn({ developerInstructions: SENTINEL });
-    expect(withPersonality.instructions).toContain("# Personality");
+  it("keeps its personality section when we layer, since we send no override", async () => {
+    // The Agent default option promises the shipped prompt untouched, and
+    // `personality: "none"` would quietly remove ~2KB of it (17,730 -> 15,649
+    // bytes). We send no such override anywhere: where we replace the prompt it is
+    // a no-op, and here it would be a broken promise.
+    const layered = await captureTurn({ developerInstructions: SENTINEL });
+    expect(layered.instructions).toContain("# Personality");
   }, 60_000);
 
   it("sends its tool specs either way, so replacing the prompt costs guidance only", async () => {

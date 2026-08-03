@@ -39,18 +39,21 @@ interface CodexModelListEntry {
   additionalSpeedTiers?: string[];
 }
 
-// The thread params that carry Isolade's prompt. Shared by start, resume and
-// fork so the three cannot drift, since a thread that resumes without them would
+// The thread params that carry Isolade's prompt. Shared by start, resume and fork
+// so the three cannot drift, since a thread that resumes without them would
 // silently keep the prompt it was created with.
 //
-// `personality: "none"` only goes with a replacing prompt. It strips ~2KB from
-// codex's own prompt (verified: 17,730 -> 15,649 bytes), which is fine when we are
-// replacing that prompt anyway, but would contradict the "Agent default" option's
-// promise to leave the shipped prompt untouched.
+// Deliberately no `personality` override, and it should stay that way. It exists
+// to strip codex's ~2KB personality section, which lives inside the prompt that
+// `baseInstructions` replaces wholesale — so where we replace, it has nothing left
+// to act on (A/B'd on the wire: identical requests but for session ids), and where
+// we layer it would quietly contradict the "Agent default" option's promise to
+// leave the shipped prompt untouched. Every case is therefore either a no-op or
+// wrong.
 function instructionParams(prompt: IsoladeSystemPrompt | undefined): Record<string, unknown> {
   if (!prompt?.text) return {};
-  if (prompt.mode === "append") return { developerInstructions: prompt.text };
-  return { baseInstructions: prompt.text, personality: "none" };
+  const field = prompt.mode === "append" ? "developerInstructions" : "baseInstructions";
+  return { [field]: prompt.text };
 }
 
 export class CodexBackend implements ChatBackend {
