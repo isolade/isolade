@@ -40,7 +40,7 @@ import type {
 } from "../../lib/contracts";
 import { CHAT_MODELS, DEFAULT_CHAT_MODEL_ID, provisionalTitle } from "../../lib/contracts";
 import { useOnboarding } from "../../lib/useOnboarding";
-import { useProfileReadiness } from "../../lib/useProfileReadiness";
+import { profileBlockingChats, useProfileReadiness } from "../../lib/useProfileReadiness";
 import OnboardingWizard from "../OnboardingWizard";
 import SettingsPane, {
   DEFAULT_SETTINGS_SECTION,
@@ -1084,12 +1084,14 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
 
   const settingsOpen = settingsSection !== null;
 
-  // Whether the active profile can host a chat yet. A profile with no image
-  // (still building, failed, or never built — the state guided setup leaves
-  // behind if it is closed while the first build runs) gets a screen saying so
-  // instead of a composer that can only fail.
+  // Whether the active profile can host a chat yet. A profile that has never
+  // produced an image (building, failed, or never built — the state guided
+  // setup leaves behind if it is closed while the first build runs) gets a
+  // screen saying so instead of a composer that can only fail. One that HAS
+  // built keeps its composer through any later rebuild, which is what
+  // profileBlockingChats encodes.
   const readiness = useProfileReadiness(activeProfileId);
-  const unbuiltProfile = readiness.profile && !readiness.ready ? readiness.profile : null;
+  const unbuiltProfile = profileBlockingChats(readiness.profile);
   const [buildStarting, setBuildStarting] = useState(false);
   const startProfileBuild = useCallback(() => {
     if (!activeProfileId) return;

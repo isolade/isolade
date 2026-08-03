@@ -6,6 +6,7 @@ import {
   ServerOffline,
 } from "../src/components/home/WorkspaceEmptyState";
 import type { ProfileSummary } from "../src/lib/contracts";
+import { profileBlockingChats } from "../src/lib/useProfileReadiness";
 
 // What stands in for the composer when a message typed into one could not go
 // anywhere. Each of these replaces a case that used to accept the message and
@@ -26,6 +27,27 @@ function profile(over: Partial<ProfileSummary> = {}): ProfileSummary {
 }
 
 const render = (node: React.ReactElement) => renderToStaticMarkup(node);
+
+describe("when a profile blocks chats at all", () => {
+  it("blocks only one that has never produced an image", () => {
+    expect(profileBlockingChats(profile())).not.toBeNull();
+    expect(profileBlockingChats(profile({ status: "error" }))).not.toBeNull();
+  });
+
+  it("lets a rebuild of an already-built profile through", () => {
+    // The image survives a rebuild, and the server keeps creating instances
+    // from that last good one while the new build runs, so refreshing an
+    // environment must not stop you starting chats in the one you have.
+    const built = { image: "registry/isolade/img:latest" };
+    expect(profileBlockingChats(profile({ ...built, status: "building" }))).toBeNull();
+    expect(profileBlockingChats(profile({ ...built, status: "error" }))).toBeNull();
+    expect(profileBlockingChats(profile({ ...built, status: "ready" }))).toBeNull();
+  });
+
+  it("blocks nothing while the profile is still unknown", () => {
+    expect(profileBlockingChats(null)).toBeNull();
+  });
+});
 
 describe("no server", () => {
   const html = render(<ServerOffline />);

@@ -12,18 +12,30 @@ import type { ProfileSummary } from "./contracts";
 // message and the server answers "profile <id> has no built image yet". The
 // workspace uses this to say what is actually happening instead.
 //
-// Polls only while the answer can still change: a profile that has an image
-// keeps it (a failed rebuild leaves the last good one in place), so once one
-// shows up the polling stops for good and this costs nothing for the rest of
-// the session.
+// Polls only while the answer can still change: an image, once built, is never
+// taken away, so the polling stops the first time one shows up and costs
+// nothing for the rest of the session.
 
 const POLL_MS = 2000;
+
+/**
+ * The profile to say something about instead of offering a composer, or null
+ * when chats can start.
+ *
+ * The question is the image, deliberately not the status. A profile that has
+ * built before keeps its image through a rebuild — `building` while one runs,
+ * `error` if it fails — and the server goes on creating instances from that
+ * last good image throughout (see `InstanceManager.create`). Refreshing an
+ * environment must not stop you starting chats in the one you already have, so
+ * only a profile that has never produced an image blocks anything.
+ */
+export function profileBlockingChats(profile: ProfileSummary | null): ProfileSummary | null {
+  return profile && !profile.image ? profile : null;
+}
 
 export interface ProfileReadiness {
   /** The profile, once read. Null while unknown, or when it can't be read. */
   profile: ProfileSummary | null;
-  /** True once we know the profile has an image to create instances from. */
-  ready: boolean;
   /** Re-read now, for a caller that just started a build. */
   refresh: () => void;
 }
@@ -63,5 +75,5 @@ export function useProfileReadiness(profileId: string | null): ProfileReadiness 
   }, [profileId, tick]);
 
   const refresh = useCallback(() => setTick((t) => t + 1), []);
-  return { profile, ready: !!profile?.image, refresh };
+  return { profile, refresh };
 }
