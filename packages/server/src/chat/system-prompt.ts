@@ -81,6 +81,15 @@ function identity(isClaude: boolean): string {
 }
 
 /**
+ * The same fact for the "extended" overlay, where the harness prompt is still in
+ * front of ours. Neither vendor mentions a VM at all, so where the chat runs is
+ * still worth saying — but both already supply the working directory, so the
+ * tree is not repeated and the sentence is phrased as an addition to a prompt
+ * that has already introduced the agent.
+ */
+const OVERLAY_IDENTITY = `You are running in Isolade, which gives this chat its own disposable Linux microVM.`;
+
+/**
  * Claude only, and load-bearing there: replacing the CLI's prompt leaves nothing
  * that says approvals are off, while the Bash tool description — which
  * `--system-prompt` does not touch — still warns that `cd` in a compound command
@@ -250,6 +259,46 @@ export function buildSystemPrompt(opts: {
   // profile's instructions on top.
   if (opts.base === "unmodified") {
     return { text: pad(prelude ?? "", opts.provider, "append"), mode: "append" };
+  }
+
+  // "Extended": keep the harness prompt and append only what it gets wrong or omits
+  // about running here. Everything else in this file is deliberately absent, because
+  // both vendor prompts were checked for it and both already cover it — scope,
+  // reporting, automatic summarization, the injected-text framing, the working
+  // directory, and on Claude the model id.
+  //
+  // What is left is four things:
+  //
+  //   The VM. Neither prompt mentions one, so neither says the environment is
+  //   disposable.
+  //
+  //   The permission posture, Claude only. Not merely missing there but contradicted:
+  //   its prompt says "Tools run behind a user-selected permission mode; a denied
+  //   call means the user declined it" and "For actions that are hard to reverse or
+  //   outward-facing, confirm first". Under --dangerously-skip-permissions the first
+  //   is false and the second is friction with nothing behind it. Codex is told
+  //   `approval_policy` never by its own <permissions instructions>, so it needs no
+  //   correction.
+  //
+  //   The credential boundary, both. It has to travel with the sandbox line or that
+  //   line reads as "nothing ever needs asking", and it is the precise version of
+  //   what Claude's prompt gestures at.
+  //
+  //   Attribution, both, which is the whole reason a profile might pick this option:
+  //   neither prompt mentions a trailer, and the Bash tool's default Co-Authored-By
+  //   line is blanked through --settings regardless of base.
+  //
+  // Plus the exact model id on codex, whose prompt only says "based on GPT-5".
+  if (opts.base === "extended") {
+    const overlay = [
+      OVERLAY_IDENTITY,
+      ...(isClaude ? [SANDBOX] : []),
+      CREDENTIALS,
+      ...(isClaude ? [] : [modelIdentity(modelName, opts.model)]),
+      attribution(opts.model),
+      ...(prelude ? [PRELUDE_PRECEDENCE, ...preludeBlocks] : []),
+    ].join("\n\n");
+    return { text: pad(overlay, opts.provider, "append"), mode: "append" };
   }
 
   // "Minimal": replace the harness prompt with the prelude alone, unheaded — there

@@ -11,8 +11,9 @@ _Changes landed on `main` that haven't shipped in a release yet._
 - A profile's instructions are now part of the system prompt rather than being
   prepended to a chat's first message, so they hold for the whole chat and
   outrank the rest of it. You can also pick the prompt they join: Isolade's own,
-  written for a disposable VM and now the default, the one Claude Code or Codex
-  ships, or none at all.
+  written for a disposable VM and now the default; the one Claude Code or Codex
+  ships, either as it comes or with the few corrections Isolade needs on top; or
+  none at all.
 - Chats now carry only the tools they can use, so every message costs less. A
   Claude chat sends about 18 KB before it says a word, down from 60 KB, and a Codex
   chat 2.8 KB, down from 10 KB.

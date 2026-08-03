@@ -124,6 +124,61 @@ describe("buildSystemPrompt", () => {
       expect(build(null, "minimal")).toEqual({ text: "", mode: "replace" });
     });
 
+    it('"extended" keeps the CLI\'s prompt and appends the corrections', () => {
+      const p = build(null, "extended");
+      expect(p.mode).toBe("append");
+      expect(p.text).toContain("You are running in Isolade");
+      expect(p.text).toContain("no call is denied");
+      expect(p.text).toContain('--trailer "Assisted-by: Isolade:claude-opus-5"');
+    });
+
+    it('"extended" carries only what the vendor prompt gets wrong or omits', () => {
+      // Every line below was checked against the shipped prompt and found already
+      // covered, so repeating it would be paying twice. If a vendor drops one of
+      // these, that is when the overlay should grow — not before.
+      const p = build(null, "extended").text;
+      for (const covered of [
+        "Deliver the scope asked for",
+        "Report what you observed",
+        "Context is summarized automatically",
+        "<system-reminder>",
+        "working tree at",
+      ]) {
+        expect(p).not.toContain(covered);
+      }
+      // Claude's own prompt states its model id; codex's says only "based on GPT-5".
+      expect(p).not.toContain("You are running Opus 5");
+      expect(
+        buildSystemPrompt({
+          provider: "openai",
+          model: "gpt-5.6-sol",
+          prelude: null,
+          base: "extended",
+        }).text,
+      ).toContain("You are running GPT-5.6 Sol (model ID: gpt-5.6-sol)");
+    });
+
+    it('"extended" leaves the sandbox correction to Claude and the patch rules to neither', () => {
+      // Codex is told `approval_policy` never by its own <permissions instructions>,
+      // and keeps its own patch guidance because we keep its prompt.
+      const overlay = buildSystemPrompt({
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        prelude: null,
+        base: "extended",
+      }).text;
+      expect(overlay).not.toContain("no call is denied");
+      expect(overlay).not.toContain("# Editing files");
+      // The credential boundary is the half that stays on both.
+      expect(overlay.replace(/\s+/g, " ")).toContain("real credentials, so ask first");
+    });
+
+    it('"extended" still gives the prelude the last word', () => {
+      const p = build("Commit messages start with a verb.", "extended").text;
+      expect(p).toContain("Where they conflict");
+      expect(p.trimEnd().endsWith("Commit messages start with a verb.")).toBe(true);
+    });
+
     const codexBase = (prelude: string | null, base: PromptBase) =>
       buildSystemPrompt({ provider: "openai", model: "gpt-5.6-sol", prelude, base });
 
@@ -185,7 +240,16 @@ describe("buildSystemPrompt", () => {
           base: "unmodified",
         }).text,
       ).toBe("Mine.");
-      for (const base of ["unmodified", "minimal", "optimized"] as PromptBase[]) {
+      // Extended appends too, so it takes the CLI's own separator like unmodified.
+      expect(
+        buildSystemPrompt({
+          provider: "anthropic",
+          model: "claude-opus-5",
+          prelude: "Mine.",
+          base: "extended",
+        }).text.startsWith("\n"),
+      ).toBe(false);
+      for (const base of ["unmodified", "extended", "minimal", "optimized"] as PromptBase[]) {
         const text = buildSystemPrompt({
           provider: "openai",
           model: "gpt-5.6-sol",

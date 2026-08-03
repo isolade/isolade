@@ -7,10 +7,11 @@ import type { PromptConfig } from "../lib/contracts";
 
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-// Ordered best-default-first, then by who writes the prompt: the two where Isolade
-// does come before the one where it does not, which is also the replace/append
-// split in IsoladeSystemPrompt. One line each, since the hint is the only
-// explanation an option gets and a reader is choosing between three of them.
+// Ordered best-default-first, then by whether Isolade replaces the prompt or keeps
+// it — the same split as the replace/append mode in IsoladeSystemPrompt. One line
+// each, since the hint is the only explanation an option gets and a reader is
+// choosing between four of them. Extended and Unmodified open the same way on
+// purpose: they differ only in what follows.
 const BASE_OPTIONS: { value: PromptConfig["base"]; label: string; hint: string }[] = [
   {
     value: "optimized",
@@ -23,9 +24,14 @@ const BASE_OPTIONS: { value: PromptConfig["base"]; label: string; hint: string }
     hint: "Removes almost the entire system prompt, leaving only your own instructions behind.",
   },
   {
+    value: "extended",
+    label: "Extended",
+    hint: "The prompt Claude Code or Codex ships, plus the little Isolade has to correct.",
+  },
+  {
     value: "unmodified",
     label: "Unmodified",
-    hint: "The default prompt that ships with Claude Code or Codex (not recommended).",
+    hint: "The prompt Claude Code or Codex ships, and nothing else (not recommended).",
   },
 ];
 
