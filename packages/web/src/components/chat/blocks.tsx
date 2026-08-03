@@ -629,8 +629,12 @@ export const StreamView = memo(function StreamView({
         }
         if (chunk.kind === "user_message") {
           return (
+            // Keys carry the kind because an id does not identify a chunk on its
+            // own: interrupting a turn with a steering message emits both an
+            // interruption marker and the message under that message's id, so
+            // the two would otherwise be one key twice in this array.
             <UserMessage
-              key={chunk.id}
+              key={`user_message:${chunk.id}`}
               message={chunk}
               capabilities={chunk.capabilities ?? NO_USER_MESSAGE_CAPABILITIES}
               instanceId={instanceId}
@@ -645,13 +649,13 @@ export const StreamView = memo(function StreamView({
           );
         }
         if (chunk.kind === "interruption") {
-          return <InterruptionMarker key={chunk.id} id={chunk.id} />;
+          return <InterruptionMarker key={`interruption:${chunk.id}`} id={chunk.id} />;
         }
         if (chunk.kind === "api_retry") return <RetryBlock key={i} chunk={chunk} />;
         if (chunk.kind === "thought") {
           return (
             <ThoughtBlock
-              key={chunk.id}
+              key={`thought:${chunk.id}`}
               chunk={chunk}
               cacheKey={cacheScope === undefined ? undefined : `${cacheScope}:thought:${chunk.id}`}
             />
