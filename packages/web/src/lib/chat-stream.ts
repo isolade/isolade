@@ -20,7 +20,11 @@ export type ChatTurnEvent =
   | { kind: "snapshot"; snapshot: ChatResumeSnapshot }
   | { kind: "event"; type: string; payload: unknown; seq: number }
   | { kind: "done" }
-  | { kind: "error"; message: string };
+  | { kind: "error"; message: string }
+  // The server did not declare the turn terminal. The current reader exhausted
+  // its retry budget, so the view may hand its cursor to a fresh reader without
+  // mistaking a transport failure for the end of the provider turn.
+  | { kind: "disconnected"; message: string };
 
 export interface RunChatTurnOptions {
   apiBase: string;
@@ -89,22 +93,25 @@ async function extractErrorMessage(resp: Response): Promise<string> {
 // the connection drops. On clean termination (terminal `done`/`error`
 // event seen) the promise resolves with `{ terminated: true }`. On a
 // recoverable disconnect (network error, idle timeout, body ended
-// without a terminal event) it resolves with `{ terminated: false,
-// messageId, lastSeq }` so the caller can decide whether to retry.
+// without a terminal event) it resolves with `{ terminated: false }`.
+// The shared cursor already holds any progress the body made, including when
+// iteration threw instead of returning normally.
 //
 // The caller's `onEvent` sees every logical event, including the
 // terminal one. Reconnect attempts pass the same onEvent so the caller
 // can stay agnostic to whether bytes came from POST or a resume GET.
-interface AttemptResult {
-  terminated: boolean;
+interface StreamCursor {
   messageId: string | null;
   lastSeq: number;
 }
 
+interface AttemptResult {
+  terminated: boolean;
+}
+
 async function streamFromResponse(
   resp: Response,
-  initialMessageId: string | null,
-  initialLastSeq: number,
+  cursor: StreamCursor,
   onEvent: (event: ChatTurnEvent) => void,
   signal: AbortSignal,
   idleTimeoutMs: number,
@@ -112,19 +119,17 @@ async function streamFromResponse(
   if (!resp.body) {
     throw new Error("missing response body");
   }
-  let messageId = initialMessageId;
-  let lastSeq = initialLastSeq;
   let terminated = false;
 
   if (signal.aborted) {
-    return { terminated: false, messageId, lastSeq };
+    return { terminated: false };
   }
 
   for await (const raw of parseSse(resp.body, { idleTimeoutMs, signal })) {
     const decoded = decodeSseEvent(raw);
     if (!decoded) continue;
     if (decoded.kind === "message_id") {
-      messageId = decoded.messageId;
+      cursor.messageId = decoded.messageId;
       onEvent(decoded);
       continue;
     }
@@ -133,13 +138,13 @@ async function streamFromResponse(
       continue;
     }
     if (decoded.kind === "snapshot") {
-      messageId = decoded.snapshot.messageId;
-      lastSeq = decoded.snapshot.lastSeq;
+      cursor.messageId = decoded.snapshot.messageId;
+      cursor.lastSeq = decoded.snapshot.lastSeq;
       onEvent(decoded);
       continue;
     }
     if (decoded.kind === "event") {
-      if (decoded.seq > lastSeq) lastSeq = decoded.seq;
+      if (decoded.seq > cursor.lastSeq) cursor.lastSeq = decoded.seq;
       onEvent(decoded);
       continue;
     }
@@ -148,7 +153,7 @@ async function streamFromResponse(
     terminated = true;
     break;
   }
-  return { terminated, messageId, lastSeq };
+  return { terminated };
 }
 
 // Translate one raw SSE frame to a ChatTurnEvent. Unknown event names
@@ -213,17 +218,20 @@ function decodeSseEvent(ev: SseEvent): ChatTurnEvent | null {
 
 // Top-level: send a new user message and stream the assistant turn.
 // On recoverable disconnects, reconnect to the resume endpoint with
-// the last seen seq until terminated or retry budget exhausted. Throws
-// only if every attempt fails. With a stable userMessageId, even an initial
-// POST that loses its response can be repeated without creating another turn.
+// the last seen seq until terminated or retry budget exhausted. With a stable
+// userMessageId, even an initial POST that loses its response can be repeated
+// without creating another turn. This includes losing the response body before
+// its message_id frame arrives.
 export async function runChatTurn(opts: RunChatTurnOptions): Promise<void> {
   const maxRetries = opts.maxRetries ?? DEFAULT_MAX_RETRIES;
   const backoffBase = opts.backoffBaseMs ?? DEFAULT_BACKOFF_BASE_MS;
   const backoffCap = opts.backoffCapMs ?? DEFAULT_BACKOFF_CAP_MS;
   const idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
 
-  let messageId: string | null = null;
-  let lastSeq = -1;
+  // The cursor belongs to the whole logical turn, not one HTTP body. Mutate it
+  // before dispatching each event so a body that throws after useful frames
+  // still leaves the retry loop knowing the turn id and latest durable seq.
+  const cursor: StreamCursor = { messageId: null, lastSeq: -1 };
 
   // Initial attempt = POST. Subsequent attempts = GET resume. We
   // surface fatal early errors (chat doesn't exist, etc) by throwing,
@@ -274,67 +282,67 @@ export async function runChatTurn(opts: RunChatTurnOptions): Promise<void> {
     if (opts.signal.aborted) return;
     let resp: Response;
     try {
-      if (messageId === null) {
+      if (cursor.messageId === null) {
         resp = await post();
       } else {
-        resp = await resume(messageId);
+        resp = await resume(cursor.messageId);
       }
     } catch (err) {
       // A stable user id makes the initial POST idempotent too. If the
       // connection died before message_id arrived, repeat that POST and the
       // server either starts it once or returns the already-running turn.
-      if (messageId === null && !opts.userMessageId) throw err;
+      if (cursor.messageId === null && !opts.userMessageId) throw err;
       if (opts.signal.aborted) return;
       failures++;
       await delay(backoffFor(failures, backoffBase, backoffCap), opts.signal);
       continue;
     }
 
-    const seqBefore = lastSeq;
-    const hadMessageId = messageId !== null;
+    const seqBefore = cursor.lastSeq;
+    const hadMessageId = cursor.messageId !== null;
     let result: AttemptResult;
     try {
-      result = await streamFromResponse(
-        resp,
-        messageId,
-        lastSeq,
-        opts.onEvent,
-        opts.signal,
-        idleTimeoutMs,
-      );
+      result = await streamFromResponse(resp, cursor, opts.onEvent, opts.signal, idleTimeoutMs);
     } catch (err) {
       // Body read failed (network drop, idle timeout, decoder error).
-      // Without a messageId there's nothing for the resume endpoint to
-      // find, so we'd loop forever, so bail out (covers idle timeout and
-      // any other read error on the initial POST) so the UI shows a
-      // clear failure.
+      // A frame may have advanced the shared cursor before the body failed. If
+      // it taught us the message id, resume instead of treating this as an
+      // unknowable initial POST failure. Progress also resets the consecutive
+      // failure budget just as it does for a cleanly-ended body.
       if (opts.signal.aborted) return;
-      if (messageId === null) throw err;
-      failures++;
+      if (cursor.messageId === null) {
+        if (!opts.userMessageId) throw err;
+        failures++;
+        await delay(backoffFor(failures, backoffBase, backoffCap), opts.signal);
+        continue;
+      }
+      const madeProgress =
+        cursor.lastSeq > seqBefore || (!hadMessageId && cursor.messageId !== null);
+      failures = madeProgress ? 0 : failures + 1;
       await delay(backoffFor(failures, backoffBase, backoffCap), opts.signal);
       continue;
     }
-
-    // Result may have learned a messageId mid-attempt (the very first
-    // POST sees `message_id` as event #1) or advanced lastSeq.
-    messageId = result.messageId;
-    lastSeq = result.lastSeq;
 
     if (result.terminated) return;
     // Body ended without a terminal event: server-side disconnect,
     // proxy timeout, etc. Retry if we have something to resume from.
-    if (messageId === null) {
-      throw new Error("stream ended before any message_id event");
+    if (cursor.messageId === null) {
+      if (!opts.userMessageId) {
+        throw new Error("stream ended before any message_id event");
+      }
+      failures++;
+      await delay(backoffFor(failures, backoffBase, backoffCap), opts.signal);
+      continue;
     }
-    const madeProgress = lastSeq > seqBefore || (!hadMessageId && messageId !== null);
+    const madeProgress = cursor.lastSeq > seqBefore || (!hadMessageId && cursor.messageId !== null);
     failures = madeProgress ? 0 : failures + 1;
     await delay(backoffFor(failures, backoffBase, backoffCap), opts.signal);
   }
 
-  // Exhausted retries without termination. Surface an error to the
-  // caller's onEvent so it can render a final state.
+  // Exhausted this reader's retries without a server terminal event. Hand the
+  // distinction to the view so it can start another reader from this cursor.
   opts.onEvent({
-    kind: "error",
+    kind: "disconnected",
     message: "lost connection to chat stream after multiple retries",
   });
 }
@@ -357,37 +365,36 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-// Best-effort fire-and-forget cancel for the Stop button. We don't
-// wait for the response, since the abort signal is plenty to tear down the
-// local stream loop, and the server's DELETE just speeds up the CLI
-// cleanup. Network/HTTP errors are non-actionable for the UI (the
-// abort already happened locally), but we still attach a .catch
-// handler so a failing cancel shows up in the console instead of
-// becoming an unhandled rejection.
-export function cancelChatTurn(
+// Ask the server to cancel before the caller drops its reader. A local abort is
+// only a disconnect, so treating it as proof of cancellation can hide a turn
+// that kept running after a failed DELETE. A 404 is also terminal for this
+// purpose: the server says there is no running producer left to preserve.
+export async function cancelChatTurn(
   apiBase: string,
   instanceId: string,
   chatId: string,
   messageId: string,
-): void {
+): Promise<boolean> {
   try {
-    void apiFetch(`${apiBase}/api/instances/${instanceId}/chats/${chatId}/messages/${messageId}`, {
-      method: "DELETE",
-      keepalive: true,
-    }).catch((err) => {
-      console.warn(`[chat] cancel request failed for ${messageId}:`, err);
-    });
+    const response = await apiFetch(
+      `${apiBase}/api/instances/${instanceId}/chats/${chatId}/messages/${messageId}`,
+      {
+        method: "DELETE",
+        keepalive: true,
+      },
+    );
+    if (response.ok || response.status === 404) return true;
+    console.warn(`[chat] cancel request failed for ${messageId}: HTTP ${response.status}`);
+    return false;
   } catch (err) {
-    // Synchronous throw from fetch is rare (invalid URL) and would
-    // indicate a programming error, so log instead of silently dropping.
-    console.warn(`[chat] cancel fetch threw synchronously for ${messageId}:`, err);
+    console.warn(`[chat] cancel request failed for ${messageId}:`, err);
+    return false;
   }
 }
 
-// Reconnect to an in-flight turn after a page reload. The chat UI
-// figures out the messageId by looking at the events log (most-recent
-// event whose messageId has no chat_message row). `afterSeq` is the
-// last seq the client has applied. Pass -1 to ask for everything.
+// Reconnect to a known turn after a page reload, chat-row discovery, or reader
+// handoff. `afterSeq` is the last seq the client has applied. Pass -1 to ask for
+// everything.
 export interface ResumeChatTurnOptions {
   apiBase: string;
   instanceId: string;
@@ -409,7 +416,7 @@ export async function resumeChatTurn(opts: ResumeChatTurnOptions): Promise<void>
   const backoffCap = opts.backoffCapMs ?? DEFAULT_BACKOFF_CAP_MS;
   const idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
 
-  let lastSeq = opts.afterSeq;
+  const cursor: StreamCursor = { messageId: opts.messageId, lastSeq: opts.afterSeq };
 
   // As in runChatTurn: count *consecutive* failures, reset on progress, so a
   // long in-flight turn we're tailing after a reload isn't dropped just
@@ -444,17 +451,15 @@ export async function resumeChatTurn(opts: ResumeChatTurnOptions): Promise<void>
       await delay(backoffFor(failures, backoffBase, backoffCap), opts.signal);
       continue;
     }
-    const seqBefore = lastSeq;
+    const seqBefore = cursor.lastSeq;
     try {
       const result = await streamFromResponse(
         resp,
-        opts.messageId,
-        lastSeq,
+        cursor,
         opts.onEvent,
         opts.signal,
         idleTimeoutMs,
       );
-      lastSeq = result.lastSeq;
       if (result.terminated) return;
     } catch (err) {
       if (opts.signal.aborted) return;
@@ -468,11 +473,11 @@ export async function resumeChatTurn(opts: ResumeChatTurnOptions): Promise<void>
         err,
       );
     }
-    failures = lastSeq > seqBefore ? 0 : failures + 1;
+    failures = cursor.lastSeq > seqBefore ? 0 : failures + 1;
     await delay(backoffFor(failures, backoffBase, backoffCap), opts.signal);
   }
   opts.onEvent({
-    kind: "error",
+    kind: "disconnected",
     message: "lost connection to chat stream after multiple retries",
   });
 }

@@ -77,6 +77,7 @@ import {
   type SessionMessageRow,
 } from "./chat/MessageHistory";
 import { QueuedMessages, reconcileQueuedMessageSnapshot } from "./chat/QueuedMessages";
+import { type TurnLease, TurnLifecycle, unfollowedTurnId } from "./chat/turn-attachment";
 import { ChatCost, ContextMeter, type TurnClock, TurnStatus } from "./chat/UsagePanel";
 import { FastModeToggle } from "./FastModeToggle";
 import { MessageBox } from "./MessageBox";
@@ -87,6 +88,18 @@ import { ModelEffortPicker } from "./ModelEffortPicker";
 // user is reading history, so streaming must not yank the viewport and the
 // jump-to-bottom button shows instead.
 const SCROLL_PIN_THRESHOLD_PX = 2;
+// One fresh reader is enough to rule out an attempt-local failure. If that
+// reader also burns through its complete no-progress retry budget, surface the
+// disconnect instead of silently starting another budget forever.
+const MAX_NO_PROGRESS_READER_HANDOFFS = 1;
+
+interface ResumeAttachmentOptions {
+  renderKey?: string;
+  lease?: TurnLease;
+  startedAt?: number | null;
+  readerHandoffs?: number;
+  assistantVersion?: TranscriptMessage["version"];
+}
 
 function pageKey(messages: TranscriptMessage[], fallback: string): string {
   return `${messages[0]?.id ?? fallback}:${messages.at(-1)?.id ?? fallback}`;
@@ -198,6 +211,39 @@ function Chat({
   const attachments = useAttachments(instanceId);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [streaming, setStreaming] = useState(!!initialMessage);
+  // React state paints activity, while this synchronous lease is its authority.
+  // Effects and event handlers can race before a render updates `streaming`, and
+  // old async cleanup can run after a replacement starts. Claims close the first
+  // race and lease-checked releases close the second.
+  const [turnLifecycle] = useState(() => new TurnLifecycle(!!initialMessage));
+  const streamingRef = useRef(streaming);
+  streamingRef.current = streaming;
+  const publishTurnActivity = useCallback(() => {
+    streamingRef.current = turnLifecycle.active;
+    setStreaming(turnLifecycle.active);
+  }, [turnLifecycle]);
+  const claimTurn = useCallback((): TurnLease | null => {
+    const lease = turnLifecycle.claim();
+    if (lease !== null) publishTurnActivity();
+    return lease;
+  }, [publishTurnActivity, turnLifecycle]);
+  const replaceTurn = useCallback(
+    (publish = true): TurnLease => {
+      const lease = turnLifecycle.replace();
+      if (publish) publishTurnActivity();
+      return lease;
+    },
+    [publishTurnActivity, turnLifecycle],
+  );
+  const releaseTurn = useCallback(
+    (lease: TurnLease) => {
+      if (turnLifecycle.release(lease)) publishTurnActivity();
+    },
+    [publishTurnActivity, turnLifecycle],
+  );
+  const resetTurn = useCallback(() => {
+    if (turnLifecycle.reset()) publishTurnActivity();
+  }, [publishTurnActivity, turnLifecycle]);
   // Which branch of the message tree is visible: the id of the path's last
   // message (or any message on it). Seeded from the persisted chat row,
   // advanced locally as turns run, and re-pointed by version navigation.
@@ -273,9 +319,6 @@ function Chat({
     userId: string;
     chunk: ProviderSwitchChunk;
   } | null>(null);
-  useEffect(() => {
-    if (!streaming) setActiveSwitch(null);
-  }, [streaming]);
   // Server-synced (model, effort, fastMode) triple. The picker stays
   // interactive while a turn is streaming. In that case we update the displayed
   // values locally and defer the PATCH until the user sends the next message.
@@ -292,9 +335,20 @@ function Chat({
     messageId: string;
     lastSeq: number;
     renderKey: string;
+    readerHandoffs: number;
+    assistantVersion: TranscriptMessage["version"];
+    // Hidden panes preserve the logical lease while dropping only their HTTP
+    // reader. A transport handoff omits it and claims a fresh lease on retry.
+    lease?: TurnLease;
   } | null>(null);
+  const activeReaderHandoffsRef = useRef(0);
   const streamingMessageIdRef = useRef<string | null>(null);
   const liveLastSeqRef = useRef(-1);
+  useEffect(() => {
+    // Retry exhaustion drops one HTTP reader, not the logical provider turn.
+    // Keep its optimistic divider across the immediate lease handoff.
+    if (!streaming && !detachedTurnRef.current) setActiveSwitch(null);
+  }, [streaming]);
   const agentFontFamily = resolveFontFamily(useAgentFontSetting());
   const userFontFamily = resolveFontFamily(useUserFontSetting());
   // Latest token-usage snapshot from the server. Seeded synchronously from
@@ -337,6 +391,9 @@ function Chat({
   // just means the previous state paints for another 16ms.
   useEffect(() => {
     if (!streaming) {
+      // A disconnected reader is replaced by the visibility effect below. The
+      // logical turn and its stopwatch stay continuous across that handoff.
+      if (detachedTurnRef.current) return;
       setTurnClock((clock) =>
         !clock.running
           ? clock
@@ -374,15 +431,38 @@ function Chat({
   // resumed turns (whose user message is already the branch tip). Where the
   // committed assistant message attaches.
   const turnUserIdRef = useRef<string | null>(null);
-  // Mirror of `streaming` for stable callbacks (edit/navigation guards).
-  const streamingRef = useRef(streaming);
-  streamingRef.current = streaming;
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
   const showDebugRef = useRef(showDebug);
   showDebugRef.current = showDebug;
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
+  // Turns this view has seen the end of. The chat row it reads below is a poll
+  // behind, so it can still name a turn that has just finished, and a turn that
+  // ended without a message to show (stopped before it said anything, or failed)
+  // leaves nothing else to recognize it by. Only a terminal state counts: a lost
+  // connection is not one, and a turn that outlives it is the whole point of the
+  // reconciliation this feeds.
+  const settledTurnsRef = useRef(new Set<string>());
+  // Turns whose server state may still be running but whose reader exhausted
+  // the bounded reconnect policy. They are not "settled": the distinction
+  // keeps a stale poll from reopening readers forever while making a subsequent
+  // send join the durable queue instead of racing the provider turn.
+  const disconnectedTurnsRef = useRef(new Set<string>());
+  // A turn the server is running that nothing here is reading. The chat row
+  // carries it, so this sees a turn regardless of how it started: a queued
+  // message the server promoted when the last turn settled, one whose stream
+  // this tab lost, or one another window sent. Drives the reconciliation below,
+  // which is what attaches to it. Computed per render rather than memoized,
+  // since `settledTurnsRef` is not a dependency anything could list.
+  const unattachedTurnId = unfollowedTurnId({
+    inFlightMessageId: chat.inFlightMessageId,
+    active: turnLifecycle.active,
+    holdsMessage: (id) =>
+      settledTurnsRef.current.has(id) ||
+      disconnectedTurnsRef.current.has(id) ||
+      messages.some((message) => message.id === id),
+  });
   const historyPagesRef = useRef(historyPages);
   historyPagesRef.current = historyPages;
   const sessionRowsRef = useRef(sessionRows);
@@ -835,11 +915,13 @@ function Chat({
         );
         setHasOlder(page.hasMore);
         setActiveLeaf(page.messages.at(-1)?.id ?? chatRef.current.activeLeafId ?? null);
-        if (transcriptRequests.accepts(generation, ac) && page.inFlight) {
-          // Time this turn from when the server says it began, not from now: it
-          // may have been running for minutes before this tab opened the chat.
-          resumedTurnRef.current = { startedAt: page.inFlight.startedAt?.getTime() ?? null };
-          attachResume(page.inFlight.messageId, page.inFlight.lastSeq, page.inFlight.chunks);
+        // Hidden panes warm their transcript but do not open an SSE reader only
+        // to have the visibility effect abort it. The chat-row reconciliation
+        // attaches when the pane becomes visible.
+        if (visible && transcriptRequests.accepts(generation, ac) && page.inFlight) {
+          attachResume(page.inFlight.messageId, page.inFlight.lastSeq, page.inFlight.chunks, {
+            startedAt: page.inFlight.startedAt?.getTime() ?? null,
+          });
         }
       } catch (err) {
         // Aborts are routine (chat switch, unmount). Anything else is
@@ -1233,7 +1315,9 @@ function Chat({
       ac: AbortController,
       existingChunks: StreamChunk[] | null,
       runner: (onEvent: (ev: ChatTurnEvent) => void) => Promise<void>,
+      readerHandoffs = 0,
     ) => {
+      activeReaderHandoffsRef.current = readerHandoffs;
       const chunks: StreamChunk[] = existingChunks ? [...existingChunks] : [];
       liveChunksRef.current = chunks;
       hiddenLiveRenderDirtyRef.current = false;
@@ -1423,6 +1507,13 @@ function Chat({
           .filter((chunk): chunk is Extract<StreamChunk, { kind: "text" }> => chunk.kind === "text")
           .map((chunk) => chunk.text)
           .join("");
+      // This turn is over as far as this view is concerned, so the chat row's
+      // still-running copy of it must not send the reconciliation after it (see
+      // settledTurnsRef). A turn that ends with nothing to commit has no message
+      // row to stand for it, which is exactly when this is the only record.
+      const markTurnSettled = () => {
+        if (serverMessageId) settledTurnsRef.current.add(serverMessageId);
+      };
 
       const applyMetaEvent = (type: string, payload: unknown): boolean => {
         if (type === "usage") {
@@ -1534,10 +1625,12 @@ function Chat({
           return;
         }
         if (ev.kind === "snapshot") {
+          const previousLastSeq = lastSeq;
           serverMessageId = ev.snapshot.messageId;
           streamingMessageIdRef.current = ev.snapshot.messageId;
           lastSeq = ev.snapshot.lastSeq;
           liveLastSeqRef.current = lastSeq;
+          if (lastSeq > previousLastSeq) activeReaderHandoffsRef.current = 0;
           snapshotState.message = ev.snapshot.message;
           for (const metaEvent of ev.snapshot.metaEvents) {
             applyMetaEvent(metaEvent.type, metaEvent.payload);
@@ -1602,8 +1695,50 @@ function Chat({
           }
           return;
         }
+        if (ev.kind === "disconnected") {
+          // A transport failure is not proof that the provider turn ended. Give
+          // an authoritative running turn one fresh reader, but do not turn each
+          // exhausted retry budget into another one forever. On the final
+          // failure, preserve any partial response and explain that the server
+          // turn may still be running without marking it settled.
+          terminalHandled = true;
+          const nextReaderHandoffs = activeReaderHandoffsRef.current + 1;
+          const serverStillNamesTurn =
+            serverMessageId !== null && chatRef.current.inFlightMessageId === serverMessageId;
+          if (
+            serverMessageId &&
+            serverStillNamesTurn &&
+            nextReaderHandoffs <= MAX_NO_PROGRESS_READER_HANDOFFS
+          ) {
+            detachedTurnRef.current = {
+              messageId: serverMessageId,
+              lastSeq,
+              renderKey: liveRenderKeyRef.current ?? serverMessageId,
+              readerHandoffs: nextReaderHandoffs,
+              assistantVersion: pendingAssistantVersionRef.current,
+            };
+          } else {
+            if (serverMessageId) disconnectedTurnsRef.current.add(serverMessageId);
+            if (chunks.length > 0 || snapshotState.message) {
+              const id = serverMessageId ?? crypto.randomUUID();
+              commit(id, snapshotState.message?.content ?? accumulatedContent());
+            } else {
+              discardLiveRow();
+            }
+            appendErrorBubble(
+              `Error: ${ev.message}. The turn may still be running on the server. ` +
+                "Reload to check its latest output.",
+            );
+            scrollToBottom();
+          }
+          streamingMessageIdRef.current = null;
+          return;
+        }
         if (ev.kind === "done") {
           const id = serverMessageId ?? crypto.randomUUID();
+          activeReaderHandoffsRef.current = 0;
+          disconnectedTurnsRef.current.delete(id);
+          markTurnSettled();
           finishingDrain = finishThenCommit(() =>
             commit(id, snapshotState.message?.content ?? accumulatedContent()),
           );
@@ -1611,6 +1746,9 @@ function Chat({
           return;
         }
         if (ev.kind === "error") {
+          activeReaderHandoffsRef.current = 0;
+          if (serverMessageId) disconnectedTurnsRef.current.delete(serverMessageId);
+          markTurnSettled();
           // Cancel is signalled as { kind: "error" } from the hub
           // (the producer's AbortSignal got tripped). We treat the
           // partial output as a real (stopped) message rather than a
@@ -1645,6 +1783,7 @@ function Chat({
         if (ev.seq >= 0) {
           lastSeq = ev.seq;
           liveLastSeqRef.current = lastSeq;
+          activeReaderHandoffsRef.current = 0;
         }
         // Meta events that don't produce chunks but update other UI.
         if (applyMetaEvent(ev.type, ev.payload)) return;
@@ -1734,7 +1873,9 @@ function Chat({
         } catch (err) {
           if (detachedControllersRef.current.has(ac)) return;
           if (ac.signal.aborted) {
-            // Local abort (Stop button / unmount). Commit partial.
+            // Local abort (Stop button / unmount). Commit partial. Stopping also
+            // cancels the turn server-side, so this view is done with it.
+            markTurnSettled();
             if (!terminalHandled && (chunks.length > 0 || snapshotState.message)) {
               const id = serverMessageId ?? crypto.randomUUID();
               commit(id, snapshotState.message?.content ?? accumulatedContent());
@@ -1763,6 +1904,7 @@ function Chat({
         if (!terminalHandled) {
           if (detachedControllersRef.current.has(ac)) return;
           if (ac.signal.aborted) {
+            markTurnSettled();
             if (chunks.length > 0 || snapshotState.message) {
               const id = serverMessageId ?? crypto.randomUUID();
               commit(id, snapshotState.message?.content ?? accumulatedContent());
@@ -1833,7 +1975,19 @@ function Chat({
       // initializer.
       if (navigatingBranchRef.current && !force) return;
 
-      if (streaming && !force) {
+      const polledTurnId = chatRef.current.inFlightMessageId;
+      const serverTurnRequiresQueue =
+        polledTurnId !== null &&
+        polledTurnId !== undefined &&
+        !settledTurnsRef.current.has(polledTurnId) &&
+        (disconnectedTurnsRef.current.has(polledTurnId) ||
+          !messagesRef.current.some((message) => message.id === polledTurnId));
+      const lease = force
+        ? (turnLifecycle.current ?? claimTurn())
+        : serverTurnRequiresQueue
+          ? null
+          : claimTurn();
+      if (lease === null) {
         await flushPickerChanges();
         const id = crypto.randomUUID();
         const now = new Date();
@@ -1885,77 +2039,77 @@ function Chat({
         return;
       }
 
-      invalidateTranscriptRequests();
-
-      if (override === undefined) {
-        setInput("");
-        attachments.clear();
-      }
-      setStreaming(true);
-      liveLastSeqRef.current = -1;
-
-      await flushPickerChanges();
-
-      // Optimistic user bubble at the tip of the visible branch. The server's
-      // `user_message` frame swaps in the real row (id + parent) once the
-      // POST lands. If the parent bootstrapped us with this same message as
-      // an optimistic bubble, reuse it instead of duplicating.
-      const last = messages[messages.length - 1];
-      const reuseBootstrap = last?.role === "user" && last.content === content;
-      const optimisticId = reuseBootstrap ? last.id : crypto.randomUUID();
-      pendingUserIdRef.current = optimisticId;
-      turnUserIdRef.current = optimisticId;
-      // If this send activates a pending cross-provider switch, show the divider
-      // above this user message immediately (optimistically). It is keyed by the
-      // message id and updated when the server swaps in the real id; it clears
-      // when the turn settles, ceding to the persisted marker on the committed
-      // turn.
-      const sw = pendingSwitchRef.current;
-      setActiveSwitch(
-        sw
-          ? {
-              userId: optimisticId,
-              chunk: {
-                kind: "provider_switch",
-                fromProvider: sw.sourceProvider,
-                fromModel: sw.sourceModel,
-                toProvider: sw.targetProvider,
-                toModel: sw.targetModel,
-              },
-            }
-          : null,
-      );
-      const renderKey = liveRenderKeyRef.current ?? `live-${crypto.randomUUID()}`;
-      liveRenderKeyRef.current = renderKey;
-      pinNextCommitToBottom();
-      setLiveRow({
-        renderKey,
-        messageId: null,
-        parentId: optimisticId,
-        chunks: [],
-      });
-      if (!reuseBootstrap) {
-        const optimistic: TranscriptMessage = {
-          id: optimisticId,
-          chatId,
-          role: "user",
-          content,
-          parentId: tipIdRef.current,
-          // Already uploaded, so previews resolve before the server swaps in
-          // the persisted user message.
-          uploads: uploads.length > 0 ? uploads : undefined,
-          deliveryStatus: "sending",
-          deliveryError: null,
-          createdAt: new Date(),
-          version: null,
-        };
-        setSessionRows((rows) => [...rows, { renderKey: optimistic.id, message: optimistic }]);
-      }
-      setActiveLeaf(optimisticId);
-
       const ac = new AbortController();
       abortRef.current = ac;
       try {
+        invalidateTranscriptRequests();
+
+        await flushPickerChanges();
+        if (ac.signal.aborted || !turnLifecycle.owns(lease)) return;
+
+        if (override === undefined) {
+          setInput("");
+          attachments.clear();
+        }
+        liveLastSeqRef.current = -1;
+
+        // Optimistic user bubble at the tip of the visible branch. The server's
+        // `user_message` frame swaps in the real row (id + parent) once the
+        // POST lands. If the parent bootstrapped us with this same message as
+        // an optimistic bubble, reuse it instead of duplicating.
+        const last = messages[messages.length - 1];
+        const reuseBootstrap = last?.role === "user" && last.content === content;
+        const optimisticId = reuseBootstrap ? last.id : crypto.randomUUID();
+        pendingUserIdRef.current = optimisticId;
+        turnUserIdRef.current = optimisticId;
+        // If this send activates a pending cross-provider switch, show the divider
+        // above this user message immediately (optimistically). It is keyed by the
+        // message id and updated when the server swaps in the real id; it clears
+        // when the turn settles, ceding to the persisted marker on the committed
+        // turn.
+        const sw = pendingSwitchRef.current;
+        setActiveSwitch(
+          sw
+            ? {
+                userId: optimisticId,
+                chunk: {
+                  kind: "provider_switch",
+                  fromProvider: sw.sourceProvider,
+                  fromModel: sw.sourceModel,
+                  toProvider: sw.targetProvider,
+                  toModel: sw.targetModel,
+                },
+              }
+            : null,
+        );
+        const renderKey = liveRenderKeyRef.current ?? `live-${crypto.randomUUID()}`;
+        liveRenderKeyRef.current = renderKey;
+        pinNextCommitToBottom();
+        setLiveRow({
+          renderKey,
+          messageId: null,
+          parentId: optimisticId,
+          chunks: [],
+        });
+        if (!reuseBootstrap) {
+          const optimistic: TranscriptMessage = {
+            id: optimisticId,
+            chatId,
+            role: "user",
+            content,
+            parentId: tipIdRef.current,
+            // Already uploaded, so previews resolve before the server swaps in
+            // the persisted user message.
+            uploads: uploads.length > 0 ? uploads : undefined,
+            deliveryStatus: "sending",
+            deliveryError: null,
+            createdAt: new Date(),
+            version: null,
+          };
+          setSessionRows((rows) => [...rows, { renderKey: optimistic.id, message: optimistic }]);
+        }
+        setActiveLeaf(optimisticId);
+
         await drainTurn(ac, null, (onEvent) =>
           runChatTurn({
             apiBase: API_BASE,
@@ -1974,13 +2128,12 @@ function Chat({
           pendingAssistantVersionRef.current = null;
         }
         if (abortRef.current === ac) abortRef.current = null;
-        if (!detachedControllersRef.current.has(ac)) setStreaming(false);
+        if (!detachedControllersRef.current.has(ac)) releaseTurn(lease);
       }
     },
     [
       input,
       attachments,
-      streaming,
       instanceId,
       chatId,
       messages,
@@ -1989,6 +2142,9 @@ function Chat({
       flushPickerChanges,
       drainTurn,
       invalidateTranscriptRequests,
+      claimTurn,
+      releaseTurn,
+      turnLifecycle,
     ],
   );
 
@@ -2166,17 +2322,26 @@ function Chat({
       navigatingBranchRef.current = true;
       setNavigatingBranch(true);
       const activeMessageId = streamingMessageIdRef.current;
-      if (activeMessageId) cancelChatTurn(API_BASE, instanceId, chatId, activeMessageId);
+      if (activeMessageId) void cancelChatTurn(API_BASE, instanceId, chatId, activeMessageId);
       detachActiveDrain();
+      const lease = replaceTurn();
+      const ac = new AbortController();
+      abortRef.current = ac;
       streamingMessageIdRef.current = null;
       invalidateTranscriptRequests();
       resetChunkCache();
       setEditingId(null);
-      setStreaming(true);
       liveLastSeqRef.current = -1;
       turnUserIdRef.current = null;
 
       await flushPickerChanges();
+      if (ac.signal.aborted || !turnLifecycle.owns(lease)) {
+        if (abortRef.current === ac) abortRef.current = null;
+        navigatingBranchRef.current = false;
+        setNavigatingBranch(false);
+        releaseTurn(lease);
+        return;
+      }
 
       const replacementId = crypto.randomUUID();
       const prefix = sourceChunks.slice(0, chunkIndex);
@@ -2235,8 +2400,6 @@ function Chat({
 
       let replacementStarted = false;
       try {
-        const ac = new AbortController();
-        abortRef.current = ac;
         const replacement = drainTurn(ac, prefix, (onEvent) =>
           runChatTurn({
             apiBase: API_BASE,
@@ -2261,14 +2424,15 @@ function Chat({
             pendingAssistantVersionRef.current = null;
           }
           if (abortRef.current === ac) abortRef.current = null;
-          if (!detachedControllersRef.current.has(ac)) setStreaming(false);
+          if (!detachedControllersRef.current.has(ac)) releaseTurn(lease);
         }
       } finally {
         if (!replacementStarted) {
+          if (abortRef.current === ac) abortRef.current = null;
           pendingAssistantVersionRef.current = null;
           navigatingBranchRef.current = false;
           setNavigatingBranch(false);
-          setStreaming(false);
+          releaseTurn(lease);
         }
       }
     },
@@ -2280,8 +2444,11 @@ function Chat({
       instanceId,
       invalidateTranscriptRequests,
       pinNextCommitToBottom,
+      releaseTurn,
+      replaceTurn,
       resetChunkCache,
       setActiveLeaf,
+      turnLifecycle,
     ],
   );
 
@@ -2301,14 +2468,16 @@ function Chat({
       navigatingBranchRef.current = true;
       setNavigatingBranch(true);
       const activeMessageId = streamingMessageIdRef.current;
-      if (activeMessageId) cancelChatTurn(API_BASE, instanceId, chatId, activeMessageId);
+      if (activeMessageId) void cancelChatTurn(API_BASE, instanceId, chatId, activeMessageId);
       detachActiveDrain();
+      const lease = replaceTurn();
+      const ac = new AbortController();
+      abortRef.current = ac;
       streamingMessageIdRef.current = null;
       invalidateTranscriptRequests();
       resetChunkCache();
 
       setEditingId(null);
-      setStreaming(true);
       liveLastSeqRef.current = -1;
 
       // The optimistic sibling: same parent as the edited message, so the
@@ -2370,9 +2539,8 @@ function Chat({
       try {
         // Same deferred picker flush as a normal send.
         await flushPickerChanges();
+        if (ac.signal.aborted || !turnLifecycle.owns(lease)) return;
 
-        const ac = new AbortController();
-        abortRef.current = ac;
         const replacement = drainTurn(ac, null, (onEvent) =>
           runChatTurn({
             apiBase: API_BASE,
@@ -2393,13 +2561,14 @@ function Chat({
           await replacement;
         } finally {
           if (abortRef.current === ac) abortRef.current = null;
-          if (!detachedControllersRef.current.has(ac)) setStreaming(false);
+          if (!detachedControllersRef.current.has(ac)) releaseTurn(lease);
         }
       } finally {
         if (!replacementStarted) {
+          if (abortRef.current === ac) abortRef.current = null;
           navigatingBranchRef.current = false;
           setNavigatingBranch(false);
-          setStreaming(false);
+          releaseTurn(lease);
         }
       }
     },
@@ -2407,12 +2576,15 @@ function Chat({
       instanceId,
       chatId,
       pinNextCommitToBottom,
+      releaseTurn,
+      replaceTurn,
       setActiveLeaf,
       flushPickerChanges,
       detachActiveDrain,
       invalidateTranscriptRequests,
       resetChunkCache,
       drainTurn,
+      turnLifecycle,
     ],
   );
 
@@ -2444,8 +2616,12 @@ function Chat({
       navigatingBranchRef.current = true;
       setNavigatingBranch(true);
       const activeMessageId = streamingMessageIdRef.current;
-      if (activeMessageId) cancelChatTurn(API_BASE, instanceId, chatId, activeMessageId);
+      if (activeMessageId) void cancelChatTurn(API_BASE, instanceId, chatId, activeMessageId);
       detachActiveDrain();
+      // Own the chat during the server-side branch transition so stale turn
+      // discovery cannot attach. When the chat was idle, keep the composer idle
+      // too: navigation is not provider work.
+      const transitionLease = replaceTurn(false);
       setLiveRow(null);
       liveRenderKeyRef.current = null;
       liveChunksRef.current = [];
@@ -2508,7 +2684,7 @@ function Chat({
           transcriptRequests.release(controller);
           navigatingBranchRef.current = false;
           setNavigatingBranch(false);
-          setStreaming(false);
+          releaseTurn(transitionLease);
         }
       })();
     },
@@ -2518,6 +2694,8 @@ function Chat({
       instanceId,
       invalidateTranscriptRequests,
       pinNextCommitToBottom,
+      releaseTurn,
+      replaceTurn,
       resetChunkCache,
       setActiveLeaf,
       transcriptRequests,
@@ -2535,11 +2713,26 @@ function Chat({
       messageId: string,
       afterSeq: number,
       seedChunks: StreamChunk[],
-      retainedRenderKey?: string,
-    ) => {
-      setStreaming(true);
+      options: ResumeAttachmentOptions = {},
+    ): boolean => {
+      // This function is the lock boundary for every attach source. Hydration,
+      // queue reconciliation, and the chat-row poll may all discover the same
+      // turn before React publishes a state update. Only one gets a lease.
+      if (abortRef.current || disconnectedTurnsRef.current.has(messageId)) return false;
+      const lease =
+        options.lease !== undefined && turnLifecycle.owns(options.lease)
+          ? options.lease
+          : claimTurn();
+      if (lease === null) return false;
+      // Record server timing only after this attach owns the turn. A competing
+      // discovery path that loses the lease must not leave timing behind for a
+      // later, unrelated turn to consume.
+      if ("startedAt" in options) resumedTurnRef.current = { startedAt: options.startedAt ?? null };
+      if ("assistantVersion" in options) {
+        pendingAssistantVersionRef.current = options.assistantVersion ?? null;
+      }
       liveLastSeqRef.current = afterSeq;
-      const renderKey = retainedRenderKey ?? messageId;
+      const renderKey = options.renderKey ?? messageId;
       liveRenderKeyRef.current = renderKey;
       setLiveRow({
         renderKey,
@@ -2556,36 +2749,47 @@ function Chat({
       turnUserIdRef.current = null;
       void (async () => {
         try {
-          await drainTurn(ac, seedChunks, (onEvent) => {
-            // The resume runner immediately fires a synthetic message_id
-            // event so drainTurn's serverMessageId tracking lights up
-            // before any server event arrives.
-            onEvent({ kind: "message_id", messageId });
-            return resumeChatTurn({
-              apiBase: API_BASE,
-              instanceId,
-              chatId,
-              messageId,
-              afterSeq,
-              includeDebug: showDebugRef.current,
-              onEvent,
-              signal: ac.signal,
-            });
-          });
+          await drainTurn(
+            ac,
+            seedChunks,
+            (onEvent) => {
+              // The resume runner immediately fires a synthetic message_id
+              // event so drainTurn's serverMessageId tracking lights up
+              // before any server event arrives.
+              onEvent({ kind: "message_id", messageId });
+              return resumeChatTurn({
+                apiBase: API_BASE,
+                instanceId,
+                chatId,
+                messageId,
+                afterSeq,
+                includeDebug: showDebugRef.current,
+                onEvent,
+                signal: ac.signal,
+              });
+            },
+            options.readerHandoffs ?? 0,
+          );
         } finally {
           if (abortRef.current === ac) abortRef.current = null;
-          if (!detachedControllersRef.current.has(ac)) setStreaming(false);
+          if (!detachedControllersRef.current.has(ac)) releaseTurn(lease);
         }
       })();
+      return true;
     },
-    [chatId, instanceId, drainTurn],
+    [chatId, instanceId, claimTurn, drainTurn, releaseTurn, turnLifecycle],
   );
 
-  // Queue promotion is server-driven so it survives a browser disconnect.
-  // While this tab has queued work, reconcile the durable outbox and attach to
-  // any newly-started turn.
+  // Queue promotion is server-driven so it survives a browser disconnect. This
+  // reconciles the durable outbox against the server's and attaches to any turn
+  // this view is not already reading, and runs while there is either: queued work
+  // of this tab's own, or a turn the chat row says is running that nothing here
+  // is following. The second is what keeps a promoted turn from streaming into
+  // nothing: the queue entry that stood for it is gone the moment it becomes a
+  // real message, and it is gone early whenever the promotion is what the client
+  // asked for.
   useEffect(() => {
-    if (pending || queuedMessages.length === 0) return;
+    if (pending || (queuedMessages.length === 0 && unattachedTurnId === null)) return;
     let cancelled = false;
     let syncing = false;
     const sync = async () => {
@@ -2605,11 +2809,11 @@ function Chat({
         // event has committed. Otherwise a very fast automatic promotion can
         // remove the final queued row and stop this reconciliation loop before
         // it gets a chance to attach to the new turn.
-        if (streamingRef.current && (nextTurnStarted || missing.length > 0)) return;
+        if (turnLifecycle.active && (nextTurnStarted || missing.length > 0)) return;
         setQueuedMessages((local) =>
           reconcileQueuedMessageSnapshot(local, page.queuedMessages, protectedQueuedIdsRef.current),
         );
-        if (streamingRef.current) return;
+        if (turnLifecycle.active) return;
 
         if (missing.length > 0) {
           setSessionRows((rows) => [
@@ -2622,11 +2826,10 @@ function Chat({
           ]);
           setActiveLeaf(missing.at(-1)?.id ?? activeLeafRef.current);
         }
-        if (!page.inFlight) return;
-        streamingRef.current = true;
-        // The promoted turn started on the server, so its clock does too.
-        resumedTurnRef.current = { startedAt: page.inFlight.startedAt?.getTime() ?? null };
-        attachResume(page.inFlight.messageId, page.inFlight.lastSeq, page.inFlight.chunks);
+        if (!page.inFlight || !visible) return;
+        attachResume(page.inFlight.messageId, page.inFlight.lastSeq, page.inFlight.chunks, {
+          startedAt: page.inFlight.startedAt?.getTime() ?? null,
+        });
       } catch (error) {
         if (!cancelled) console.warn(`[chat] queue reconciliation failed (chat=${chatId}):`, error);
       } finally {
@@ -2639,19 +2842,33 @@ function Chat({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [attachResume, chatId, instanceId, pending, queuedMessages.length, setActiveLeaf]);
+  }, [
+    attachResume,
+    chatId,
+    instanceId,
+    pending,
+    queuedMessages.length,
+    unattachedTurnId,
+    setActiveLeaf,
+    turnLifecycle,
+    visible,
+  ]);
 
   useEffect(() => {
-    if (!streamingRef.current) return;
     if (!visible) {
+      if (!turnLifecycle.active) return;
       const messageId = streamingMessageIdRef.current;
       const ac = abortRef.current;
-      if (!messageId || !ac) return;
+      const lease = turnLifecycle.current;
+      if (!messageId || !ac || lease === null) return;
       detachedControllersRef.current.add(ac);
       detachedTurnRef.current = {
         messageId,
         lastSeq: liveLastSeqRef.current,
         renderKey: liveRenderKeyRef.current ?? messageId,
+        readerHandoffs: activeReaderHandoffsRef.current,
+        assistantVersion: pendingAssistantVersionRef.current,
+        lease,
       };
       ac.abort();
       return;
@@ -2668,19 +2885,19 @@ function Chat({
         return;
       }
       detachedTurnRef.current = null;
-      attachResume(
-        detached.messageId,
-        detached.lastSeq,
-        [...liveChunksRef.current],
-        detached.renderKey,
-      );
+      attachResume(detached.messageId, detached.lastSeq, [...liveChunksRef.current], {
+        renderKey: detached.renderKey,
+        lease: detached.lease,
+        readerHandoffs: detached.readerHandoffs,
+        assistantVersion: detached.assistantVersion,
+      });
     };
     resumeWhenReleased();
     return () => {
       cancelled = true;
       if (retryFrame !== null) cancelAnimationFrame(retryFrame);
     };
-  }, [attachResume, chatId, instanceId, liveRow?.messageId, streaming, visible]);
+  }, [attachResume, chatId, instanceId, liveRow?.messageId, streaming, turnLifecycle, visible]);
 
   // Fire the initial-message send exactly once per (chatId, initialMessage).
   // The new-chat flow passes a message typed in the empty-state pane.
@@ -2705,7 +2922,7 @@ function Chat({
     if (!creationError) return;
     if (creationErrorFiredRef.current === creationError) return;
     creationErrorFiredRef.current = creationError;
-    setStreaming(false);
+    resetTurn();
     const errMsg: TranscriptMessage = {
       id: `creation-error-${crypto.randomUUID()}`,
       chatId,
@@ -2717,7 +2934,7 @@ function Chat({
     };
     setSessionRows((rows) => [...rows, { renderKey: errMsg.id, message: errMsg }]);
     setActiveLeaf(errMsg.id);
-  }, [creationError, chatId, setActiveLeaf]);
+  }, [creationError, chatId, resetTurn, setActiveLeaf]);
 
   // The picker offers models from both providers. Selecting a cross-provider
   // model records a pending switch that the next send activates with a
@@ -2839,17 +3056,23 @@ function Chat({
             onSubmit={() => void sendMessage()}
             onStop={() => {
               const mid = streamingMessageIdRef.current;
-              const interruptionId = mid ?? `local-stop-${crypto.randomUUID()}`;
-              applyEvent(liveChunksRef.current, liveToolIndexRef.current, "turn_interrupted", {
-                id: interruptionId,
+              const reader = abortRef.current;
+              if (!mid) {
+                reader?.abort();
+                return;
+              }
+              void cancelChatTurn(API_BASE, instanceId, chatId, mid).then((confirmed) => {
+                // A failed DELETE is not an interruption. Keep following the
+                // provider without painting a marker the server did not honor,
+                // and let the user retry Stop. Once confirmed, the reducer
+                // deduplicates this marker with the server's matching event.
+                if (!confirmed || !reader || abortRef.current !== reader) return;
+                applyEvent(liveChunksRef.current, liveToolIndexRef.current, "turn_interrupted", {
+                  id: mid,
+                });
+                setLiveRow((row) => (row ? { ...row, chunks: [...liveChunksRef.current] } : row));
+                reader.abort();
               });
-              setLiveRow((row) => (row ? { ...row, chunks: [...liveChunksRef.current] } : row));
-              // Tell the server to abort the producer (the local
-              // abort below just tears down our reader. Without the
-              // DELETE the server's CLI subprocess would happily run
-              // to completion).
-              if (mid) cancelChatTurn(API_BASE, instanceId, chatId, mid);
-              abortRef.current?.abort();
             }}
             loading={streaming}
             autoFocus

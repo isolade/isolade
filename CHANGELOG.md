@@ -15,6 +15,9 @@ _Changes landed on `main` that haven't shipped in a release yet._
 - Back-to-back profile builds no longer occasionally fail because the previous
   builder still holds the shared cache disk, including after a nested Isolade
   instance restarts during a build.
+- Chats now recover more reliably when a running reply's connection drops,
+  including replies started from queued messages. A failed Stop request no
+  longer hides a turn that is still running.
 
 ## [0.5.0] - 2026-08-02
 

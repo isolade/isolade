@@ -101,6 +101,30 @@ export class ChatQueueService {
     };
   }
 
+  // What became of a queued message that no longer has a queued row: promotion
+  // deletes it as it inserts the user message it became (see beginTurn). Such a
+  // message was delivered, not lost, so report that rather than "not found".
+  // Reporting it as missing made a client that asked to send it now conclude its
+  // message had gone nowhere, and drop the queue entry that was the only thing
+  // keeping it looking for the turn the message had already become.
+  private promotedMessage(chatId: string, messageId: string): QueuedMessage | undefined {
+    const message = this.deps.chatManager.getMessage(messageId);
+    if (!message || message.chatId !== chatId || message.role !== "user") return undefined;
+    return {
+      id: message.id,
+      chatId,
+      content: message.content,
+      mode: "later",
+      status: "delivered",
+      targetMessageId: null,
+      editSessionId: null,
+      editAnchorId: null,
+      error: null,
+      createdAt: message.createdAt,
+      updatedAt: message.createdAt,
+    };
+  }
+
   async activate(
     instanceId: string,
     chatId: string,
@@ -108,7 +132,7 @@ export class ChatQueueService {
     mode: "next" | "now",
   ): Promise<QueuedMessage | undefined> {
     const queued = this.deps.chatManager.getQueuedMessage(messageId);
-    if (!queued || queued.chatId !== chatId) return undefined;
+    if (!queued || queued.chatId !== chatId) return this.promotedMessage(chatId, messageId);
     if (queued.status !== "queued" && queued.status !== "unknown" && queued.status !== "rejected") {
       return queued;
     }
@@ -129,7 +153,9 @@ export class ChatQueueService {
         error: null,
       });
       await this.dispatchNext(chatId);
-      return this.deps.chatManager.getQueuedMessage(messageId);
+      return (
+        this.deps.chatManager.getQueuedMessage(messageId) ?? this.promotedMessage(chatId, messageId)
+      );
     }
 
     // Codex has no atomic "now" operation. Persist the intent, interrupt only

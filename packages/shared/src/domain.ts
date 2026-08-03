@@ -288,6 +288,13 @@ export const chatSchema = z.object({
   // chats that have not finished a turn since the server began recording it.
   // Optional so producers that predate it (mocks) still parse.
   lastTurnMs: z.number().int().nonnegative().nullable().optional(),
+  // The assistant message id of the turn running in this chat, or null between
+  // turns. A turn is not always started by the tab that shows the chat: the
+  // server promotes a queued message into one when the previous turn ends, and a
+  // turn outlives the connection that asked for it. This is how a chat view
+  // notices a turn it is not following and attaches to its stream. Optional so
+  // producers that predate it (mocks) still parse.
+  inFlightMessageId: z.string().nullable().optional(),
   createdAt: dateLikeSchema,
 });
 export const chatArraySchema = z.array(chatSchema);
