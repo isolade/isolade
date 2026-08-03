@@ -27,12 +27,6 @@ import {
 
 const CLAUDE_EFFORTS = new Set<ChatEffort>(["low", "medium", "high", "xhigh", "max"]);
 
-// Identity of a launched process's prompt, for deciding whether a live process
-// can be reused. Both halves matter: the text and the flag it was passed under.
-function promptKey(prompt: IsoladeSystemPrompt | undefined): string | null {
-  return prompt ? `${prompt.mode}:${prompt.text}` : null;
-}
-
 // Bound on a single warm-session title turn. The cold one-shot path had a 20s
 // exec timeout. The persistent session has no built-in timeout, so we cap the
 // turn with an abort signal and fall back to the one-shot if it's exceeded.
@@ -262,9 +256,6 @@ export class ClaudeBackend implements ChatBackend {
       command: buildTitleSessionCommand(TITLE_MODEL),
       model: TITLE_MODEL,
       effort: undefined,
-      // Titling passes its own --system-prompt (the summarizer instruction), so
-      // it never participates in the chat prompt's launch-time comparison.
-      systemPrompt: null,
       // Titling is a cheap one-shot on a small model and never fast: it would
       // pay a premium rate for a sentence nobody is waiting on.
       fast: false,
@@ -303,20 +294,20 @@ export class ClaudeBackend implements ChatBackend {
     const fork = opts.sessionId ? opts.fork : undefined;
 
     let session = this.sessions.get(opts.chatId);
-    // The system prompt is a launch-time flag, so a live process cannot be
-    // re-prompted the way model/effort can be re-configured. It carries the
-    // model id (identity line and attribution trailer), so a mid-chat model
-    // switch changes it and reconfigure alone would leave the process claiming
-    // the old model and committing a wrong trailer. Retire it instead: the next
-    // turn relaunches with --resume, so only process warmth is lost.
-    // Compare text AND mode: switching a profile from "keep the CLI's prompt" to
-    // "no prompt" changes which flag the process launched with, not just its text.
-    const promptChanged =
-      session !== undefined && promptKey(opts.systemPrompt) !== session.systemPrompt;
-    if (
-      session &&
-      (fork !== undefined || promptChanged || session.isDead() || session.vmId !== opts.vmId)
-    ) {
+    // The system prompt is a launch-time flag, and the CLI has no control request
+    // to change it, so a live process keeps the prompt it started with. We
+    // deliberately do NOT retire the process to refresh it: this process is kept
+    // alive precisely so the agent's background commands, and its handle on their
+    // output, survive between turns. Killing it to correct a line of prose would
+    // trade running work for tidiness.
+    //
+    // The staleness that would matter is the model id, and the CLI already
+    // handles that itself: `set_model` makes it inject
+    // `<local-command-stdout>Set model to <exact-id></local-command-stdout>` into
+    // the conversation, verified on the wire. So a switched-to model is stated
+    // more recently, and more specifically, than the launch-time prompt. Prompt
+    // and prelude edits apply when the process is next relaunched.
+    if (session && (fork !== undefined || session.isDead() || session.vmId !== opts.vmId)) {
       // A dead or wrong-VM session can't be reused. A fork turn also always
       // retires the live process: there is no control request to rewind a
       // live conversation, so it's positioned at the old branch's tail, and
@@ -581,7 +572,6 @@ export class ClaudeBackend implements ChatBackend {
       command: this.buildCommand(model, effort, sessionId, fork, systemPrompt),
       model,
       effort,
-      systemPrompt: promptKey(systemPrompt),
       // A fresh CLI always starts standard: fast mode has no command-line flag,
       // so a chat that wants it gets switched over by the reconfigure below.
       fast: false,

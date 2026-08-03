@@ -256,7 +256,7 @@ describe("CodexBackend notification parsing", () => {
 
     expect(mgr.conn.sent).toContainEqual({
       method: "thread/start",
-      params: { ephemeral: false, personality: "none" },
+      params: { ephemeral: false },
     });
     expect(updated).toEqual([{ chatId: "chat", codexThreadId: "thread-new" }]);
     expect(result.sessionId).toBe("thread-new");
@@ -285,7 +285,7 @@ describe("CodexBackend notification parsing", () => {
     // which is only safe because the text carries CODEX_PATCH_RULES.
     expect(mgr.conn.sent).toContainEqual({
       method: "thread/start",
-      params: { ephemeral: false, personality: "none", baseInstructions: "ISOLADE PROMPT" },
+      params: { ephemeral: false, baseInstructions: "ISOLADE PROMPT", personality: "none" },
     });
   });
 
@@ -309,16 +309,20 @@ describe("CodexBackend notification parsing", () => {
     });
 
     // developerInstructions leaves codex's base prompt — and so its own patch
-    // guidance — in place, so ours would be redundant here.
+    // guidance — in place, so ours would be redundant here. `personality` is
+    // deliberately absent: it strips ~2KB from that prompt, which would contradict
+    // this option's promise to leave the shipped prompt untouched.
     expect(mgr.conn.sent).toContainEqual({
       method: "thread/start",
-      params: { ephemeral: false, personality: "none", developerInstructions: "MY PRELUDE" },
+      params: { ephemeral: false, developerInstructions: "MY PRELUDE" },
     });
   });
 
-  it("does not re-send the prompt when resuming an existing thread", async () => {
-    // thread/resume accepts no instruction fields; codex keeps the ones set at
-    // start. Sending them here would just be rejected params.
+  it("re-sends the prompt when resuming an existing thread", async () => {
+    // How an existing thread picks up an edited prompt at all. Verified against
+    // the installed codex: resuming with a different baseInstructions changes the
+    // request's `instructions`. Bounded by the per-connection liveness cache, so
+    // it lands on reconnect rather than on the next turn.
     const mgr = new FakeCodexManager();
     mgr.conn.script = [["turn/completed", { turn: { status: "completed" } }]];
     const backend = new CodexBackend(
@@ -340,7 +344,7 @@ describe("CodexBackend notification parsing", () => {
 
     expect(mgr.conn.sent).toContainEqual({
       method: "thread/resume",
-      params: { threadId: "thread-1" },
+      params: { threadId: "thread-1", baseInstructions: "ISOLADE PROMPT", personality: "none" },
     });
     expect(mgr.conn.sent.some((s) => s.method === "thread/start")).toBe(false);
   });
@@ -419,7 +423,7 @@ describe("CodexBackend notification parsing", () => {
     });
     expect(mgr.conn.sent).toContainEqual({
       method: "thread/start",
-      params: { ephemeral: false, personality: "none" },
+      params: { ephemeral: false },
     });
     expect(updated).toEqual([{ codexThreadId: "thread-new" }]);
     expect(result.sessionId).toBe("thread-new");

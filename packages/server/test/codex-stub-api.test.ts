@@ -30,6 +30,16 @@ let workdir = "";
 // the JSON-RPC reply would race and waiting on a sleep would be flaky.
 let onCapture: ((request: Captured) => void) | null = null;
 
+/** A promise for the next request codex makes, armed before the turn is sent. */
+function nextRequest(): Promise<Captured> {
+  return new Promise<Captured>((resolve) => {
+    onCapture = (request) => {
+      onCapture = null;
+      resolve(request);
+    };
+  });
+}
+
 beforeAll(() => {
   if (!hasCodex) return;
   // 400 on every call: we only want the request body, and failing fast means the
@@ -58,22 +68,16 @@ afterAll(() => {
 });
 
 /**
- * Run one turn through `codex app-server` and return the request it made.
- *
- * `threadStart` is merged into the thread/start params, which is the only place
- * codex accepts either instruction field (thread/resume and turn/start accept
- * neither), so it is also the only thing this can vary.
+ * One `codex app-server`, launched with the same posture CodexManager uses so the
+ * tool set under test matches production, and driven over the JSON-RPC calls it
+ * makes. Closed when `fn` returns.
  */
-async function captureTurn(threadStart: Record<string, unknown>): Promise<Captured> {
-  let settle: (request: Captured) => void = () => {};
-  const firstRequest = new Promise<Captured>((resolve) => {
-    settle = resolve;
-  });
-  onCapture = (request) => {
-    onCapture = null; // first request only; retries would overwrite it
-    settle(request);
-  };
-
+async function withServer<T>(
+  fn: (io: {
+    send: (id: number, method: string, params: unknown) => void;
+    awaitId: (id: number) => Promise<Record<string, unknown> | null>;
+  }) => Promise<T>,
+): Promise<T> {
   const proc = Bun.spawn(
     [
       "codex",
@@ -82,8 +86,6 @@ async function captureTurn(threadStart: Record<string, unknown>): Promise<Captur
       "stdio://",
       "--disable",
       "apps",
-      // The same posture CodexManager launches with, so the tool set under test
-      // matches the tool set in production.
       "-c",
       "features.memories=false",
       "-c",
@@ -115,6 +117,7 @@ async function captureTurn(threadStart: Record<string, unknown>): Promise<Captur
   const reader = proc.stdout.getReader();
   const decoder = new TextDecoder();
   let buffered = "";
+
   const send = (id: number, method: string, params: unknown) =>
     proc.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
 
@@ -146,28 +149,72 @@ async function captureTurn(threadStart: Record<string, unknown>): Promise<Captur
       capabilities: { experimentalApi: true },
     });
     expect(await awaitId(1)).not.toBeNull();
-
-    send(2, "thread/start", { ephemeral: false, personality: "none", ...threadStart });
-    const started = await awaitId(2);
-    const threadId = (started?.result as { thread?: { id?: string } } | undefined)?.thread?.id;
-    expect(threadId).toBeTruthy();
-
-    send(3, "turn/start", {
-      threadId,
-      model: "gpt-5-codex",
-      input: [{ type: "text", text: "hi" }],
-    });
-    return await Promise.race([
-      firstRequest,
-      Bun.sleep(30_000).then(() => {
-        throw new Error("codex made no request to the stub within 30s");
-      }),
-    ]);
+    return await fn({ send, awaitId });
   } finally {
-    onCapture = null;
     proc.kill();
     await proc.exited;
   }
+}
+
+const TURN = { model: "gpt-5-codex", input: [{ type: "text", text: "hi" }] };
+
+/** Fail loudly rather than hanging if codex never calls out. */
+function withTimeout(request: Promise<Captured>): Promise<Captured> {
+  return Promise.race([
+    request,
+    Bun.sleep(30_000).then<Captured>(() => {
+      throw new Error("codex made no request to the stub within 30s");
+    }),
+  ]);
+}
+
+/**
+ * Start a thread with `threadStart` and return the request its first turn makes.
+ */
+async function captureTurn(threadStart: Record<string, unknown>): Promise<Captured> {
+  return withServer(async ({ send, awaitId }) => {
+    const request = nextRequest();
+    send(2, "thread/start", { ephemeral: false, ...threadStart });
+    const started = await awaitId(2);
+    const threadId = (started?.result as { thread?: { id?: string } } | undefined)?.thread?.id;
+    expect(threadId).toBeTruthy();
+    send(3, "turn/start", { threadId, ...TURN });
+    return await withTimeout(request);
+  });
+}
+
+/**
+ * Start a thread in one app-server, then resume it in a FRESH one with different
+ * params, and return the request the resumed turn makes.
+ *
+ * The two processes are the point. Resuming a thread that is already live in the
+ * same app-server silently ignores an instruction override — codex has a
+ * "provided and ignored while running" warning for that case — so only a
+ * reconnect, which is what CodexBackend.ensureThreadLive resumes for, applies it.
+ */
+async function captureResumedTurn(
+  threadStart: Record<string, unknown>,
+  resumeWith: Record<string, unknown>,
+): Promise<Captured> {
+  const threadId = await withServer(async ({ send, awaitId }) => {
+    const seeded = nextRequest();
+    send(2, "thread/start", { ephemeral: false, ...threadStart });
+    const started = await awaitId(2);
+    const id = (started?.result as { thread?: { id?: string } } | undefined)?.thread?.id;
+    expect(id).toBeTruthy();
+    // A turn is what persists a rollout for the next process to resume.
+    send(3, "turn/start", { threadId: id, ...TURN });
+    await withTimeout(seeded);
+    return id as string;
+  });
+
+  return withServer(async ({ send, awaitId }) => {
+    const request = nextRequest();
+    send(2, "thread/resume", { threadId, ...resumeWith });
+    expect(await awaitId(2)).not.toBeNull();
+    send(3, "turn/start", { threadId, ...TURN });
+    return await withTimeout(request);
+  });
 }
 
 const textOf = (item: unknown): string => {
@@ -215,6 +262,25 @@ describe.skipIf(!hasCodex)("codex against a stub API", () => {
     expect(parts).toContain(SENTINEL);
     // Codex's own sections are siblings, not neighbours in one blob.
     expect(parts.filter((text) => text.startsWith("<permissions instructions>")).length).toBe(1);
+  }, 60_000);
+
+  it("applies an instruction override on resume, not only at start", async () => {
+    // The fact CodexBackend.ensureThreadLive depends on. A checked-out codex tree
+    // says resume takes no instruction fields; the installed build applies them,
+    // and a comment here once claimed the opposite for exactly that reason.
+    const request = await captureResumedTurn(
+      { baseInstructions: "STARTED_WITH_THIS" },
+      { baseInstructions: "RESUMED_WITH_THIS" },
+    );
+
+    expect(request.instructions).toBe("RESUMED_WITH_THIS");
+  }, 60_000);
+
+  it("strips its personality section when told none, which is why we gate it", async () => {
+    // Sent only alongside a replacing prompt. On "Agent default" it would quietly
+    // remove ~2KB from the very prompt that option promises to leave untouched.
+    const withPersonality = await captureTurn({ developerInstructions: SENTINEL });
+    expect(withPersonality.instructions).toContain("# Personality");
   }, 60_000);
 
   it("sends its tool specs either way, so replacing the prompt costs guidance only", async () => {

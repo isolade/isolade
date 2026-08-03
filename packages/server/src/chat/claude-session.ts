@@ -73,11 +73,6 @@ export interface ClaudeSessionOpts {
   // starts standard (the CLI has no flag for it), so a chat that wants fast is
   // switched over by the first reconfigure.
   fast: boolean;
-  // The `--system-prompt` value this process was launched with, or null when it
-  // runs the harness default. Unlike model/effort there is no control request to
-  // change it on a live process, so the backend compares it against the prompt
-  // the next turn wants and retires the process when they differ.
-  systemPrompt: string | null;
   // Called exactly once when the process ends (clean exit, crash, or
   // force-kill) so the backend can drop this session from its map.
   onExit: () => void;
@@ -101,7 +96,6 @@ export class ClaudeSession {
   model: string;
   effort: string | undefined;
   fast: boolean;
-  readonly systemPrompt: string | null;
 
   private readonly opts: ClaudeSessionOpts;
   private readonly interruptGraceMs: number;
@@ -146,7 +140,6 @@ export class ClaudeSession {
     this.model = opts.model;
     this.effort = opts.effort;
     this.fast = opts.fast;
-    this.systemPrompt = opts.systemPrompt;
     this.interruptGraceMs = opts.interruptGraceMs ?? 5_000;
     this.shutdownGraceMs = opts.shutdownGraceMs ?? 5_000;
     this.controlTimeoutMs = opts.controlTimeoutMs ?? DEFAULT_CONTROL_TIMEOUT_MS;

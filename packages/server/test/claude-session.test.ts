@@ -35,7 +35,6 @@ function sessionFor(proc: FakeProc, onExit: () => void = () => {}) {
     model: "claude-sonnet-4-6",
     effort: "high",
     fast: false,
-    systemPrompt: null,
     onExit,
     // Large enough that the safety-net timers never fire mid-test.
     interruptGraceMs: 60_000,
