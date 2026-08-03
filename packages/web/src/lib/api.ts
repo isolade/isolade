@@ -44,7 +44,9 @@ import {
   type NetworkConfig,
   networkConfigSchema,
   type OkResponse,
+  type OnboardingDemo,
   okResponseSchema,
+  onboardingDemoSchema,
   type PortForward,
   type PortProbe,
   type ProfileConfigForm,
@@ -67,11 +69,13 @@ import {
   type QueuedMessage,
   queuedMessageSchema,
   type RemoveQueuedMessageResult,
+  type RepoPathCheck,
   type ResourceStats,
   type RuntimeConfig,
   removeQueuedMessageResultSchema,
   renameFileBodySchema,
   renameProfileBodySchema,
+  repoPathCheckSchema,
   resourceStatsSchema,
   runtimeConfigSchema,
   type SecretDeclaration,
@@ -1135,4 +1139,23 @@ export async function getChatContextBreakdown(
     await apiFetch(`${API_BASE}/api/instances/${instanceId}/chats/${chatId}/context`),
     contextBreakdownSchema,
   );
+}
+
+// ---- Onboarding wizard ----
+// Two reads. Everything the wizard writes goes through the profile functions
+// above, so what it produces is an ordinary profile.
+
+export async function checkRepoPath(path: string): Promise<RepoPathCheck> {
+  return parseResponse(
+    await apiFetch(`${API_BASE}/api/onboarding/check-path`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    }),
+    repoPathCheckSchema,
+  );
+}
+
+export async function getOnboardingDemo(): Promise<OnboardingDemo> {
+  return parseResponse(await apiFetch(`${API_BASE}/api/onboarding/demo`), onboardingDemoSchema);
 }

@@ -68,7 +68,14 @@ export function createTestServer(dbPathOrOpts?: string | CreateAppOptions) {
           seedMountDir: join(xdg.root, "seed"),
           ...dbPathOrOpts,
         };
-  const { app, instances, chatManager, chatStreamHub, db, websocket } = createApp(opts);
+  const { app, instances, profiles, chatManager, chatStreamHub, db, websocket } = createApp(opts);
+
+  // A `default` profile, because most route tests address one and seedInstance
+  // below scopes rows to it. Production seeds nothing: an install with no
+  // profiles is an ordinary state, and the guided setup creates the first one.
+  // The fixture stating its own requirement beats the server manufacturing a
+  // profile nobody asked for so that tests have something to talk to.
+  profiles.create("Default", "default");
 
   // Real loopback server so WebSocket upgrades work, and the fetch shim below
   // covers server-origin HTTP requests, but `new WebSocket(...)` bypasses it.

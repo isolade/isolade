@@ -53,6 +53,15 @@ import { stateDir } from "./xdg";
 
 export const SEED_MOUNT = "/run/isolade-seed";
 
+/** Off switch for the whole feature: `ISOLADE_SEED=0` in the server's
+ * environment. Both sides honour it — the host stages nothing for new dev VMs
+ * (as if the profile set no `seed_profiles`), the guest imports nothing from a
+ * bundle it was given. Read per call, not memoized at module load, so a test
+ * (or a relaunch with the var flipped) takes effect immediately. */
+export function seedingEnabled(): boolean {
+  return process.env.ISOLADE_SEED !== "0";
+}
+
 const MANIFEST_NAME = "manifest.json";
 const PROFILES_SUBDIR = "profiles";
 
@@ -138,6 +147,11 @@ export function sweepSeedStaging(liveInstanceIds: ReadonlySet<string>): void {
 export function importSeedProfiles(db: Db, mountDir: string = SEED_MOUNT): void {
   const manifestPath = join(mountDir, MANIFEST_NAME);
   if (!existsSync(manifestPath)) return;
+  // Checked after the mount probe so ordinary (non-nested) boots stay silent.
+  if (!seedingEnabled()) {
+    console.log(`[seed] ISOLADE_SEED=0; not importing the bundle at ${mountDir}`);
+    return;
+  }
 
   let manifest: z.infer<typeof seedManifestSchema>;
   try {

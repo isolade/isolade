@@ -627,3 +627,32 @@ export const updateStatusSchema = z.object({
   checkedAt: z.number().nullable(),
 });
 export type UpdateStatus = z.infer<typeof updateStatusSchema>;
+
+// ---- Onboarding wizard ----
+// The first-run flow. Both shapes are advisory: the wizard shows
+// what it would write, and everything it does write goes through the ordinary
+// profile routes.
+
+/** POST /api/onboarding/check-path: does a local source exist, so a typo is
+ *  caught while the user is still looking at it. A remote source is reported as
+ *  `remote` and left to the build, which is the thing holding credentials. */
+export const repoPathBodySchema = z.object({ path: z.string() });
+export const repoPathCheckSchema = z.object({
+  ok: z.boolean(),
+  remote: z.boolean(),
+  problem: z.string().nullable(),
+});
+export type RepoPathCheck = z.infer<typeof repoPathCheckSchema>;
+
+/** GET /api/onboarding/demo: the shipped demo profile, served rather than
+ *  duplicated client-side so the two cannot drift. */
+export const onboardingDemoSchema = z.object({
+  name: z.string(),
+  form: profileConfigFormSchema,
+  dockerfile: z.string(),
+  /** The demo's network posture, which exists for one line of it: the dev
+   *  server's port, forwarded from the moment an instance is created so the
+   *  preview works the instant something answers on it. */
+  network: networkConfigSchema,
+});
+export type OnboardingDemo = z.infer<typeof onboardingDemoSchema>;

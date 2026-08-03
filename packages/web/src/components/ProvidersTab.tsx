@@ -25,7 +25,22 @@ function expiryLabel(s: ProviderAuthStatus): string {
   return `Signed in · token valid ${Math.round(hours / 24)}d`;
 }
 
-export default function ProvidersTab({ activeProfileId }: { activeProfileId: string | null }) {
+/**
+ * The provider cards, with the whole in-app login flow behind them: start a
+ * login, open the authorize URL in the system browser, poll until the loopback
+ * callback completes it. Shared by the Providers section and by the onboarding
+ * wizard's last step, so the wizard frames the real sign-in rather than a
+ * second implementation of it.
+ *
+ * `onSignedIn` fires after a login completes, for callers that advance on it.
+ */
+export function ProviderSignIn({
+  activeProfileId,
+  onSignedIn,
+}: {
+  activeProfileId: string | null;
+  onSignedIn?: (status: AuthStatus) => void;
+}) {
   const [status, setStatus] = useState<AuthStatus | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   // At most one login is in flight at a time.
@@ -37,12 +52,14 @@ export default function ProvidersTab({ activeProfileId }: { activeProfileId: str
   const refresh = useCallback(async () => {
     if (!activeProfileId) return;
     try {
-      setStatus(await getAuthStatus(activeProfileId));
+      const next = await getAuthStatus(activeProfileId);
+      setStatus(next);
       setLoadError(null);
+      if (next.claude.loggedIn || next.codex.loggedIn) onSignedIn?.(next);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : String(err));
     }
-  }, [activeProfileId]);
+  }, [activeProfileId, onSignedIn]);
 
   useEffect(() => {
     void refresh();
@@ -122,15 +139,7 @@ export default function ProvidersTab({ activeProfileId }: { activeProfileId: str
   );
 
   return (
-    <div className="flex-1 min-h-0 overflow-y-auto px-6 pt-4 pb-6 space-y-4">
-      <div className="max-w-2xl space-y-1">
-        <h2 className="text-sm font-medium">Providers</h2>
-        <p className="text-xs text-muted-foreground">
-          Sign in to Claude and Codex once here. Credentials are stored by isolade and injected into
-          every agent VM, with no need to install or log into the CLIs on this machine.
-        </p>
-      </div>
-
+    <div className="space-y-4">
       {loadError && (
         <p className="text-xs text-destructive max-w-2xl">Couldn’t load status: {loadError}</p>
       )}
@@ -210,6 +219,23 @@ export default function ProvidersTab({ activeProfileId }: { activeProfileId: str
             </div>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+export default function ProvidersTab({ activeProfileId }: { activeProfileId: string | null }) {
+  return (
+    <div className="flex-1 min-h-0 overflow-y-auto px-6 pt-4 pb-6 space-y-4">
+      <div className="max-w-2xl space-y-1">
+        <h2 className="text-sm font-medium">Providers</h2>
+        <p className="text-xs text-muted-foreground">
+          Sign in to Claude and Codex once here. Credentials are stored by isolade and injected into
+          every agent VM, with no need to install or log into the CLIs on this machine.
+        </p>
+      </div>
+      <div className="max-w-2xl">
+        <ProviderSignIn activeProfileId={activeProfileId} />
       </div>
     </div>
   );

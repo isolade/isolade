@@ -28,6 +28,7 @@ import {
   removeSeedStaging,
   SEED_MOUNT,
   type SeedProfileEntry,
+  seedingEnabled,
   seedStagingDir,
   stageSeed,
 } from "./seed";
@@ -276,7 +277,13 @@ export class InstanceManager {
     // validation is warn-and-skip: a seed problem should degrade the nested
     // experience, not block the dev VM.
     let seeded: SeedProfileEntry[] = [];
-    if (exposeSandbox) {
+    if (config.seedProfiles.length > 0 && !seedingEnabled()) {
+      // ISOLADE_SEED=0: create the dev VM exactly as if the profile listed no
+      // seed profiles — no bundle, no mount, no keep-set, nothing on the row.
+      console.warn(
+        `[instance-create ${id}] ISOLADE_SEED=0; ignoring profile ${profileId}'s seed_profiles.`,
+      );
+    } else if (exposeSandbox) {
       seeded = this.resolveSeedEntries(id, config.seedProfiles);
     } else if (config.seedProfiles.length > 0) {
       console.warn(
@@ -496,7 +503,11 @@ export class InstanceManager {
 
     let entries: SeedProfileEntry[] = [];
     try {
-      entries = this.resolveSeedEntries(instance.id, instance.seedProfiles);
+      // ISOLADE_SEED=0 flipped on after this instance was created: rebuild the
+      // bundle EMPTY rather than re-seeding. The persisted VM record still
+      // bind-mounts /run/isolade-seed either way, so the target has to exist,
+      // but an empty manifest imports nothing.
+      entries = seedingEnabled() ? this.resolveSeedEntries(instance.id, instance.seedProfiles) : [];
       stageSeed(instance.id, entries);
     } catch (err) {
       // Never let a re-stage failure brick resume: an empty bundle still
@@ -511,6 +522,7 @@ export class InstanceManager {
       } catch {}
       return;
     }
+    if (!seedingEnabled()) return; // empty bundle: no refs of ours to protect
     // Bundle exists again; re-protect its images so a GC between now and boot
     // can't collect them. Best-effort — the mount target already exists, so a
     // failed keep-set must not block resume.

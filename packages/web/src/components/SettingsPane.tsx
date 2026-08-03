@@ -15,8 +15,10 @@ import {
   Plug,
   SlidersHorizontal,
   Users,
+  Wand2,
 } from "lucide-react";
 import { type MouseEvent as ReactMouseEvent, useId } from "react";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -110,6 +112,9 @@ interface SettingsPaneProps {
   // profile inside ModelsTab; the pickers re-sync when settings closes.
   chatModels: ChatModelDefinition[];
   onSectionChange: (section: SettingsSection) => void;
+  // Opens the guided setup. Lives up in HomeTab because the card is presented
+  // over the whole window rather than inside the settings surface.
+  onOpenWizard: () => void;
   // Shared with the instances sidebar: the title-bar toggle collapses whichever
   // sidebar occupies the slot, so the section nav hides when collapsed too.
   sidebarCollapsed: boolean;
@@ -225,12 +230,35 @@ function FontSelect({
   );
 }
 
+// The empty state for a section that configures a profile, on an install with
+// none. Without it each such section sits on a fetch it never makes and renders
+// a spinner that never resolves. Theme, Debugging, Resources, About and Profiles
+// itself are not profile-scoped and keep their own content.
+function NoProfile({ onOpenWizard }: { onOpenWizard: () => void }) {
+  return (
+    <div className="flex-1 min-h-0 overflow-y-auto px-6 pt-4 pb-6">
+      <div className="max-w-2xl space-y-3">
+        <h2 className="font-medium text-sm">Nothing to configure yet</h2>
+        <p className="text-muted-foreground text-xs">
+          This section belongs to a profile, and there are none. Guided setup makes one: it takes
+          the repositories you want to work on, asks what the image should carry, and builds it.
+        </p>
+        <Button size="sm" onClick={onOpenWizard}>
+          <Wand2 className="size-3.5" />
+          Guided setup
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export default function SettingsPane({
   isTauri,
   section,
   activeProfileId,
   chatModels,
   onSectionChange,
+  onOpenWizard,
   sidebarCollapsed,
   topInset = 0,
   topDrag,
@@ -443,40 +471,80 @@ export default function SettingsPane({
             </label>
           </TabsContent>
           <TabsContent value="git" className="flex-1 min-w-0 min-h-0 flex flex-col">
-            <GitTab activeProfileId={activeProfileId} />
+            {activeProfileId ? (
+              <GitTab activeProfileId={activeProfileId} />
+            ) : (
+              <NoProfile onOpenWizard={onOpenWizard} />
+            )}
           </TabsContent>
           <TabsContent value="models" className="flex-1 min-w-0 min-h-0">
-            <ModelsTab activeProfileId={activeProfileId} chatModels={chatModels} />
+            {activeProfileId ? (
+              <ModelsTab activeProfileId={activeProfileId} chatModels={chatModels} />
+            ) : (
+              <NoProfile onOpenWizard={onOpenWizard} />
+            )}
           </TabsContent>
           <TabsContent value="configuration" className="flex-1 min-w-0 min-h-0 flex flex-col">
-            <ConfigurationTab activeProfileId={activeProfileId} />
+            {activeProfileId ? (
+              <ConfigurationTab activeProfileId={activeProfileId} />
+            ) : (
+              <NoProfile onOpenWizard={onOpenWizard} />
+            )}
           </TabsContent>
           <TabsContent value="dockerfile" className="flex-1 min-w-0 min-h-0">
-            <DockerfileTab activeProfileId={activeProfileId} />
+            {activeProfileId ? (
+              <DockerfileTab activeProfileId={activeProfileId} />
+            ) : (
+              <NoProfile onOpenWizard={onOpenWizard} />
+            )}
           </TabsContent>
           <TabsContent value="build" className="flex-1 min-w-0 min-h-0">
-            <BuildTab activeProfileId={activeProfileId} />
+            {activeProfileId ? (
+              <BuildTab activeProfileId={activeProfileId} />
+            ) : (
+              <NoProfile onOpenWizard={onOpenWizard} />
+            )}
           </TabsContent>
           <TabsContent value="network" className="flex-1 min-w-0 min-h-0 flex flex-col">
-            <NetworkTab activeProfileId={activeProfileId} />
+            {activeProfileId ? (
+              <NetworkTab activeProfileId={activeProfileId} />
+            ) : (
+              <NoProfile onOpenWizard={onOpenWizard} />
+            )}
           </TabsContent>
           <TabsContent value="profiles" className="flex-1 min-w-0 min-h-0 flex flex-col">
-            <ProfilesTab activeProfileId={activeProfileId} />
+            <ProfilesTab activeProfileId={activeProfileId} onOpenWizard={onOpenWizard} />
           </TabsContent>
           <TabsContent value="prompt" className="flex-1 min-w-0 min-h-0 flex flex-col">
-            <PromptTab activeProfileId={activeProfileId} />
+            {activeProfileId ? (
+              <PromptTab activeProfileId={activeProfileId} />
+            ) : (
+              <NoProfile onOpenWizard={onOpenWizard} />
+            )}
           </TabsContent>
           <TabsContent value="runtime" className="flex-1 min-w-0 min-h-0 flex flex-col">
-            <RuntimeTab activeProfileId={activeProfileId} />
+            {activeProfileId ? (
+              <RuntimeTab activeProfileId={activeProfileId} />
+            ) : (
+              <NoProfile onOpenWizard={onOpenWizard} />
+            )}
           </TabsContent>
           <TabsContent value="providers" className="flex-1 min-w-0 min-h-0 flex flex-col">
-            <ProvidersTab activeProfileId={activeProfileId} />
+            {activeProfileId ? (
+              <ProvidersTab activeProfileId={activeProfileId} />
+            ) : (
+              <NoProfile onOpenWizard={onOpenWizard} />
+            )}
           </TabsContent>
           <TabsContent value="resources" className="flex-1 min-w-0 min-h-0">
             <ResourcesTab />
           </TabsContent>
           <TabsContent value="secrets" className="flex-1 min-w-0 min-h-0 flex flex-col">
-            <SecretsTab activeProfileId={activeProfileId} />
+            {activeProfileId ? (
+              <SecretsTab activeProfileId={activeProfileId} />
+            ) : (
+              <NoProfile onOpenWizard={onOpenWizard} />
+            )}
           </TabsContent>
           <TabsContent
             value="theme"
@@ -549,7 +617,11 @@ export default function SettingsPane({
             />
           </TabsContent>
           <TabsContent value="usage" className="flex-1 min-w-0 min-h-0">
-            <UsageTab activeProfileId={activeProfileId} />
+            {activeProfileId ? (
+              <UsageTab activeProfileId={activeProfileId} />
+            ) : (
+              <NoProfile onOpenWizard={onOpenWizard} />
+            )}
           </TabsContent>
         </div>
       </Tabs>

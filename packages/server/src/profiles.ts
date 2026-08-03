@@ -266,11 +266,10 @@ export class ProfileManager {
   // ---- mutations ----
 
   // There is no server-side "active profile": the client (each window) names
-  // the profile it's acting as on every request. This just guarantees at least
-  // one profile exists so a fresh install has something to select.
-  ensureDefault(): Profile {
-    return this.get("default") ?? this.create("Default", "default");
-  }
+  // the profile it's acting as on every request. Nor is there a guaranteed
+  // profile. An install with none is an ordinary state that the API, the client
+  // and the guided setup all handle, rather than one papered over by seeding a
+  // "Default" that exists on paper and can do nothing.
 
   create(name: string, idHint?: string): Profile {
     const id = this.uniqueSlug(idHint ?? name);

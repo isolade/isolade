@@ -62,13 +62,14 @@ export function setStoredProfileId(id: string | null): void {
 // real profile, else the first profile. Persists the resolution so later reads
 // (and other components in this window) are stable. Returns null only when no
 // profiles exist at all.
+//
+// Throws when the API can't be reached, rather than answering null. The two are
+// different things and the workspace shows different screens for them: an
+// install with no profile is offered guided setup, while a server that isn't up
+// yet is worth waiting for. The window opens before the sidecar listens, so the
+// very first call of a launch can lose that race (see HomeTab, which retries).
 export async function resolveActiveProfileId(): Promise<string | null> {
-  let profiles;
-  try {
-    profiles = await listProfiles();
-  } catch {
-    return getStoredProfileId();
-  }
+  const profiles = await listProfiles();
   if (profiles.length === 0) return null;
   const stored = getStoredProfileId();
   const chosen = profiles.find((p) => p.id === stored) ?? profiles[0];

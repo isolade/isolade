@@ -6,8 +6,20 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+### Added
+
+- New installs now guide you through creating and building a first profile, either
+  from the ready-made Excalidraw demo or your own repositories and toolchains. It
+  writes the Dockerfile and shows it to you to edit before the first build.
+  Guided setup is also available from Settings > Profiles. Until there is
+  something to chat in, the new-chat screen says what is missing instead of
+  taking a message it cannot run.
+
 ### Changed
 
+- Build logs no longer go quiet for minutes at a time. The stretches that used
+  to say nothing, booting the builder and taking the finished image into the
+  cache, now report what they are doing and how long it has taken.
 - The model picker now offers only models you can actually run.
 - Agent messages are now set in a sans-serif face by default. If you had picked
   serif, that sticks, and Settings still offers serif and any font on your
@@ -28,6 +40,10 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Fixed
 
+- Profile images now build even when their Dockerfile does not define an `agent`
+  user.
+- A window that opens before Isolade's local server is up now waits for it,
+  instead of coming up empty until you reload.
 - On macOS, the window can now be dragged from the title-bar area while Settings
   is open.
 - Newly created chats now give `/tmp` up to one quarter of their memory, capped

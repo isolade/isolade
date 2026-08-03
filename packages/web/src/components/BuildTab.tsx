@@ -103,7 +103,11 @@ export default function BuildTab({ activeProfileId }: { activeProfileId: string 
 // Streams the build log. The same endpoint replays a finished build's persisted
 // log (then `done`) and follows a live one, so we connect regardless of state.
 // `runKey` bumps to reconnect after a rebuild is kicked off.
-function BuildLogs({
+//
+// Exported because the onboarding wizard shows the same build: a
+// second implementation of this would drift from the one people watch every
+// other time they build.
+export function BuildLogs({
   profileId,
   building,
   runKey,

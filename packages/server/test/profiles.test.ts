@@ -83,11 +83,11 @@ describe("ProfileManager", () => {
     expect(pm.appearance(p.id).debug).toBe(true);
   });
 
-  it("ensureDefault creates a 'default' profile once", () => {
+  it("starts with no profiles at all", () => {
+    // An install with none is an ordinary state rather than one to paper over.
+    // The guided setup is the empty state, and it creates the first profile.
     const pm = newManager(createDb(":memory:"));
-    expect(pm.ensureDefault().id).toBe("default");
-    expect(pm.ensureDefault().id).toBe("default");
-    expect(pm.list().filter((p) => p.id === "default")).toHaveLength(1);
+    expect(pm.list()).toEqual([]);
   });
 
   it("clones the build definition + identity config, but not auth", () => {
@@ -133,5 +133,37 @@ describe("ProfileManager", () => {
     pm.remove(p.id);
     expect(pm.get(p.id)).toBeUndefined();
     expect(existsSync(profileDir(p.id))).toBe(false);
+  });
+
+  describe("an install with no profiles", () => {
+    // Zero profiles used to be impossible: the server seeded a "Default" at boot,
+    // so the state the API and the client were written to handle never occurred.
+    // These pin that it is now ordinary rather than exceptional.
+
+    it("lists nothing, and creating the first one works from empty", () => {
+      const pm = newManager(createDb(":memory:"));
+      expect(pm.list()).toEqual([]);
+
+      const first = pm.create("My project");
+      expect(pm.list().map((p) => p.id)).toEqual([first.id]);
+    });
+
+    it("lets the last profile be deleted", () => {
+      // The UI used to disable delete at one profile, purely to keep the seeded
+      // Default alive. Nothing underneath ever required it.
+      const pm = newManager(createDb(":memory:"));
+      const only = pm.create("Only");
+      pm.remove(only.id);
+      expect(pm.list()).toEqual([]);
+    });
+
+    it("reports a profile that has never been configured as unusable", () => {
+      // What the guided setup keys off: a profile can exist and still be nothing
+      // to work with, which is why it asks about build definitions rather than
+      // counting rows.
+      const pm = newManager(createDb(":memory:"));
+      const p = pm.create("Empty");
+      expect(pm.get(p.id)?.hasConfig).toBe(false);
+    });
   });
 });

@@ -21,6 +21,7 @@ import {
   listTerminals,
   markInstanceRead,
   pinInstance,
+  rebuildProfile,
   deleteInstance as removeInstance,
   restartInstance,
   unarchiveInstance,
@@ -38,6 +39,9 @@ import type {
   Terminal,
 } from "../../lib/contracts";
 import { CHAT_MODELS, DEFAULT_CHAT_MODEL_ID, provisionalTitle } from "../../lib/contracts";
+import { useOnboarding } from "../../lib/useOnboarding";
+import { profileBlockingChats, useProfileReadiness } from "../../lib/useProfileReadiness";
+import OnboardingWizard from "../OnboardingWizard";
 import SettingsPane, {
   DEFAULT_SETTINGS_SECTION,
   isSettingsSection,
@@ -48,6 +52,7 @@ import InstancesSidebar from "./InstancesSidebar";
 import NewInstancePane from "./NewInstancePane";
 import RetainedInstancePane from "./RetainedInstancePane";
 import WindowChrome from "./WindowChrome";
+import { NoProfile, ProfileUnbuilt, ServerOffline } from "./WorkspaceEmptyState";
 
 type View = { kind: "drafting" } | { kind: "instance"; id: string };
 
@@ -250,15 +255,46 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
   // A profile IS the buildable unit, so its id is all we need. Switching
   // profiles happens in Settings and reloads the app, so this is fetched once.
   const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
+  // A null activeProfileId means three different things, and the workspace
+  // shows a different screen for each: still resolving, an install that
+  // genuinely has no profile, or an API we can't reach. Only the second is an
+  // empty state, and only the third is an error.
+  const [profileResolution, setProfileResolution] = useState<"resolving" | "resolved" | "offline">(
+    "resolving",
+  );
+  // Guided setup. It opens itself on an install with nothing to work with, and
+  // is otherwise opened from the Profiles section. The counter is what makes it
+  // re-read: bumped when the wizard creates a profile, and when the resolution
+  // below finally succeeds, so a self-open is never lost to a first request
+  // that raced the server's boot.
+  const [profilesVersion, setProfilesVersion] = useState(0);
+  const onboarding = useOnboarding(profilesVersion);
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      try {
-        const profileId = await resolveActiveProfileId();
-        if (!cancelled) setActiveProfileId(profileId);
-      } catch {
-        // Profiles API unavailable (e.g. demo mock), so leave unscoped.
+      // The app window opens before its sidecar listens, so the first attempt
+      // of a launch can lose that race. Retrying briefly is the difference
+      // between the app coming up and a fresh install being told it has no
+      // environment (and never being offered guided setup, which self-opens off
+      // this same answer). Backs off to a slow poll rather than giving up, so
+      // an install that took a while to start still lands on its own.
+      for (let attempt = 0; !cancelled; attempt++) {
+        try {
+          const profileId = await resolveActiveProfileId();
+          if (cancelled) return;
+          setActiveProfileId(profileId);
+          setProfileResolution("resolved");
+          // Only worth re-running the wizard's own check when an earlier
+          // attempt failed and it may have skipped a self-open.
+          if (attempt > 0) setProfilesVersion((v) => v + 1);
+          return;
+        } catch {
+          // Unreachable, not empty. Say so once the quick retries are spent, so
+          // a sidecar that's half a second late costs nothing on screen.
+          if (attempt === 4) setProfileResolution("offline");
+          await new Promise((r) => setTimeout(r, attempt < 4 ? 250 : 2000));
+        }
       }
     })();
     return () => {
@@ -1048,6 +1084,29 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
 
   const settingsOpen = settingsSection !== null;
 
+  // Whether the active profile can host a chat yet. A profile that has never
+  // produced an image (building, failed, or never built — the state guided
+  // setup leaves behind if it is closed while the first build runs) gets a
+  // screen saying so instead of a composer that can only fail. One that HAS
+  // built keeps its composer through any later rebuild, which is what
+  // profileBlockingChats encodes.
+  const readiness = useProfileReadiness(activeProfileId);
+  const unbuiltProfile = profileBlockingChats(readiness.profile);
+  const [buildStarting, setBuildStarting] = useState(false);
+  const startProfileBuild = useCallback(() => {
+    if (!activeProfileId) return;
+    setBuildStarting(true);
+    void rebuildProfile(activeProfileId)
+      .catch(() => {
+        // The failure lands on the profile row as `error`, which the poll picks
+        // up and this screen then reports with its log.
+      })
+      .finally(() => {
+        setBuildStarting(false);
+        readiness.refresh();
+      });
+  }, [activeProfileId, readiness]);
+
   // Only draw an edge where the content meets another surface. Window edges
   // stay flush and unframed; internal panel boundaries are owned by the panel
   // tree itself.
@@ -1104,13 +1163,32 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
                       aria-hidden
                       {...windowDrag}
                     />
-                    <NewInstancePane
-                      profileId={activeProfileId}
-                      chatModels={chatModels}
-                      modelOverrides={modelOverrides}
-                      defaultModelId={DEFAULT_CHAT_MODEL_ID}
-                      onSubmit={handleSubmitDraft}
-                    />
+                    {/* A composer is only offered when a message typed into it
+                        can go somewhere: there has to be a server, a profile,
+                        and an image built from that profile. Each missing piece
+                        has its own screen (WorkspaceEmptyState) rather than a
+                        composer that swallows the message and answers with an
+                        internal precondition. */}
+                    {profileResolution === "offline" ? (
+                      <ServerOffline />
+                    ) : profileResolution === "resolved" && !activeProfileId ? (
+                      <NoProfile onOpenWizard={onboarding.open_} />
+                    ) : unbuiltProfile ? (
+                      <ProfileUnbuilt
+                        profile={unbuiltProfile}
+                        building={buildStarting}
+                        onWatchBuild={() => setSettingsSection("build")}
+                        onBuild={startProfileBuild}
+                      />
+                    ) : (
+                      <NewInstancePane
+                        profileId={activeProfileId}
+                        chatModels={chatModels}
+                        modelOverrides={modelOverrides}
+                        defaultModelId={DEFAULT_CHAT_MODEL_ID}
+                        onSubmit={handleSubmitDraft}
+                      />
+                    )}
                   </div>
                 )}
 
@@ -1164,9 +1242,27 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
                 activeProfileId={activeProfileId}
                 chatModels={chatModels}
                 onSectionChange={setSettingsSection}
+                onOpenWizard={onboarding.open_}
                 sidebarCollapsed={sidebarCollapsed}
                 topInset={TITLE_BAR_WITH_INSET_HEIGHT}
                 topDrag={windowDrag}
+              />
+            </div>
+          )}
+
+          {/* Guided setup. On a fresh install the card is what the window holds,
+              so the backdrop is opaque: a scrim would imply something underneath
+              being withheld, and there is nothing there. Opened deliberately it
+              is a modal over real work, so that gets the scrim. */}
+          {onboarding.open && (
+            <div
+              className={`absolute inset-0 z-50 flex items-center justify-center p-6 ${
+                onboarding.self ? "bg-background" : "bg-black/50"
+              }`}
+            >
+              <OnboardingWizard
+                onClose={onboarding.close}
+                onProfileCreated={() => setProfilesVersion((v) => v + 1)}
               />
             </div>
           )}

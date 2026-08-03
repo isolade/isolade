@@ -191,6 +191,27 @@ describe("assembleDockerfile", () => {
   });
 });
 
+describe("the agent layer", () => {
+  // Built through the real default fragment rather than the stub above, since
+  // what is asserted here is what that fragment says.
+  const layer = assembleDockerfile("FROM ubuntu:24.04\n").toString("utf8");
+
+  it("creates the user it then runs as", () => {
+    // It used to require the base image to supply one and died on `chown:
+    // invalid user: 'agent'`, in a layer the person reading the error had not
+    // written. Every base worth naming (ubuntu, debian, node) ships without it.
+    expect(layer).toContain("useradd");
+    expect(layer).toContain("USER agent");
+    expect(layer.indexOf("useradd")).toBeLessThan(layer.indexOf("chown agent /workspace"));
+  });
+
+  it("leaves an image that already has the user alone", () => {
+    // Every hand-written profile creates it, usually with a uid and sudo rights
+    // this layer knows nothing about, so it must not be a second definition.
+    expect(layer).toContain("id -u agent");
+  });
+});
+
 describe("buildContextTar", () => {
   it("ships only the Dockerfile when there are no repos", async () => {
     const dockerfileBytes = Buffer.from("FROM scratch\n", "utf8");
