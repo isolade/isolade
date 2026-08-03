@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { PromptDialog } from "@/components/ui/prompt-dialog";
+import { AgentAuthProvider, availableProvidersFromAuth } from "@/lib/agent-auth";
 import { TITLE_BAR_WITH_INSET_HEIGHT } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import { useWindowDrag } from "@/lib/window-drag";
@@ -12,6 +13,7 @@ import {
   clearArchive,
   createChat,
   detachInstancePr,
+  getAuthStatus,
   getProfileModelOverrides,
   listChatModels,
   listChats,
@@ -27,6 +29,7 @@ import {
 } from "../../lib/api";
 import type {
   AttachedPr,
+  AuthStatus,
   Chat,
   ChatEffort,
   ChatModelDefinition,
@@ -211,6 +214,12 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
   // restarts on every backend edit in dev). The fetch below refreshes it.
   const [chatModels, setChatModels] = useState<ChatModelDefinition[]>(() => [...CHAT_MODELS]);
   const [modelOverrides, setModelOverrides] = useState<ModelOverrides>({});
+  // Which providers the effective profile has signed in to, which decides what
+  // the pickers offer and whether a composer can send at all. Null until the
+  // first response lands (or if it never does), read as "assume both work" so a
+  // signed-in user never sees the catalog blink or a sign-in prompt they don't
+  // need. See lib/agent-auth.
+  const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [allChats, setAllChats] = useState<Chat[]>([]);
   const [terminalsByInstance, setTerminalsByInstance] = useState<Record<string, Terminal[]>>({});
   const [view, setView] = useState<View>(
@@ -447,6 +456,34 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
       cancelled = true;
     };
   }, [effectiveProfileId, settingsSection]);
+
+  // The effective profile's logins, on the same schedule as the overrides above
+  // and for the same reason: signing in (or out) happens on the Providers
+  // settings page, so re-reading it whenever the overlay toggles is enough for
+  // the pickers and composers to be right by the time the user is back at them.
+  useEffect(() => {
+    let cancelled = false;
+    if (!effectiveProfileId) {
+      setAuthStatus(null);
+      return;
+    }
+    void (async () => {
+      try {
+        const status = await getAuthStatus(effectiveProfileId);
+        if (!cancelled) setAuthStatus(status);
+      } catch {
+        // Leave the last known answer (or "unknown") rather than claiming
+        // signed-out on a failed request: hiding the whole catalog because one
+        // GET fell over would be worse than offering a model that then errors.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveProfileId, settingsSection]);
+
+  const availableProviders = useMemo(() => availableProvidersFromAuth(authStatus), [authStatus]);
+  const openSignIn = useCallback(() => setSettingsSection("providers"), []);
 
   // A draft whose server rows haven't landed. Its pane renders from stand-ins,
   // so anything that talks to the server about it has to wait.
@@ -1017,173 +1054,175 @@ export default function HomeTab({ isTauri }: HomeTabProps) {
   const contentFrame = !sidebarCollapsed ? "border-l border-border" : undefined;
 
   return (
-    <div className="flex-1 min-h-0 flex flex-col">
-      <UpdateBanner />
+    <AgentAuthProvider available={availableProviders} openSignIn={openSignIn}>
+      <div className="flex-1 min-h-0 flex flex-col">
+        <UpdateBanner />
 
-      {/* Body region: the muted chrome field. The panel workspace floats on it,
+        {/* Body region: the muted chrome field. The panel workspace floats on it,
           and the window-chrome cluster floats above everything at the top-left. */}
-      <div className="relative flex-1 min-h-0 bg-muted/30">
-        {/* The workspace stays mounted while settings is open so its transient
+        <div className="relative flex-1 min-h-0 bg-muted/30">
+          {/* The workspace stays mounted while settings is open so its transient
             UI state (chat scroll, composer drafts, terminal scrollback) survives
             the round-trip. `inert` while covered keeps it out of the tab order. */}
-        <div className="flex h-full w-full min-w-0" inert={settingsOpen}>
-          {!sidebarCollapsed && (
-            <InstancesSidebar
-              instances={activeInstances}
-              pinnedInstances={pinnedInstances}
-              archivedInstances={archivedInstances}
-              pendingId={draftPending ? draft.standInInstanceId : null}
-              selectedId={view.kind === "instance" ? view.id : null}
-              isDrafting={view.kind === "drafting"}
-              topInset={TITLE_BAR_WITH_INSET_HEIGHT}
-              topDrag={windowDrag}
-              onNew={handleNew}
-              onSelect={handleSelect}
-              onRename={handleRename}
-              onRestart={handleRestart}
-              onPin={handlePin}
-              onUnpin={handleUnpin}
-              onArchive={handleArchive}
-              onUnarchive={handleUnarchive}
-              onDelete={handleRequestDelete}
-              onClearArchive={handleRequestClearArchive}
-            />
-          )}
-
-          <div
-            className={cn(
-              "flex-1 min-w-0 min-h-0 flex flex-col bg-background overflow-hidden",
-              contentFrame,
+          <div className="flex h-full w-full min-w-0" inert={settingsOpen}>
+            {!sidebarCollapsed && (
+              <InstancesSidebar
+                instances={activeInstances}
+                pinnedInstances={pinnedInstances}
+                archivedInstances={archivedInstances}
+                pendingId={draftPending ? draft.standInInstanceId : null}
+                selectedId={view.kind === "instance" ? view.id : null}
+                isDrafting={view.kind === "drafting"}
+                topInset={TITLE_BAR_WITH_INSET_HEIGHT}
+                topDrag={windowDrag}
+                onNew={handleNew}
+                onSelect={handleSelect}
+                onRename={handleRename}
+                onRestart={handleRestart}
+                onPin={handlePin}
+                onUnpin={handleUnpin}
+                onArchive={handleArchive}
+                onUnarchive={handleUnarchive}
+                onDelete={handleRequestDelete}
+                onClearArchive={handleRequestClearArchive}
+              />
             )}
-          >
-            <div className="relative min-h-0 flex-1">
-              {view.kind === "drafting" && (
-                <div className="absolute inset-0 flex min-h-0">
-                  <div
-                    data-demo="new-chat-window-drag"
-                    className="absolute inset-x-0 top-0 z-10 flex-shrink-0 select-none"
-                    style={{ height: TITLE_BAR_WITH_INSET_HEIGHT }}
-                    aria-hidden
-                    {...windowDrag}
-                  />
-                  <NewInstancePane
-                    profileId={activeProfileId}
-                    chatModels={chatModels}
-                    modelOverrides={modelOverrides}
-                    defaultModelId={DEFAULT_CHAT_MODEL_ID}
-                    onSubmit={handleSubmitDraft}
-                  />
-                </div>
-              )}
 
-              {panes.map((pane) => {
-                const isActive = pane.instance.id === activeInstanceId;
-                const isDraft = pane.key === draft?.standInInstanceId;
-                return (
-                  <RetainedInstancePane
-                    key={pane.key}
-                    instance={pane.instance}
-                    chats={pane.chats}
-                    terminals={pane.terminals}
-                    active={isActive}
-                    pendingFirstMessage={isActive && isDraft ? draftFirstMessage : null}
-                    pending={pane.pending}
-                    creationError={isDraft ? (draft?.error ?? null) : null}
-                    resourceIdRemap={isDraft ? draftRemap : EMPTY_REMAP}
-                    chatModels={chatModels}
-                    modelOverrides={modelOverrides}
-                    sidebarCollapsed={sidebarCollapsed}
-                    chromeInset={chromeWidth}
-                    isTauri={isTauri}
-                    onTitleAutoUpdated={handleTitleAutoUpdated}
-                    onDetachPr={handleDetachPr}
-                    onChatCreated={registerChat}
-                    onChatDeleted={unregisterChat}
-                    onTerminalCreated={registerTerminal}
-                    onTerminalDeleted={unregisterTerminal}
-                  />
-                );
-              })}
-
-              {view.kind === "instance" && !activePane && (
-                <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
-                  Chat not found
-                </div>
+            <div
+              className={cn(
+                "flex-1 min-w-0 min-h-0 flex flex-col bg-background overflow-hidden",
+                contentFrame,
               )}
+            >
+              <div className="relative min-h-0 flex-1">
+                {view.kind === "drafting" && (
+                  <div className="absolute inset-0 flex min-h-0">
+                    <div
+                      data-demo="new-chat-window-drag"
+                      className="absolute inset-x-0 top-0 z-10 flex-shrink-0 select-none"
+                      style={{ height: TITLE_BAR_WITH_INSET_HEIGHT }}
+                      aria-hidden
+                      {...windowDrag}
+                    />
+                    <NewInstancePane
+                      profileId={activeProfileId}
+                      chatModels={chatModels}
+                      modelOverrides={modelOverrides}
+                      defaultModelId={DEFAULT_CHAT_MODEL_ID}
+                      onSubmit={handleSubmitDraft}
+                    />
+                  </div>
+                )}
+
+                {panes.map((pane) => {
+                  const isActive = pane.instance.id === activeInstanceId;
+                  const isDraft = pane.key === draft?.standInInstanceId;
+                  return (
+                    <RetainedInstancePane
+                      key={pane.key}
+                      instance={pane.instance}
+                      chats={pane.chats}
+                      terminals={pane.terminals}
+                      active={isActive}
+                      pendingFirstMessage={isActive && isDraft ? draftFirstMessage : null}
+                      pending={pane.pending}
+                      creationError={isDraft ? (draft?.error ?? null) : null}
+                      resourceIdRemap={isDraft ? draftRemap : EMPTY_REMAP}
+                      chatModels={chatModels}
+                      modelOverrides={modelOverrides}
+                      sidebarCollapsed={sidebarCollapsed}
+                      chromeInset={chromeWidth}
+                      isTauri={isTauri}
+                      onTitleAutoUpdated={handleTitleAutoUpdated}
+                      onDetachPr={handleDetachPr}
+                      onChatCreated={registerChat}
+                      onChatDeleted={unregisterChat}
+                      onTerminalCreated={registerTerminal}
+                      onTerminalDeleted={unregisterTerminal}
+                    />
+                  );
+                })}
+
+                {view.kind === "instance" && !activePane && (
+                  <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
+                    Chat not found
+                  </div>
+                )}
+              </div>
             </div>
           </div>
-        </div>
 
-        {/* Settings overlay covers the whole body region, including behind the
+          {/* Settings overlay covers the whole body region, including behind the
             floating window controls. SettingsPane reserves its own top rows so
             the sidebar background reaches the window edge while content clears
             the controls. */}
-        {settingsSection !== null && (
-          <div className="absolute inset-0 z-40 flex bg-background">
-            <SettingsPane
-              isTauri={isTauri}
-              section={settingsSection}
-              activeProfileId={activeProfileId}
-              chatModels={chatModels}
-              onSectionChange={setSettingsSection}
-              sidebarCollapsed={sidebarCollapsed}
-              topInset={TITLE_BAR_WITH_INSET_HEIGHT}
-              topDrag={windowDrag}
-            />
-          </div>
-        )}
+          {settingsSection !== null && (
+            <div className="absolute inset-0 z-40 flex bg-background">
+              <SettingsPane
+                isTauri={isTauri}
+                section={settingsSection}
+                activeProfileId={activeProfileId}
+                chatModels={chatModels}
+                onSectionChange={setSettingsSection}
+                sidebarCollapsed={sidebarCollapsed}
+                topInset={TITLE_BAR_WITH_INSET_HEIGHT}
+                topDrag={windowDrag}
+              />
+            </div>
+          )}
 
-        {/* Window-chrome cluster: traffic lights, sidebar toggle, and settings
+          {/* Window-chrome cluster: traffic lights, sidebar toggle, and settings
             toggle. Floats above both the workspace and settings overlay. */}
-        <WindowChrome
-          isTauri={isTauri}
-          settingsOpen={settingsOpen}
-          onToggleSidebar={fireToggle}
-          onOpenSettings={handleOpenSettings}
-          onCloseSettings={handleCloseSettings}
-          onWidthChange={setChromeWidth}
+          <WindowChrome
+            isTauri={isTauri}
+            settingsOpen={settingsOpen}
+            onToggleSidebar={fireToggle}
+            onOpenSettings={handleOpenSettings}
+            onCloseSettings={handleCloseSettings}
+            onWidthChange={setChromeWidth}
+          />
+        </div>
+
+        <PromptDialog
+          open={renaming !== null}
+          onOpenChange={(open) => {
+            if (!open) setRenaming(null);
+          }}
+          title="Rename chat"
+          initialValue={renaming?.title ?? ""}
+          placeholder="Chat name…"
+          confirmLabel="Rename"
+          onSubmit={(title) => void submitRename(title)}
+        />
+
+        <ConfirmDialog
+          open={confirmingClearArchive}
+          onOpenChange={setConfirmingClearArchive}
+          title="Delete archived?"
+          description={
+            archivedInstances.length === 1
+              ? "This permanently deletes the 1 archived chat and its VM. This can't be undone."
+              : `This permanently deletes all ${archivedInstances.length} archived chats and their VMs. This can't be undone.`
+          }
+          confirmLabel="Delete archived"
+          destructive
+          busy={clearingArchive}
+          onConfirm={() => void handleClearArchive()}
+        />
+
+        <ConfirmDialog
+          open={confirmingDelete !== null}
+          onOpenChange={(open) => {
+            if (!open) setConfirmingDelete(null);
+          }}
+          title="Delete chat?"
+          description="This permanently deletes this chat and its VM. This can't be undone."
+          confirmLabel="Delete"
+          destructive
+          busy={deleting}
+          onConfirm={() => confirmingDelete && void handleDelete(confirmingDelete)}
         />
       </div>
-
-      <PromptDialog
-        open={renaming !== null}
-        onOpenChange={(open) => {
-          if (!open) setRenaming(null);
-        }}
-        title="Rename chat"
-        initialValue={renaming?.title ?? ""}
-        placeholder="Chat name…"
-        confirmLabel="Rename"
-        onSubmit={(title) => void submitRename(title)}
-      />
-
-      <ConfirmDialog
-        open={confirmingClearArchive}
-        onOpenChange={setConfirmingClearArchive}
-        title="Delete archived?"
-        description={
-          archivedInstances.length === 1
-            ? "This permanently deletes the 1 archived chat and its VM. This can't be undone."
-            : `This permanently deletes all ${archivedInstances.length} archived chats and their VMs. This can't be undone.`
-        }
-        confirmLabel="Delete archived"
-        destructive
-        busy={clearingArchive}
-        onConfirm={() => void handleClearArchive()}
-      />
-
-      <ConfirmDialog
-        open={confirmingDelete !== null}
-        onOpenChange={(open) => {
-          if (!open) setConfirmingDelete(null);
-        }}
-        title="Delete chat?"
-        description="This permanently deletes this chat and its VM. This can't be undone."
-        confirmLabel="Delete"
-        destructive
-        busy={deleting}
-        onConfirm={() => confirmingDelete && void handleDelete(confirmingDelete)}
-      />
-    </div>
+    </AgentAuthProvider>
   );
 }

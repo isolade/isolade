@@ -309,6 +309,14 @@ export function installWorkspaceApiMock(options: WorkspaceFixtureOptions): Works
         : json(serialized.models);
     }
     if (path === "/api/update") return json(serialized.update);
+    // Signed in to both providers, so the pickers offer the whole catalog and no
+    // composer carries a sign-in notice (see lib/agent-auth).
+    if (path === "/api/auth") {
+      return json({
+        claude: { loggedIn: true, expiresAt: null },
+        codex: { loggedIn: true, expiresAt: null },
+      });
+    }
     if (/^\/api\/profiles\/[^/]+\/models$/.test(path)) return json({});
     if (/^\/api\/profiles\/[^/]+\/(activate|deactivate)$/.test(path)) return json({ ok: true });
     const layout = path.match(/^\/api\/instances\/([^/]+)\/layout$/);

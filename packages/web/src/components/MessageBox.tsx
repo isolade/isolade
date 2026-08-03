@@ -9,6 +9,23 @@ interface MessageBoxProps {
   onSubmit: () => void;
   onStop?: () => void;
   disabled?: boolean;
+  // Holds back the send while leaving the composer usable: the draft can still
+  // be typed, pasted into and attached to, it just has nowhere to go yet (the
+  // chosen model's provider is signed out). Unlike `disabled`, which turns the
+  // whole composer off, so a draft written before the reason appeared isn't
+  // stranded.
+  sendDisabled?: boolean;
+  // Why, as the send button's tooltip. The composer's layout never changes for
+  // it: the state belongs to the model, so what says it is the model picker
+  // (which flags the model and offers both fixes), and this is the same sentence
+  // where the blocked click lands.
+  sendDisabledReason?: string;
+  // An overlay across the composer, centered, for when nothing inside it can be
+  // used: no provider is signed in, so there is no model, no draft worth typing
+  // and no send. The composer stays where it is and shows through, so what is
+  // unavailable is still legible; the overlay takes the clicks and `disabled`
+  // (pass it too) takes the keyboard.
+  cover?: React.ReactNode;
   placeholder?: string;
   autoFocus?: boolean;
   loading?: boolean;
@@ -77,6 +94,9 @@ export function MessageBox({
   onSubmit,
   onStop,
   disabled,
+  sendDisabled,
+  sendDisabledReason,
+  cover,
   placeholder,
   autoFocus,
   loading,
@@ -147,7 +167,7 @@ export function MessageBox({
   // The bottom-right corner only ever holds one button. While a turn is active
   // it stops the turn, unless there is something to send: then it turns into
   // Send again, which adds the draft to the durable queue.
-  const canSubmit = !disabled && (value.trim().length > 0 || !!hasAttachments);
+  const canSubmit = !disabled && !sendDisabled && (value.trim().length > 0 || !!hasAttachments);
   const showStop = loading && !!onStop && !canSubmit;
 
   const handleSubmit = () => {
@@ -169,37 +189,56 @@ export function MessageBox({
     <div
       className={cn(
         "flex flex-col gap-2 rounded-2xl border border-input bg-background px-3 py-2 shadow-xs focus-within:border-ring/60 dark:bg-input/30",
+        // Covered, the overlay and the composer share one grid cell rather than
+        // the overlay being positioned on top of it. Same picture, except the
+        // cell takes the taller of the two, so the box is never shorter than the
+        // composer and never too short for the message either: a narrow docked
+        // pane wraps the message onto three lines, which an absolutely
+        // positioned overlay would have spilled out of the box.
+        cover && "grid",
         className,
       )}
     >
-      <textarea
-        ref={textareaRef}
-        autoFocus={autoFocus}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        onKeyDown={handleKeyDown}
-        onPaste={onPaste}
-        rows={1}
-        placeholder={placeholder}
-        disabled={disabled}
-        className="w-full resize-none bg-transparent py-1 text-base leading-relaxed outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50 md:text-sm"
-      />
-      {attachments}
-      <div className="flex min-w-0 items-center gap-1">
-        {onAttachClick && (
-          <Button
-            type="button"
-            size="icon"
-            variant="ghost"
-            className="size-8 shrink-0 rounded-full text-muted-foreground"
-            onClick={onAttachClick}
-            disabled={disabled}
-            aria-label="Attach files"
-          >
-            <Paperclip className="size-4" />
-          </Button>
-        )}
-        {/* What the chat is: the model, what it has cost, how full its context
+      {/* The overlay sits across the composer rather than in place of it: the
+          composer it explains stays visible underneath, so what is unavailable
+          reads as the familiar box, dimmed. The negative margins pull the scrim
+          out over the box's own padding (they cancel this element's padding, so
+          the grid cell still sizes to the message), which is what lets it reach
+          the rounded border instead of stopping short of it. */}
+      {cover && (
+        <div className="z-10 col-start-1 row-start-1 -mx-3 -my-2 flex flex-wrap items-center justify-center gap-x-2 gap-y-1.5 rounded-2xl bg-background/75 px-4 py-2 text-center backdrop-blur-[1px] dark:bg-background/65">
+          {cover}
+        </div>
+      )}
+      <div className="col-start-1 row-start-1 flex min-w-0 flex-col gap-2">
+        <textarea
+          ref={textareaRef}
+          autoFocus={autoFocus}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          onKeyDown={handleKeyDown}
+          onPaste={onPaste}
+          rows={1}
+          placeholder={placeholder}
+          disabled={disabled}
+          className="w-full resize-none bg-transparent py-1 text-base leading-relaxed outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50 md:text-sm"
+        />
+        {attachments}
+        <div className="flex min-w-0 items-center gap-1">
+          {onAttachClick && (
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              className="size-8 shrink-0 rounded-full text-muted-foreground"
+              onClick={onAttachClick}
+              disabled={disabled}
+              aria-label="Attach files"
+            >
+              <Paperclip className="size-4" />
+            </Button>
+          )}
+          {/* What the chat is: the model, what it has cost, how full its context
             is. The model name is what gives way when a docked panel gets narrow
             enough that the row cannot hold everything: it truncates (the picker
             shrinks inside this box) while the figures and the send button keep
@@ -209,38 +248,46 @@ export function MessageBox({
             amount half elided says nothing. Spaced on the same gap as the row
             around it: each piece carries its own inset for its hover target, and
             those alone left the four of them reading as one crowded run. */}
-        <div className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
-          {modelPicker}
-          {fastMode}
-          {cost}
-          {context}
-        </div>
-        <div className="flex shrink-0 items-center gap-1">
-          {status}
-          {showStop ? (
-            <Button
-              type="button"
-              size="icon"
-              variant="default"
-              className="size-8 rounded-full"
-              onClick={onStop}
-              aria-label="Stop"
-            >
-              <Square className="size-3 fill-current" />
-            </Button>
-          ) : (
-            <Button
-              type="button"
-              size="icon"
-              variant="default"
-              className="size-8 rounded-full"
-              disabled={!canSubmit}
-              onClick={handleSubmit}
-              aria-label={loading ? "Queue message" : "Send"}
-            >
-              <ArrowUp className="size-4" />
-            </Button>
-          )}
+          <div className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
+            {modelPicker}
+            {fastMode}
+            {cost}
+            {context}
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            {status}
+            {showStop ? (
+              <Button
+                type="button"
+                size="icon"
+                variant="default"
+                className="size-8 rounded-full"
+                onClick={onStop}
+                aria-label="Stop"
+              >
+                <Square className="size-3 fill-current" />
+              </Button>
+            ) : (
+              // The reason rides a wrapper, not the button: a disabled button
+              // takes `pointer-events: none` from the button base, so a `title`
+              // on it would never be hovered and never shown. The wrapper still
+              // gets the pointer, so the explanation reaches the one place the
+              // blocked click lands.
+              <span className="inline-flex" title={sendDisabled ? sendDisabledReason : undefined}>
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="default"
+                  className="size-8 rounded-full"
+                  disabled={!canSubmit}
+                  onClick={handleSubmit}
+                  aria-label={loading ? "Queue message" : "Send"}
+                >
+                  <ArrowUp className="size-4" />
+                </Button>
+              </span>
+            )}
+          </div>
         </div>
       </div>
     </div>

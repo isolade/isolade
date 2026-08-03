@@ -52,6 +52,7 @@ import {
   useUserFontSetting,
 } from "../lib/settings";
 import { useAttachments } from "../lib/use-attachments";
+import { useComposerAuth } from "./ComposerAuthGate";
 import { AttachmentStrip } from "./chat/AttachmentStrip";
 import type { ProviderSwitchChunk } from "./chat/blocks";
 import {
@@ -2939,8 +2940,12 @@ function Chat({
   // The picker offers models from both providers. Selecting a cross-provider
   // model records a pending switch that the next send activates with a
   // provider-neutral handoff (see the handoff service); the chat keeps running
-  // its current provider until then.
+  // its current provider until then. Models whose provider isn't signed in are
+  // dropped inside the picker, this chat's own model excepted.
   const pickerModels = chatModels;
+  // A missing login is the one send-blocker the composer can see coming: the
+  // turn would otherwise fail inside the VM with the agent CLI's own error.
+  const composerAuth = useComposerAuth(findChatModel(currentModel));
   const liveAssistantRow = useMemo<LiveAssistantRow | null>(() => {
     if (!liveRow) return null;
     return {
@@ -3079,6 +3084,10 @@ function Chat({
             placeholder="Message... (Enter to send, Shift+Enter for newline)"
             onAttachClick={() => fileInputRef.current?.click()}
             onPaste={handlePaste}
+            disabled={composerAuth.disabled}
+            sendDisabled={composerAuth.sendDisabled}
+            sendDisabledReason={composerAuth.sendDisabledReason}
+            cover={composerAuth.cover}
             hasAttachments={attachments.items.length > 0}
             attachments={
               <AttachmentStrip items={attachments.items} onRemove={attachments.remove} />
@@ -3092,6 +3101,7 @@ function Chat({
                 currentEffort={currentEffort}
                 onModelChange={handleModelChange}
                 onEffortChange={handleEffortChange}
+                disabled={composerAuth.disabled}
               />
             }
             fastMode={
@@ -3099,6 +3109,7 @@ function Chat({
                 model={findChatModel(currentModel)}
                 fastMode={fastMode}
                 onFastModeChange={handleFastModeChange}
+                disabled={composerAuth.disabled}
               />
             }
             context={
