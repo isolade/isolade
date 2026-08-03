@@ -13,6 +13,9 @@ _Changes landed on `main` that haven't shipped in a release yet._
   outrank the rest of it. You can also pick the prompt they join: Isolade's own,
   written for a disposable VM and now the default, the one Claude Code or Codex
   ships, or none at all.
+- Chats now carry only the tools they can use, so every message costs less. A
+  Claude chat sends about 18 KB before it says a word, down from 60 KB, and a Codex
+  chat 2.8 KB, down from 10 KB.
 
 ### Fixed
 

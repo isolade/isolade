@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CODEX_CONFIG_OVERRIDES } from "../src/chat/codex-manager";
 
 // What codex actually puts on the wire, driven through the same JSON-RPC calls
 // CodexManager/CodexBackend make, against a stub that captures the request body.
@@ -86,14 +87,9 @@ async function withServer<T>(
       "stdio://",
       "--disable",
       "apps",
-      "-c",
-      "features.memories=false",
-      "-c",
-      "approval_policy=never",
-      "-c",
-      "sandbox_mode=danger-full-access",
-      "-c",
-      "agents.enabled=false",
+      // The same posture CodexManager ships, so what the tool assertions below see
+      // is what a real chat sends.
+      ...CODEX_CONFIG_OVERRIDES.flatMap((override) => ["-c", override]),
       "-c",
       "model_provider=stub",
       "-c",
@@ -307,14 +303,43 @@ describe.skipIf(!hasCodex)("codex against a stub API", () => {
   it("does not expose a patch tool for this model, which is why our guidance is conditional", async () => {
     // `apply_patch` is gated on model_info.apply_patch_tool_type, a field from the
     // server-supplied models manifest, so its presence is not ours to decide. This
-    // pins the reason CODEX_PATCH_RULES says "if you edit files by writing a patch"
-    // rather than naming a tool. A stub cannot fetch the manifest, so this asserts
-    // the fallback behaviour; treat a failure here as the manifest having changed
-    // rather than as a regression.
+    // pins the reason CODEX_PATCH_RULES describes how a patch applies rather than
+    // naming a tool to use. A stub cannot fetch the manifest, so this asserts the
+    // fallback behaviour; treat a failure here as the manifest having changed rather
+    // than as a regression.
     const request = await captureTurn({ baseInstructions: SENTINEL });
     const names = (request.tools ?? []).map((tool) => (tool as { name?: string }).name);
 
     expect(names).not.toContain("apply_patch");
     expect(names).toContain("exec_command");
+  }, 60_000);
+
+  it("withholds the planning and user-input tools our config disables", async () => {
+    // The tool specs are the bulk of a codex request, and these five are ~5.7KB of
+    // them. The goal and plan tools are bookkeeping rather than capability, dropped
+    // to match the task family we deny on Claude; `request_user_input` is codex's
+    // AskUserQuestion, and nothing in isolade can present the picker, so a call
+    // would only burn a turn. Asserting absence rather than a byte count, since the
+    // specs are the CLI's to reword.
+    const request = await captureTurn({ baseInstructions: SENTINEL });
+    // Server-side tools carry only a `type` (web search arrives as
+    // `{"type": "web_search"}`), so a name-only read would miss them.
+    const names = (request.tools ?? []).map(
+      (tool) => (tool as { name?: string; type?: string }).name ?? (tool as { type?: string }).type,
+    );
+
+    for (const withheld of [
+      "get_goal",
+      "create_goal",
+      "update_goal",
+      "update_plan",
+      "request_user_input",
+    ]) {
+      expect(names).not.toContain(withheld);
+    }
+    // Still the tools a chat works with, so the overrides are not simply breaking
+    // the tool set.
+    expect(names).toContain("exec_command");
+    expect(names).toContain("web_search");
   }, 60_000);
 });

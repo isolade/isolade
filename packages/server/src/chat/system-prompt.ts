@@ -27,6 +27,19 @@
 //   its tool guidance all disappear, while the tool SPECS are still sent. So the
 //   loss is guidance, not capability — and CODEX_PATCH_RULES covers the one piece
 //   of that guidance whose absence is silent rather than loud.
+//
+// The asymmetry runs deeper than that, and it is why several blocks below are
+// per-provider. What each harness still injects once its prompt is replaced,
+// measured on the wire rather than read out of either source tree:
+//
+//   Claude sends three system blocks — a billing header, the SDK identity line,
+//   and ours. No environment section, no cwd, no permission-mode text. Nothing
+//   else will say where the working tree is or that approvals are off.
+//
+//   Codex sends `<permissions instructions>` (naming `sandbox_mode`
+//   danger-full-access and `approval_policy` never) and `<environment_context>`
+//   (cwd, shell, date, timezone, workspace roots) as conversation items. Repeating
+//   either would be telling it something it has already read.
 import { type ChatProvider, findChatModel, type PromptBase, WORKSPACE_ROOT } from "../contracts";
 
 /**
@@ -53,31 +66,75 @@ export interface IsoladeSystemPrompt {
 // already distinguishable as instruction, so the tags bought nothing.
 const PRELUDE_HEADING = "# Project instructions";
 
-const IDENTITY = `You are a coding agent in Isolade, a sandboxed harness. Each chat gets its own
-disposable Linux microVM, with the working tree at ${WORKSPACE_ROOT}. You read files,
-run commands, edit code, write files.`;
+/**
+ * No "you read files, run commands, edit code": that restates the tool schemas,
+ * which both providers send in full whatever we do here.
+ *
+ * The working tree is named for Claude only. Its harness sends no environment
+ * block once the prompt is replaced, and its file tools want absolute paths, so
+ * without this the model has to spend a call on `pwd`. Codex reads the same path
+ * out of `<environment_context>`.
+ */
+function identity(isClaude: boolean): string {
+  const tree = isClaude ? `,\nwith the working tree at ${WORKSPACE_ROOT}` : "";
+  return `You are a coding agent in Isolade. This chat has its own disposable Linux microVM${tree}.`;
+}
 
-const PERMISSIONS = `Nothing prompts for permission here: no call is denied, no dialog appears. The VM
-is disposable, so local work (editing, testing, installing, deleting) is free. Do
-it, do not ask, but nothing you install survives this session, so do not rely on
-it later. What the VM does not contain is anything using real credentials, so ask
-first before pushing, creating or commenting on PRs, sending messages, or posting
-to an external service.`;
+/**
+ * Claude only, and load-bearing there: replacing the CLI's prompt leaves nothing
+ * that says approvals are off, while the Bash tool description — which
+ * `--system-prompt` does not touch — still warns that `cd` in a compound command
+ * "can trigger a permission prompt". So this is correcting the tool schema, not
+ * just filling a gap.
+ *
+ * Codex needs none of it. Its `<permissions instructions>` item already reports
+ * `sandbox_mode` danger-full-access and `approval_policy` never.
+ */
+const SANDBOX = `Nothing here prompts for permission and no call is denied. The VM is disposable, so
+edit, test, install and delete freely, without asking.`;
 
-// Counterweight to the freedom granted just above, and to preludes that tell the
-// agent to be aggressive about changing files: "no permission needed" is not
-// "do more than was asked". The vendor prompts spend ~2KB on this; one paragraph
-// is the smallest version that still names the failure mode.
-const SCOPE = `Deliver the scope asked for: no extra features, refactors, files, or comments. If
-part of it is blocked, finish the rest and say what you left out.`;
+/**
+ * The counterweight, and the one thing neither harness says. Codex's permissions
+ * item mentions only that network access is enabled, which points the wrong way.
+ */
+const CREDENTIALS = `Pushing, opening or commenting on PRs, and posting anywhere outside the VM use real
+credentials, so ask first.`;
 
-// Both harnesses summarize and continue. Without this, context pressure reads as
-// a cue to wrap up, which is the wrong instinct for turns that run for minutes.
+/**
+ * Both harnesses summarize and continue, so context pressure is never a reason to
+ * stop — but the reason this earns its bytes is how the failure plays out here
+ * rather than that the vendors also say it.
+ *
+ * At a terminal, an agent that decides to hand off gets "keep going" typed at it a
+ * second later. An isolade chat runs unattended in its own VM, often alongside
+ * others, and long autonomous runs are the point of the product; the same wrong
+ * instinct is found much later, with the turn already ended. Expensive failure,
+ * slow correction loop, one sentence to prevent.
+ */
 const COMPACTION = `Context is summarized automatically as the session grows, so never wrap up early
-or hand off because the session is long.`;
+because the session is long.`;
 
-const REPORTING = `Report what you observed. Show failures. Say when you skipped a check. State
-verified results plainly, without hedging.`;
+/**
+ * Scope creep and overclaiming, together because both are about what the turn hands
+ * back rather than how it works.
+ *
+ * The scope half is structural, not stylistic. In an ordinary harness the permission
+ * prompt is what bounds an agent's blast radius: every risky call stops and asks,
+ * and a user declining is how "that is not what I meant" gets said early. SANDBOX
+ * above removes that mechanism outright, and a prelude may push the same way again.
+ * Something has to take over the job, and a sentence is the cheapest thing that can.
+ * It also matters more here than at a terminal because the output is a branch
+ * someone reviews, so extra work converts into review burden rather than visible
+ * mess.
+ *
+ * The reporting half covers what the user actually reads. Tool calls are on screen,
+ * but the artifact of a chat is the final message and the diff — so an unverified
+ * claim is what survives, and it is what would make the other lines here look
+ * satisfied when they are not.
+ */
+const DELIVERY = `Deliver the scope asked for, no more; if part of it is blocked, finish the rest and
+say what you left out. Report what you observed, failures included, and state
+verified results without hedging.`;
 
 // Explicit precedence, so a profile can override any default above without us
 // having to hedge each individual line.
@@ -85,13 +142,28 @@ const PRELUDE_PRECEDENCE = `The ${PRELUDE_HEADING} below are set by whoever conf
 Where they conflict with anything above, follow them instead.`;
 
 /**
- * Claude Code injects <system-reminder> blocks into the conversation no matter
- * what system prompt we set, and delivers CLAUDE.md inside one. Without this
- * line the model receives framing it was never told how to read. Codex has no
- * such mechanism, so the line would be describing something that never arrives.
+ * Claude Code injects <system-reminder> blocks into the conversation no matter what
+ * system prompt we set, and delivers CLAUDE.md inside one. Without this line the
+ * model receives framing it was never told how to read.
+ *
+ * Worth being precise about which injections this is for, because the loudest ones
+ * do NOT need it. A model switch arrives as three user messages that open with
+ * `<local-command-caveat>`, explaining themselves in full, and isolade's own
+ * cross-provider handoff carries the framing paragraph in envelope.ts. Anything that
+ * announces itself is already handled.
+ *
+ * What this covers is the rest, which arrives unannounced and mostly inside tool
+ * results: `<system-reminder>This file is already in your context`, `Warning: the
+ * file exists but the contents are empty`, `GitHub API rate limit exceeded`, the
+ * agent-type listing, `<bash-stdout>`/`<bash-stderr>` around background output. None
+ * of those say where they came from, and a model that reads one as the user speaking
+ * answers the wrong thing.
+ *
+ * Claude only. Codex has no such injection mechanism, so the line would be
+ * describing something that never arrives — its handoff arrives as ordinary input.
  */
-const SYSTEM_REMINDERS = `<system-reminder> blocks and similar injected text come from the harness, not the
-user. They carry context and bear no relation to the message they sit in.`;
+const SYSTEM_REMINDERS = `Injected text such as <system-reminder> comes from the harness, not the user, and
+bears no relation to the message it sits in.`;
 
 /**
  * The model line and the attribution trailer both interpolate the id rather than
@@ -109,17 +181,17 @@ function modelIdentity(modelName: string, modelId: string): string {
 // stops advertising a competing Co-Authored-By line; codex adds no attribution
 // of its own and needs no equivalent.
 function attribution(modelId: string): string {
-  return `When you commit, attribute the work to Isolade rather than adding yourself as a
-co-author: git commit --trailer "Assisted-by: Isolade:${modelId}"`;
+  return `Commit with git commit --trailer "Assisted-by: Isolade:${modelId}" rather than
+adding yourself as a co-author.`;
 }
 
 /**
  * Conditional on purpose: whether codex exposes a patch tool at all is decided
  * per model by the server-supplied models manifest
  * (`model_info.apply_patch_tool_type`, checked in core/src/tools/spec_plan.rs).
- * Capturing a real request showed nine tools and no apply_patch, so on some models
- * this is inert — hence "if", rather than telling the model to use a tool that may
- * not be there.
+ * Capturing a real request showed no apply_patch among the tools, so on some models
+ * this is inert. Hence a statement about how patches apply rather than an
+ * instruction to reach for a tool that may not be there.
  *
  * Worth the bytes where it does apply, because the failure is silent rather than
  * loud: codex-rs/apply-patch/src/seek_sequence.rs takes the FIRST context match,
@@ -131,24 +203,12 @@ co-author: git commit --trailer "Assisted-by: Isolade:${modelId}"`;
  * schema, which --system-prompt leaves untouched.
  */
 const CODEX_PATCH_RULES = `# Editing files
-If you edit files by writing a patch, note that the patch is applied at the FIRST
-place its context lines match, compared loosely enough to ignore whitespace, with
-no warning when more than one place would have matched. Too little context edits
-the wrong lines and still reports success.
+A patch applies at the FIRST place its context lines match, compared loosely enough
+to ignore whitespace, with no warning when more than one place matches, so too
+little context edits the wrong lines and still reports success. Give every change
+three unchanged lines above and below, and where three are not unique in the file,
+name the enclosing function or class.`;
 
-So give every change three lines of unchanged context above and below it, and where
-three lines are not unique in the file, name the enclosing function or class until
-the location is unambiguous.`;
-
-/**
- * Assemble the prompt for one chat.
- *
- * Block order is load-bearing for the prompt cache, which matches on the
- * longest identical leading bytes: the core is byte-identical across every chat,
- * the prelude across every chat in a profile, and only the model line varies
- * before them. Appending the prelude last keeps two chats in a profile sharing
- * a prefix instead of diverging at the first block.
- */
 /**
  * Claude concatenates the blocks of its system array with nothing in between, and
  * the block before ours is the SDK identity line ("You are a Claude agent, built
@@ -202,16 +262,23 @@ export function buildSystemPrompt(opts: {
     return { text: pad(minimal, opts.provider, "replace"), mode: "replace" };
   }
 
+  // Ordered stable-to-volatile, because the prompt cache matches on the longest
+  // identical leading bytes. Everything down to the patch rules is byte-identical
+  // across every chat on a provider; the two blocks that interpolate the model id
+  // sit together after it, so switching a chat's model invalidates only the tail
+  // rather than everything from the second block on. The prelude stays last
+  // regardless — PRELUDE_PRECEDENCE gives it the final word, and position should
+  // agree with that.
   const text = [
-    IDENTITY,
-    modelIdentity(modelName, opts.model),
-    PERMISSIONS,
+    identity(isClaude),
+    ...(isClaude ? [SANDBOX] : []),
+    CREDENTIALS,
     ...(isClaude ? [SYSTEM_REMINDERS] : []),
     COMPACTION,
-    REPORTING,
-    SCOPE,
-    attribution(opts.model),
+    DELIVERY,
     ...patchRules,
+    modelIdentity(modelName, opts.model),
+    attribution(opts.model),
     ...(prelude ? [PRELUDE_PRECEDENCE, ...preludeBlocks] : []),
   ].join("\n\n");
   return { text: pad(text, opts.provider, "replace"), mode: "replace" };

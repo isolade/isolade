@@ -33,7 +33,7 @@ describe("buildSystemPrompt", () => {
   it("explains <system-reminder> to Claude only", () => {
     // Claude Code injects these no matter what prompt we set. Codex has no such
     // mechanism, so the guidance would describe something that never arrives.
-    expect(claude()).toContain("<system-reminder> blocks");
+    expect(claude()).toContain("such as <system-reminder> comes from the harness");
     expect(codex()).not.toContain("<system-reminder>");
   });
 
@@ -43,7 +43,7 @@ describe("buildSystemPrompt", () => {
     // its prompt without these silently edits the wrong lines. Claude's Edit tool
     // states its own contract in a tool schema we never touch.
     expect(codex()).toContain("# Editing files");
-    expect(codex()).toContain("three lines of unchanged context");
+    expect(codex()).toContain("three unchanged lines above and below");
     expect(claude()).not.toContain("# Editing files");
   });
 
@@ -71,8 +71,26 @@ describe("buildSystemPrompt", () => {
     expect(claude()).toContain("Deliver the scope asked for");
   });
 
-  it("warns that installed software does not survive the session", () => {
-    expect(claude()).toContain("nothing you install survives this session");
+  it("says the permission layer is off to Claude only", () => {
+    // Codex injects a <permissions instructions> conversation item naming
+    // sandbox_mode danger-full-access and approval_policy never, so repeating it
+    // spends bytes telling codex something it has already read. Claude gets no
+    // environment block at all once --system-prompt replaces the CLI's prompt, and
+    // its Bash tool description still warns about permission prompts.
+    expect(claude()).toContain("no call is denied");
+    expect(codex()).not.toContain("no call is denied");
+  });
+
+  it("names the working tree to Claude only", () => {
+    // Same split: codex reads cwd and workspace_roots out of <environment_context>.
+    expect(claude()).toContain("working tree at /workspace");
+    expect(codex()).not.toContain("working tree");
+  });
+
+  it("keeps the credential boundary on both, since neither harness states it", () => {
+    for (const prompt of [claude(), codex()]) {
+      expect(prompt.replace(/\s+/g, " ")).toContain("real credentials, so ask first");
+    }
   });
 
   describe("base", () => {
@@ -199,6 +217,17 @@ describe("buildSystemPrompt", () => {
     // whitespace-collapsed text so hard-wrapping the prompt stays free.
     const prompt = claude().replace(/\s+/g, " ");
     expect(prompt).toContain("no call is denied");
-    expect(prompt).toContain("ask first before pushing");
+    expect(prompt).toContain("Pushing, opening or commenting on PRs");
+  });
+
+  it("puts the model-dependent blocks after the invariant ones", () => {
+    // Cache-prefix ordering: the two blocks that interpolate the model id are the
+    // only thing switching a chat's model changes, so they belong at the end. With
+    // them early, a switch invalidates the cached prefix from that point on.
+    const prompt = claude();
+    for (const invariant of ["no call is denied", "Context is summarized", "Deliver the scope"]) {
+      expect(prompt.indexOf(invariant)).toBeLessThan(prompt.indexOf("You are running Opus 5"));
+    }
+    expect(prompt.indexOf("You are running Opus 5")).toBeLessThan(prompt.indexOf("--trailer"));
   });
 });
