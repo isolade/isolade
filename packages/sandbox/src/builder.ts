@@ -17,6 +17,7 @@ import {
   getLocalRegistryPort,
 } from "./host-network";
 import { msbBinDir } from "./msb-home";
+import { formatElapsed, formatMiB, heartbeat, progressBytes, tickWhileQuiet } from "./progress";
 import { getHostCpuCount, getVmMemoryMib } from "./vms";
 
 const DEFAULT_BUILDKIT_IMAGE =
@@ -107,6 +108,13 @@ export class BuilderManager {
   }> | null = null;
   private hostIp: string | null = null;
   private registry: string | null = null;
+  // What ensureBuilder() is currently doing, for the heartbeat doRunBuild ticks
+  // while it waits. The boot is opaque and, on a first run, minutes long (a
+  // cache disk to format, two images to pull), so a build log that says
+  // "booting" once and then nothing reads as a hang. Held on the manager rather
+  // than passed in because bootBuilder is shared: a second caller awaiting the
+  // same `starting` promise watches the same phases.
+  private bootPhase = "booting the builder VM";
   // Single async chain that serializes builds and registry GC. GC is
   // destructive (deletes manifests + reclaims blobs) and the registry docs
   // require no concurrent writes during `garbage-collect`. Builds also push
@@ -204,8 +212,11 @@ export class BuilderManager {
     const image = this.opts.buildkitImage || DEFAULT_BUILDKIT_IMAGE;
     const networkPolicy = this.buildBuilderNetworkPolicy();
     const cacheDiskPath = resolveCacheDiskPath();
-    await ensureCacheDisk(cacheDiskPath, CACHE_DISK_SIZE_GIB);
+    await ensureCacheDisk(cacheDiskPath, CACHE_DISK_SIZE_GIB, (phase) => {
+      this.bootPhase = phase;
+    });
 
+    this.bootPhase = `booting the builder VM from ${image}`;
     console.log(`[builder] booting ${image}`);
     const sandbox = await Sandbox.builder(BUILDER_NAME)
       .image(image)
@@ -245,6 +256,7 @@ export class BuilderManager {
       // resolve back inside the destination. GNU tar checks the resolved path
       // instead, so the same symlink extracts fine. `tar` from apk lands in
       // /usr/bin and wins PATH precedence over /bin/tar (busybox).
+      this.bootPhase = "installing GNU tar in the builder";
       const apkTar = await sandbox.shell("apk add --no-cache tar");
       if (apkTar.code !== 0) {
         throw new Error(
@@ -318,6 +330,7 @@ export class BuilderManager {
         `[registry."${registry}"]\n` +
         `  http = true\n`;
       await sandbox.fs().write("/etc/buildkit/buildkitd.toml", Buffer.from(buildkitdToml));
+      this.bootPhase = "starting buildkitd";
       buildkitHandle = await this.startBuildkit(sandbox);
       await this.waitForBuildkit(sandbox);
     } catch (err) {
@@ -440,8 +453,21 @@ export class BuilderManager {
     // ensureBuilder() boots the VM if needed, which is what brings up the
     // libkrun bridge interface. Only after that can ensureConfig() detect
     // the host IP and resolve the registry endpoint.
+    //
+    // Heartbeat rather than a bare await: the first boot of an install formats
+    // the cache disk and pulls two images before it says anything, which is
+    // minutes of a log whose last line reads "Booting builder VM". Ticking with
+    // the phase and the elapsed time is what makes that a wait rather than a
+    // hang (the phases are set by bootBuilder, see `bootPhase`).
     yield "=== Booting builder VM ===";
-    const { sandbox } = await this.ensureBuilder();
+    const bootStartedAt = Date.now();
+    const booting = this.ensureBuilder();
+    yield* heartbeat(
+      booting,
+      5000,
+      () => `  ${this.bootPhase} (${formatElapsed(Date.now() - bootStartedAt)})`,
+    );
+    const { sandbox } = await booting;
     this.ensureConfig();
     const registry = this.registry!;
 
@@ -647,15 +673,23 @@ export class BuilderManager {
     // `msb` is the canonical binary (`microsandbox` is just a symlink to it).
     // It inherits MSB_HOME/MSB_PATH from this process, so the pull lands in
     // isolade's isolated cache.
-    for await (const line of this.runHostStreaming([
-      join(msbBinDir(), "msb"),
-      "pull",
-      "--insecure",
-      "--info",
-      finalRefCache,
-    ])) {
-      yield line;
-    }
+    //
+    // Quiet by design, then, and this step decompresses and re-writes every
+    // layer of a multi-GB image as EROFS, so it is minutes of nothing right
+    // where the build otherwise looks finished. tickWhileQuiet keeps the
+    // elapsed time moving between whatever msb does have to say.
+    const ingestStartedAt = Date.now();
+    yield* tickWhileQuiet(
+      this.runHostStreaming([
+        join(msbBinDir(), "msb"),
+        "pull",
+        "--insecure",
+        "--info",
+        finalRefCache,
+      ]),
+      5000,
+      () => `  writing layers (${formatElapsed(Date.now() - ingestStartedAt)})`,
+    );
 
     // Register the fresh ref in the building client's keep-set NOW, while this
     // build still holds the opChain slot. Any sweep queued behind us computes
@@ -1032,7 +1066,11 @@ async function killHandle(handle: ExecHandle): Promise<void> {
 // builder VM then refused to mount it and exited mid-boot). On any failure
 // during provisioning, the partial file is removed so the next call
 // retries cleanly.
-async function ensureCacheDisk(diskPath: string, sizeGib: number): Promise<void> {
+async function ensureCacheDisk(
+  diskPath: string,
+  sizeGib: number,
+  onPhase: (phase: string) => void = () => {},
+): Promise<void> {
   if (await isExt4(diskPath)) {
     // fstrim from inside the VM can shrink this file on macOS: imago's
     // virtio-blk DISCARD path (try_discard_by_truncate in imago/src/file.rs)
@@ -1083,6 +1121,7 @@ async function ensureCacheDisk(diskPath: string, sizeGib: number): Promise<void>
     await fh.close();
   }
 
+  onPhase("preparing the build cache disk, once per install");
   console.log(`[builder] formatting ${diskPath} as ext4 (one-time, ~30s on first run)`);
   // Outer try/catch so a Sandbox.builder().create() failure (image pull
   // auth error, network blip, etc.) also cleans up the truncated file.
@@ -1156,56 +1195,6 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
       setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms),
     ),
   ]);
-}
-
-function formatMiB(bytes: number): string {
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
-}
-
-// Yields `msg()` every `intervalMs` until `p` settles. Used to keep the SSE
-// stream alive while we await opaque long operations (request-body spool,
-// fs.copyFromHost, tar extract) that don't produce their own progress.
-async function* heartbeat<T>(
-  p: Promise<T>,
-  intervalMs: number,
-  msg: () => string,
-): AsyncGenerator<string> {
-  let done = false;
-  p.finally(() => {
-    done = true;
-  }).catch(() => {});
-  while (!done) {
-    await new Promise<void>((r) => setTimeout(r, intervalMs));
-    if (done) break;
-    yield msg();
-  }
-}
-
-// Like heartbeat, but each tick runs an async `probe()` to discover the
-// current byte count (e.g. via `stat` or `du` in the guest) and formats it
-// with `fmt(bytes)`. Skips probe errors (transient ENOENT before the file
-// appears, dropped exec channels), because they shouldn't kill the build.
-async function* progressBytes<T>(
-  p: Promise<T>,
-  intervalMs: number,
-  probe: () => Promise<number>,
-  fmt: (bytes: number) => string,
-): AsyncGenerator<string> {
-  let done = false;
-  p.finally(() => {
-    done = true;
-  }).catch(() => {});
-  while (!done) {
-    await new Promise<void>((r) => setTimeout(r, intervalMs));
-    if (done) break;
-    try {
-      const bytes = await probe();
-      if (done) break;
-      yield fmt(bytes);
-    } catch {
-      // Swallow probe failures, since they shouldn't abort the operation.
-    }
-  }
 }
 
 // Spools a stream to a host tempfile so we can hand the path to copyFromHost.

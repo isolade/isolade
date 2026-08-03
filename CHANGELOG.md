@@ -15,6 +15,9 @@ _Changes landed on `main` that haven't shipped in a release yet._
 
 ### Changed
 
+- Build logs no longer go quiet for minutes at a time. The stretches that used
+  to say nothing, booting the builder and taking the finished image into the
+  cache, now report what they are doing and how long it has taken.
 - The model picker now offers only models you can actually run.
 - Agent messages are now set in a sans-serif face by default. If you had picked
   serif, that sticks, and Settings still offers serif and any font on your
