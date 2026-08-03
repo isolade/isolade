@@ -83,7 +83,11 @@ describe("setting up your own", () => {
 
 describe("the Dockerfile step", () => {
   const html = renderToStaticMarkup(
-    <DockerfileStep value={"FROM ubuntu:24.04\nRUN apt-get update\n"} onChange={() => {}} />,
+    <DockerfileStep
+      value={"FROM ubuntu:24.04\nRUN apt-get update\n"}
+      source="composed"
+      onChange={() => {}}
+    />,
   );
 
   it("shows the file, highlighted the way Settings shows it", () => {
@@ -102,6 +106,20 @@ describe("the Dockerfile step", () => {
 
   it("says where the file lives afterwards", () => {
     expect(html).toContain("Settings, Dockerfile");
+  });
+
+  it("describes a scaffold as installing no dependencies", () => {
+    expect(html).toContain("installs no project dependencies");
+  });
+
+  it("does not say that of the demo, whose file does install them", () => {
+    // The demo pays for `yarn install` at build time on purpose, so the
+    // scaffold's line would be describing the opposite of the file on screen.
+    const demo = renderToStaticMarkup(
+      <DockerfileStep value={"FROM node:22\n"} source="demo" onChange={() => {}} />,
+    );
+    expect(demo).not.toContain("installs no project dependencies");
+    expect(demo).toContain("dependencies during the build");
   });
 });
 
@@ -139,7 +157,7 @@ describe("the build step", () => {
 
   it("says the wait is expected, and that leaving does not stop it", () => {
     expect(html).toContain("first build is the slow one");
-    expect(html).toContain("closing this card does not stop it");
+    expect(html).toContain("Closing this card does not stop it");
   });
 
   it("offers nothing that closes the card, since the card has that", () => {

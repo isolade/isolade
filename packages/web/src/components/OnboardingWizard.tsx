@@ -40,6 +40,11 @@ import { ProviderSignIn } from "./ProvidersTab";
  *  picture. */
 type StepId = "signin" | "branch" | "dockerfile" | "build";
 
+/** Which way the run went, which the Dockerfile step needs because the two
+ *  files differ in the one respect worth saying out loud: a scaffold installs no
+ *  project dependencies, and the demo's does. */
+export type DockerfileSource = "demo" | "composed";
+
 const STEP_TITLES: Record<StepId, string> = {
   signin: "Sign in to an agent",
   branch: "Choose what to work on",
@@ -85,6 +90,7 @@ export default function OnboardingWizard({ onClose, onProfileCreated }: Onboardi
   // read back from the server, since the step that wrote it knows it and the
   // footer button that builds it has to see the edits.
   const [dockerfile, setDockerfileDraft] = useState("");
+  const [dockerfileSource, setDockerfileSource] = useState<DockerfileSource>("composed");
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
 
@@ -144,16 +150,22 @@ export default function OnboardingWizard({ onClose, onProfileCreated }: Onboardi
     >
       {step === "branch" && (
         <BranchStep
-          onCreated={(profile, composed) => {
+          onCreated={(profile, composed, source) => {
             setCreated(profile);
             setDockerfileDraft(composed);
+            setDockerfileSource(source);
             onProfileCreated?.(profile);
             advance();
           }}
         />
       )}
       {step === "dockerfile" && (
-        <DockerfileStep value={dockerfile} onChange={setDockerfileDraft} error={startError} />
+        <DockerfileStep
+          value={dockerfile}
+          source={dockerfileSource}
+          onChange={setDockerfileDraft}
+          error={startError}
+        />
       )}
       {step === "build" && created && (
         <BuildStep profileId={created.id} onStatus={setBuildStatus} />
@@ -230,21 +242,35 @@ function WizardCard({
  *  Controlled by the card, which holds the text and writes it on the way out. */
 export function DockerfileStep({
   value,
+  source,
   onChange,
   error,
 }: {
   value: string;
+  source: DockerfileSource;
   onChange: (value: string) => void;
   error?: string | null;
 }) {
   return (
     <div className="flex flex-col gap-3">
-      <p className="text-muted-foreground text-xs">
-        Written from your answers, and yours to change. It installs no project dependencies on
-        purpose, so the first build cannot fail on them: an agent can do that in the VM and tell you
-        what it needed, which is a line to add here once you know. This same file is under Settings,
-        Dockerfile afterwards.
-      </p>
+      {source === "demo" ? (
+        // The demo's file does install its dependencies (see onboarding-demo.ts
+        // for why), so it must not be described with the scaffold's line about
+        // deliberately not doing that.
+        <p className="text-muted-foreground text-xs">
+          Excalidraw's environment, and yours to change like any other profile's. It installs the
+          project's dependencies during the build, which is most of why the first one is slow, so
+          that an instance starts with a tree that runs. This same file is under Settings,
+          Dockerfile afterwards.
+        </p>
+      ) : (
+        <p className="text-muted-foreground text-xs">
+          Written from your answers, and yours to change. It installs no project dependencies on
+          purpose, so the first build cannot fail on them: an agent can do that in the VM and tell
+          you what it needed, which is a line to add here once you know. This same file is under
+          Settings, Dockerfile afterwards.
+        </p>
+      )}
       <CodeEditor
         value={value}
         onChange={onChange}
@@ -299,7 +325,7 @@ export function ChooserStep({
   onCreated,
   onCustom,
 }: {
-  onCreated: (profile: ProfileSummary, dockerfile: string) => void;
+  onCreated: (profile: ProfileSummary, dockerfile: string, source: DockerfileSource) => void;
   onCustom: () => void;
 }) {
   const [busy, setBusy] = useState(false);
@@ -318,7 +344,7 @@ export function ChooserStep({
       // The dev server's port, forwarded from the moment an instance exists, so
       // the preview is ready for it before anything is listening.
       await setNetworkConfig(profile.id, demo.network);
-      onCreated(profile, demo.dockerfile);
+      onCreated(profile, demo.dockerfile, "demo");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setBusy(false);
@@ -396,7 +422,7 @@ export function CustomStep({
   onCreated,
   onBack,
 }: {
-  onCreated: (profile: ProfileSummary, dockerfile: string) => void;
+  onCreated: (profile: ProfileSummary, dockerfile: string, source: DockerfileSource) => void;
   onBack: () => void;
 }) {
   const [name, setName] = useState("");
@@ -438,7 +464,7 @@ export function CustomStep({
       // Written, not built. The next step shows this file, and the build starts
       // from there with whatever it says by then.
       await setDockerfile(profile.id, dockerfile);
-      onCreated(profile, dockerfile);
+      onCreated(profile, dockerfile, "composed");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setBusy(false);
@@ -688,8 +714,9 @@ export function BuildStep({
           </p>
           <p className="text-muted-foreground text-xs">
             The first build is the slow one. BuildKit boots in its own VM and the base image is
-            pulled once, and later builds skip both. Minutes rather than seconds, and closing this
-            card does not stop it.
+            pulled once, and later builds skip both. Minutes rather than seconds. Closing this card
+            does not stop it: the workspace behind it waits on the same build and lets you in when
+            it lands.
           </p>
         </div>
       )}
@@ -733,7 +760,7 @@ export function BuildStep({
 export function BranchStep({
   onCreated,
 }: {
-  onCreated: (profile: ProfileSummary, dockerfile: string) => void;
+  onCreated: (profile: ProfileSummary, dockerfile: string, source: DockerfileSource) => void;
 }) {
   const [own, setOwn] = useState(false);
   return own ? (
