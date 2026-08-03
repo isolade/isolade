@@ -212,20 +212,25 @@ export function ChooserStep({
         Two ways in. The demo is a real project, set up and ready to run, for seeing an agent work
         before setting anything up yourself.
       </p>
-      <div className="grid grid-cols-2 gap-3">
-        <div className="flex flex-col gap-2 rounded-lg border border-border p-4">
-          <span className="flex items-center gap-1.5 font-medium text-sm">
-            <Sparkles className="size-3.5" />
-            The Excalidraw demo
-          </span>
-          <p className="flex-1 text-muted-foreground text-xs">
-            Excalidraw, cloned and built for you, with its dev server ready to start. Nothing on
-            your machine is touched, and the drawing app shows up in the preview once an agent runs
-            it.
-          </p>
+      {/* One above the other rather than side by side. The demo is the way in for
+          someone who has not decided yet, so it reads first instead of competing
+          with the other half of a row. */}
+      <div className="flex flex-col gap-3">
+        <div className="flex items-center justify-between gap-4 rounded-lg border border-border p-4">
+          <div className="flex min-w-0 flex-col gap-1">
+            <span className="flex items-center gap-1.5 font-medium text-sm">
+              <Sparkles className="size-3.5" />
+              The Excalidraw demo
+            </span>
+            <p className="text-muted-foreground text-xs">
+              Excalidraw, cloned and built for you, with its dev server ready to start. Nothing on
+              your machine is touched, and the drawing app shows up in the preview once an agent
+              runs it.
+            </p>
+          </div>
           <Button
             size="sm"
-            className="h-8 w-full text-xs"
+            className="h-8 shrink-0 text-xs"
             disabled={busy}
             onClick={() => void createDemo()}
           >
@@ -233,19 +238,21 @@ export function ChooserStep({
             Use the demo
           </Button>
         </div>
-        <div className="flex flex-col gap-2 rounded-lg border border-border p-4">
-          <span className="flex items-center gap-1.5 font-medium text-sm">
-            <FolderGit2 className="size-3.5" />
-            Your own code
-          </span>
-          <p className="flex-1 text-muted-foreground text-xs">
-            Name the profile, point it at the repositories the work touches, and say what the image
-            should carry. Isolade writes the Dockerfile from your answers.
-          </p>
+        <div className="flex items-center justify-between gap-4 rounded-lg border border-border p-4">
+          <div className="flex min-w-0 flex-col gap-1">
+            <span className="flex items-center gap-1.5 font-medium text-sm">
+              <FolderGit2 className="size-3.5" />
+              Your own code
+            </span>
+            <p className="text-muted-foreground text-xs">
+              Name the profile, point it at the repositories the work touches, and say what the
+              image should carry. Isolade writes the Dockerfile from your answers.
+            </p>
+          </div>
           <Button
             size="sm"
             variant="secondary"
-            className="h-8 w-full text-xs"
+            className="h-8 shrink-0 text-xs"
             disabled={busy}
             onClick={() => onCustom()}
           >
