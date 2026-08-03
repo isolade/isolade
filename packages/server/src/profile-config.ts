@@ -12,6 +12,8 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
   internetAccessSchema,
+  type PromptBase,
+  promptBaseSchema,
   type SecretInjectMode,
   secretDeclarationSchema,
   secretInjectModeSchema,
@@ -244,12 +246,14 @@ export const runtimeTableSchema = z
   })
   .strict();
 
-// [prompt]: chat augmentation. `prelude` is prepended (invisibly) to the first
-// user message of every new chat in this profile — the DB stores the original
-// content; only the message sent to the chat backend is augmented.
+// [prompt]: the system prompt agents in this profile run on. `prelude` is the
+// profile's own instructions, always appended and always taking precedence.
+// `base` picks what sits in front of it: Isolade's sandbox brief (the default),
+// the agent CLI's own stock prompt, or nothing.
 export const promptTableSchema = z
   .object({
     prelude: z.string().optional(),
+    base: promptBaseSchema.optional(),
   })
   .strict();
 
@@ -404,8 +408,11 @@ export interface ResolvedProfileConfig {
   /** DEV-ONLY: host profile ids to seed into the nested isolade (config dirs +
    * built image refs). Only meaningful with exposeSandbox. See seed.ts. */
   seedProfiles: string[];
-  /** Prepended to the first user message of every new chat. */
+  /** The profile's own system-prompt instructions, appended below Isolade's core
+   * prompt and taking precedence over it. See promptTableSchema. */
   prelude: string | null;
+  /** Which base prompt precedes the prelude. See promptTableSchema. */
+  promptBase: PromptBase;
   /** Skill packages to install via `npx skills add` in the agent layer. */
   skills: string[];
   /** Secrets the profile declares. Values are supplied separately from the store. */
@@ -670,6 +677,7 @@ export function loadProfileConfig(profileId: string): ResolvedProfileConfig {
       exposeSandbox: config.expose_sandbox,
       seedProfiles: config.seed_profiles,
       prelude: config.prompt?.prelude || null,
+      promptBase: config.prompt?.base ?? "isolade",
       skills: build.skills,
       secrets: resolveSecretDeclarations(config.secrets),
       init: {

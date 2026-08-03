@@ -590,8 +590,15 @@ export const EMPTY_RUNTIME_CONFIG: RuntimeConfig = {
 // The prelude prepended (invisibly) to the first user message of every new chat
 // in the profile. Edited on the Prompt settings section, saved to config.toml's
 // `[prompt]` table. Empty string means "no prelude".
+// Which base prompt sits in front of the profile's prelude. "isolade" is our own
+// sandbox brief, "cli" is whatever Claude Code or Codex ships, "none" is nothing
+// at all. The prelude is appended in every case.
+export const promptBaseSchema = z.enum(["isolade", "cli", "none"]);
+export type PromptBase = z.infer<typeof promptBaseSchema>;
+
 export const promptConfigSchema = z.object({
   prelude: z.string(),
+  base: promptBaseSchema.default("isolade"),
 });
 export type PromptConfig = z.infer<typeof promptConfigSchema>;
 

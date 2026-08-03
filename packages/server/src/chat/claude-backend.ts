@@ -2,6 +2,7 @@ import type { ChatManager } from "../chats";
 import { type ChatEffort, type ContextBreakdown, findChatModel } from "../contracts";
 import { KeyedQueue } from "../keyed-queue";
 import type { SandboxApi } from "../sandbox-client";
+import { shellQuote } from "../shell";
 import {
   addUsage,
   type ChatBackend,
@@ -14,6 +15,7 @@ import {
   type UserMessageReceipt,
 } from "./backend";
 import { ClaudeSession, type TurnHooks } from "./claude-session";
+import type { IsoladeSystemPrompt } from "./system-prompt";
 import {
   buildTitleCommand,
   buildTitlePrompt,
@@ -24,6 +26,12 @@ import {
 } from "./title-generator";
 
 const CLAUDE_EFFORTS = new Set<ChatEffort>(["low", "medium", "high", "xhigh", "max"]);
+
+// Identity of a launched process's prompt, for deciding whether a live process
+// can be reused. Both halves matter: the text and the flag it was passed under.
+function promptKey(prompt: IsoladeSystemPrompt | undefined): string | null {
+  return prompt ? `${prompt.mode}:${prompt.text}` : null;
+}
 
 // Bound on a single warm-session title turn. The cold one-shot path had a 20s
 // exec timeout. The persistent session has no built-in timeout, so we cap the
@@ -254,6 +262,9 @@ export class ClaudeBackend implements ChatBackend {
       command: buildTitleSessionCommand(TITLE_MODEL),
       model: TITLE_MODEL,
       effort: undefined,
+      // Titling passes its own --system-prompt (the summarizer instruction), so
+      // it never participates in the chat prompt's launch-time comparison.
+      systemPrompt: null,
       // Titling is a cheap one-shot on a small model and never fast: it would
       // pay a premium rate for a sentence nobody is waiting on.
       fast: false,
@@ -278,6 +289,7 @@ export class ClaudeBackend implements ChatBackend {
     onEvent?: (event: ChatEvent) => void;
     onMeta?: (meta: TurnMeta) => void;
     fast?: boolean;
+    systemPrompt?: IsoladeSystemPrompt;
     onBilling?: (models: ModelBilling[]) => void;
     onUserMessageAcknowledged?: (receipt?: UserMessageReceipt) => void;
   }): Promise<{ content: string; sessionId?: string }> {
@@ -291,7 +303,20 @@ export class ClaudeBackend implements ChatBackend {
     const fork = opts.sessionId ? opts.fork : undefined;
 
     let session = this.sessions.get(opts.chatId);
-    if (session && (fork !== undefined || session.isDead() || session.vmId !== opts.vmId)) {
+    // The system prompt is a launch-time flag, so a live process cannot be
+    // re-prompted the way model/effort can be re-configured. It carries the
+    // model id (identity line and attribution trailer), so a mid-chat model
+    // switch changes it and reconfigure alone would leave the process claiming
+    // the old model and committing a wrong trailer. Retire it instead: the next
+    // turn relaunches with --resume, so only process warmth is lost.
+    // Compare text AND mode: switching a profile from "keep the CLI's prompt" to
+    // "no prompt" changes which flag the process launched with, not just its text.
+    const promptChanged =
+      session !== undefined && promptKey(opts.systemPrompt) !== session.systemPrompt;
+    if (
+      session &&
+      (fork !== undefined || promptChanged || session.isDead() || session.vmId !== opts.vmId)
+    ) {
       // A dead or wrong-VM session can't be reused. A fork turn also always
       // retires the live process: there is no control request to rewind a
       // live conversation, so it's positioned at the old branch's tail, and
@@ -343,6 +368,7 @@ export class ClaudeBackend implements ChatBackend {
         claudeEffort,
         opts.sessionId,
         fork,
+        opts.systemPrompt,
       );
       this.sessions.set(opts.chatId, created);
       session = created;
@@ -424,6 +450,7 @@ export class ClaudeBackend implements ChatBackend {
     effort: string | undefined,
     resumeSessionId: string | undefined,
     fork?: { anchorId: string },
+    systemPrompt?: IsoladeSystemPrompt,
   ): string {
     const args = [
       "claude",
@@ -494,6 +521,29 @@ export class ClaudeBackend implements ChatBackend {
       "Task",
       "Workflow",
     ];
+    // Blank both attribution strings, unconditionally. The CLI resolves them
+    // into the Bash tool's commit/PR guidance, which we do NOT override (tool
+    // descriptions are untouched by --system-prompt), so at their defaults the
+    // tool would advertise `Co-Authored-By: Claude` against the Isolade trailer
+    // our prompt asks for. Blanking `pr` also drops the "Generated with Claude
+    // Code" footer from PR bodies. Applied even for a prelude-only profile, which
+    // therefore gets no trailer at all unless its prelude supplies one.
+    args.push("--settings", shellQuote(JSON.stringify({ attribution: { commit: "", pr: "" } })));
+    // `replace` swaps the CLI's own prompt for ours, and does so even when the
+    // text is empty: `--system-prompt ""` is exactly how a profile asks for no
+    // prompt at all. `append` keeps the CLI's prompt and layers the prelude on
+    // top, so with nothing to add it is simply omitted.
+    //
+    // Either way the value travels in a shell variable rather than inline:
+    // preludes are user-authored and unbounded, and the whole command is one
+    // string sent to the VM, so a long one would run into ARG_MAX. base64 also
+    // makes it injection-safe regardless of its contents (the alphabet is
+    // `[A-Za-z0-9+/=]`, so the single-quoted literal cannot be escaped).
+    if (systemPrompt?.mode === "replace") {
+      args.push("--system-prompt", '"$ISOLADE_SP"');
+    } else if (systemPrompt?.text) {
+      args.push("--append-system-prompt", '"$ISOLADE_SP"');
+    }
     if (effort) {
       args.push("--effort", effort);
     }
@@ -509,7 +559,11 @@ export class ClaudeBackend implements ChatBackend {
       // `system/init` event, and the turn hooks below pick it up from there.
       args.push("--resume-session-at", fork.anchorId, "--fork-session");
     }
-    return args.join(" ");
+    const command = args.join(" ");
+    // Bind the variable only when a flag above actually referenced it.
+    if (!command.includes("ISOLADE_SP")) return command;
+    const b64 = Buffer.from(systemPrompt?.text ?? "", "utf8").toString("base64");
+    return `ISOLADE_SP="$(printf %s '${b64}' | base64 -d)"; ${command}`;
   }
 
   private createChatSession(
@@ -519,13 +573,15 @@ export class ClaudeBackend implements ChatBackend {
     effort: string | undefined,
     sessionId: string | undefined,
     fork?: { anchorId: string },
+    systemPrompt?: IsoladeSystemPrompt,
   ): ClaudeSession {
     const created = new ClaudeSession({
       sandboxClient: this.sandboxClient,
       vmId,
-      command: this.buildCommand(model, effort, sessionId, fork),
+      command: this.buildCommand(model, effort, sessionId, fork, systemPrompt),
       model,
       effort,
+      systemPrompt: promptKey(systemPrompt),
       // A fresh CLI always starts standard: fast mode has no command-line flag,
       // so a chat that wants it gets switched over by the reconfigure below.
       fast: false,
@@ -1010,6 +1066,11 @@ export class ClaudeBackend implements ChatBackend {
     model: string;
     effort: ChatEffort;
     sessionId?: string;
+    // Needed even though a probe sends no user turn: when the idle reaper has
+    // already retired the process, the relaunch below becomes the chat's new
+    // live process. Omitting it here would silently move the chat onto the
+    // stock harness prompt for every turn after someone opened /context.
+    systemPrompt?: IsoladeSystemPrompt;
   }): Promise<ContextBreakdown> {
     if (!opts.sessionId) {
       return {
@@ -1050,6 +1111,8 @@ export class ClaudeBackend implements ChatBackend {
         opts.model,
         claudeEffort,
         opts.sessionId,
+        undefined,
+        opts.systemPrompt,
       );
       this.sessions.set(opts.chatId, session);
     }

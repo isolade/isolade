@@ -6,6 +6,39 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+### Added
+
+- Settings → Prompt now lets a profile choose its agents' base prompt: Isolade's
+  own, the one Claude Code or Codex ships, or none at all. Your instructions are
+  added below whichever you pick, so "none" makes them the entire prompt. Stored
+  as `base` in the profile's `config.toml`. Codex chats keep a short note about
+  its patch format in the first two cases, because its file-editing tool applies
+  a change at the first place that looks like a match and edits can otherwise
+  land in the wrong place.
+
+### Changed
+
+- Agents now run on a system prompt written for Isolade instead of the one their
+  CLI ships by default. The stock prompt assumes a terminal, a permission prompt
+  in front of every risky action, and a machine you care about keeping. None of
+  that describes a throwaway VM, so it has been replaced with a short brief that
+  says what is actually true: local work is free and needs no confirmation,
+  while pushing, opening PRs, and sending messages reach outside the VM and
+  should be checked first.
+- Agents are told exactly which model they are running, which they previously
+  could not always tell. Codex only tells its models they are "based on GPT-5",
+  so a Sol or Terra chat had no way to name itself.
+- Commits are attributed with an `Assisted-by: Isolade:<model-id>` trailer, and
+  the agent's own `Co-Authored-By` line and "Generated with" PR footer are off.
+  The model id is filled in for the agent rather than guessed by it.
+- A profile's prelude is now part of the system prompt rather than hidden in
+  your first message. It carries more weight there, applies for the whole chat
+  instead of only the first turn, and survives the long-conversation
+  summarization that could previously drop it. Prelude instructions also
+  explicitly override the defaults above them, so a profile can change any of
+  them. Editing a prelude affects new chats, and existing ones once their
+  session restarts.
+
 ### Fixed
 
 - On macOS, the window can now be dragged from the title-bar area while Settings

@@ -380,7 +380,7 @@ describe("Claude transcript reconstruction", () => {
 describe("capacity estimation", () => {
   const capacity = { contextWindow: 100_000 };
   const parts = (summaryText: string, userMessage = "answer this") => ({
-    prelude: null,
+    systemPrompt: "",
     handoff: {
       version: 1,
       source: "anthropic" as const,

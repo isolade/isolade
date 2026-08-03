@@ -3,6 +3,7 @@
 // in here knows about either provider's wire format. That lives in the
 // respective backend.
 import type { ChatEffort, ContextBreakdown } from "../contracts";
+import type { IsoladeSystemPrompt } from "./system-prompt";
 
 // Token-usage breakdown shared by both providers. We keep the three input
 // buckets separate because they're weighted very differently for both billing
@@ -185,6 +186,13 @@ export interface ChatBackend {
     // Off unless the chat opted in. Claude applies it to the live process, codex
     // ignores it for now.
     fast?: boolean;
+    // Isolade's own system prompt for this chat, built by `buildSystemPrompt`
+    // (core + the profile's prelude). Claude replaces its prompt with it; codex
+    // layers it on top as developer instructions. Fixed for the life of a
+    // provider process, so a change retires and relaunches it. Empty text means
+    // the profile turned the core off and has no prelude, so the agent runs on
+    // the CLI's own default prompt.
+    systemPrompt?: IsoladeSystemPrompt;
     signal?: AbortSignal;
     onDelta: (text: string) => void;
     onEvent?: (event: ChatEvent) => void;
@@ -237,6 +245,7 @@ export interface ChatBackend {
     model: string;
     effort: ChatEffort;
     sessionId?: string;
+    systemPrompt?: IsoladeSystemPrompt;
   }): Promise<ContextBreakdown>;
 
   // Mint a short chat title from the chat's first user message, running the

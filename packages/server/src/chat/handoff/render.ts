@@ -5,10 +5,11 @@ import type { PortableHandoff } from "./types";
 // only `userMessage` and its attachment metadata; this assembled string is what
 // the target native transcript stores.
 export interface FirstTargetPromptParts {
-  // The normal Isolade environment prelude for a fresh session, already wrapped
-  // by the caller exactly as an ordinary first turn wraps it. Null when the
-  // instance has no profile prelude.
-  prelude: string | null;
+  // Isolade's system prompt for the target (core + profile prelude). It is sent
+  // as system-level text rather than inside this message, so it is NOT part of
+  // the rendered string — it is carried here only because it is unavoidable
+  // overhead on the same request and the estimate has to account for it.
+  systemPrompt: string;
   handoff: PortableHandoff;
   // The attachments preamble for the CURRENT user message (cites each file's
   // absolute VM path), or null when the message has none.
@@ -17,16 +18,14 @@ export interface FirstTargetPromptParts {
   userMessage: string;
 }
 
-// Assemble the first target prompt in the required order:
-//   1. environment prelude, 2. handoff envelope, 3. current attachments,
-//   4. current user message.
-// The handoff envelope sits between the prelude and the current turn so the
-// target reads "here is the environment, here is prior context, now answer
-// this". Parts are joined with blank lines, matching the ordinary turn
-// assembly.
+// Assemble the first target user message in the required order:
+//   1. handoff envelope, 2. current attachments, 3. current user message.
+// The environment no longer appears here — it moved to the system prompt — so
+// the target reads "here is prior context, now answer this", with the
+// environment already in front of it. Parts are joined with blank lines,
+// matching the ordinary turn assembly.
 export function renderFirstTargetPrompt(parts: FirstTargetPromptParts): string {
   const segments: string[] = [];
-  if (parts.prelude) segments.push(`<prelude>\n${parts.prelude}\n</prelude>`);
   segments.push(renderHandoffEnvelope(parts.handoff));
   if (parts.attachmentsPreamble) segments.push(parts.attachmentsPreamble);
   if (parts.userMessage.length > 0) segments.push(parts.userMessage);

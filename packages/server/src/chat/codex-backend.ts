@@ -18,6 +18,7 @@ import {
   usageTokenCount,
 } from "./backend";
 import { type CodexConnection, CodexManager } from "./codex-manager";
+import type { IsoladeSystemPrompt } from "./system-prompt";
 import { buildTitlePrompt, CODEX_TITLE_MODEL, cleanTitle } from "./title-generator";
 
 // How long a single title turn may run before we give up and let the caller
@@ -89,6 +90,7 @@ export class CodexBackend implements ChatBackend {
     conn: CodexConnection,
     chatId: string,
     sessionId: string | undefined,
+    systemPrompt: IsoladeSystemPrompt | undefined,
   ): Promise<string> {
     if (sessionId) {
       try {
@@ -101,13 +103,53 @@ export class CodexBackend implements ChatBackend {
         );
       }
     }
-    const threadId = await this.startThread(conn);
+    const threadId = await this.startThread(conn, systemPrompt);
     this.chatManager.updateSessionId(chatId, undefined, threadId);
     return threadId;
   }
 
-  private async startThread(conn: CodexConnection): Promise<string> {
-    const result = (await conn.send("thread/start", { ephemeral: false })) as {
+  // Two ways to give codex a prompt, and they are different KINDS of thing, not
+  // two spellings of the same one:
+  //
+  //   baseInstructions       becomes the request's `instructions` slot, replacing
+  //                          codex's own prompt (and clearing the per-model
+  //                          instruction template, models-manager/model_info.rs).
+  //                          What "Isolade's" and "None" both want. Safe only
+  //                          because buildSystemPrompt puts CODEX_PATCH_RULES in
+  //                          that text: tool specs are sent regardless, so
+  //                          apply_patch keeps its grammar, but how much context a
+  //                          hunk needs is stated only in the prompt we replaced.
+  //
+  //   developerInstructions  becomes a developer-ROLE MESSAGE in the conversation
+  //                          input (core/src/session/mod.rs pushes it into
+  //                          developer_sections → build_developer_update_item),
+  //                          rebuilt from session config every turn, leaving
+  //                          codex's own prompt intact. What "The agent's own"
+  //                          wants, and there the only option available.
+  //
+  // Which is why the prelude is not always sent this way. For the two replace
+  // cases it stays inside baseInstructions alongside our core, so the "where they
+  // conflict, follow these instead" precedence is plain text in one block rather
+  // than an argument across a channel boundary between an instructions slot and a
+  // conversation item.
+  //
+  // Both are start-only: `thread/resume` and `turn/start` accept neither. They do
+  // persist across resume (codex keeps them in the thread's collaboration-mode
+  // settings), so setting them once here is enough — but it also means a mid-chat
+  // model switch leaves the prompt naming the model the thread started with, since
+  // there is no way to re-supply it.
+  private async startThread(
+    conn: CodexConnection,
+    systemPrompt: IsoladeSystemPrompt | undefined,
+  ): Promise<string> {
+    const field = systemPrompt?.mode === "replace" ? "baseInstructions" : "developerInstructions";
+    const result = (await conn.send("thread/start", {
+      ephemeral: false,
+      // Drops codex's ~2KB personality section, which is tone guidance for a
+      // chat assistant and not something we want shaping a coding agent.
+      personality: "none",
+      ...(systemPrompt?.text ? { [field]: systemPrompt.text } : {}),
+    })) as {
       thread: { id: string };
     };
     const threadId = result.thread.id;
@@ -222,6 +264,9 @@ export class CodexBackend implements ChatBackend {
     effort: ChatEffort;
     // Run this turn on the fast (priority) service tier, at its premium rates.
     fast?: boolean;
+    // Only consulted when this turn starts a NEW thread: codex accepts developer
+    // instructions at thread/start and nowhere else. See startThread.
+    systemPrompt?: IsoladeSystemPrompt;
     sessionId?: string; // codexThreadId
     userMessageId?: string;
     fork?: { anchorId: string }; // anchorId = the turn id to fork through
@@ -249,7 +294,7 @@ export class CodexBackend implements ChatBackend {
       threadId =
         opts.fork && opts.sessionId
           ? await this.forkThread(conn, opts.chatId, opts.sessionId, opts.fork.anchorId)
-          : await this.resolveThread(conn, opts.chatId, opts.sessionId);
+          : await this.resolveThread(conn, opts.chatId, opts.sessionId, opts.systemPrompt);
     } catch (err) {
       await this.refreshAuthAfterPossibleStaleState(opts.vmId, err);
       throw err;

@@ -7,9 +7,29 @@ import type { PromptConfig } from "../lib/contracts";
 
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-// Prompt: the profile's chat augmentation. Its one field, the prelude, is
-// prepended (invisibly) to the first user message of every new chat in this
-// profile. Saved to the `[prompt]` table of config.toml (see PromptConfigStore).
+// Ordered best-default-first. Labels name what the agent gets rather than what
+// Isolade does to it, since that is the part a reader has to reason about.
+const BASE_OPTIONS: { value: PromptConfig["base"]; label: string; hint: string }[] = [
+  {
+    value: "isolade",
+    label: "Isolade's",
+    hint: "Written for the sandbox: what agents may do without asking, which model they are running, how to attribute commits.",
+  },
+  {
+    value: "cli",
+    label: "The agent's own",
+    hint: "Whatever prompt Claude Code or Codex ships with, untouched. Longer, and written for someone working on their own machine.",
+  },
+  {
+    value: "none",
+    label: "None",
+    hint: "No base prompt. Your instructions below are the whole thing.",
+  },
+];
+
+// Prompt: which base prompt this profile's agents run on, plus the profile's own
+// instructions layered below it. Saved to the `[prompt]` table of config.toml
+// (see PromptConfigStore) and assembled per chat by buildSystemPrompt.
 export default function PromptTab({ activeProfileId }: { activeProfileId: string | null }) {
   const [saved, setSaved] = useState<PromptConfig | null>(null);
   const [cfg, setCfg] = useState<PromptConfig | null>(null);
@@ -39,9 +59,9 @@ export default function PromptTab({ activeProfileId }: { activeProfileId: string
     [cfg, saved],
   );
 
-  const setPrelude = useCallback((prelude: string) => {
+  const patch = useCallback((fields: Partial<PromptConfig>) => {
     setJustSaved(false);
-    setCfg({ prelude });
+    setCfg((prev) => (prev ? { ...prev, ...fields } : prev));
   }, []);
 
   const onSave = useCallback(async () => {
@@ -88,20 +108,55 @@ export default function PromptTab({ activeProfileId }: { activeProfileId: string
       <div className="max-w-2xl space-y-1">
         <h2 className="text-sm font-medium">Prompt</h2>
         <p className="text-xs text-muted-foreground">
-          Context prepended (invisibly) to the first message of every new chat in this profile. Your
-          message is stored as you typed it; only what's sent to the agent is augmented.
+          The system prompt every agent in this profile runs on: a base prompt, then your own
+          instructions on top.
         </p>
       </div>
 
+      <div className="max-w-2xl space-y-2">
+        <span className="text-sm font-medium">Base prompt</span>
+        {BASE_OPTIONS.map((option) => (
+          <label
+            key={option.value}
+            className="flex items-start gap-3 cursor-pointer select-none"
+            title={option.value}
+          >
+            <input
+              type="radio"
+              name="prompt-base"
+              className="accent-foreground mt-0.5"
+              checked={cfg.base === option.value}
+              onChange={() => patch({ base: option.value })}
+            />
+            <span className="flex flex-col gap-0.5">
+              <span className="text-sm">{option.label}</span>
+              <span className="text-xs text-muted-foreground">{option.hint}</span>
+            </span>
+          </label>
+        ))}
+        {cfg.base !== "cli" && (
+          <p className="text-xs text-muted-foreground/80">
+            Codex chats keep a short note about its patch format either way. Its file-editing tool
+            applies a change at the first place that looks like a match, so without it edits can
+            land in the wrong place.
+          </p>
+        )}
+      </div>
+
       <div className="max-w-2xl space-y-1.5">
-        <span className="text-sm font-medium">Prelude</span>
+        <span className="text-sm font-medium">Your instructions</span>
         <Textarea
           value={cfg.prelude}
-          placeholder="Optional context prepended to the first chat message…"
+          placeholder="Standing instructions for every agent in this profile…"
           spellCheck={false}
-          onChange={(e) => setPrelude(e.target.value)}
+          onChange={(e) => patch({ prelude: e.target.value })}
           className="min-h-40 text-xs"
         />
+        <p className="text-xs text-muted-foreground">
+          {cfg.base === "isolade"
+            ? "Added below the base prompt, and taking precedence over it wherever the two disagree."
+            : "Added below the base prompt."}
+        </p>
       </div>
 
       {saveError && <p className="text-xs text-destructive max-w-2xl">{saveError}</p>}

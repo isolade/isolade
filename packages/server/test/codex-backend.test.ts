@@ -256,10 +256,93 @@ describe("CodexBackend notification parsing", () => {
 
     expect(mgr.conn.sent).toContainEqual({
       method: "thread/start",
-      params: { ephemeral: false },
+      params: { ephemeral: false, personality: "none" },
     });
     expect(updated).toEqual([{ chatId: "chat", codexThreadId: "thread-new" }]);
     expect(result.sessionId).toBe("thread-new");
+  });
+
+  it("layers the system prompt on as developer instructions at thread start", async () => {
+    const mgr = new FakeCodexManager();
+    mgr.conn.script = [["turn/completed", { turn: { status: "completed" } }]];
+    const backend = new CodexBackend(
+      {} as unknown as SandboxClient,
+      noopChatManager,
+      mgr as unknown as CodexManager,
+    );
+
+    await backend.sendMessage({
+      vmId: "vm",
+      chatId: "chat",
+      message: "hi",
+      model: "gpt-5-codex",
+      effort: "medium",
+      systemPrompt: { text: "ISOLADE PROMPT", mode: "replace" as const },
+      onDelta: () => {},
+    });
+
+    // mode "replace" means baseInstructions: codex's own prompt is swapped out,
+    // which is only safe because the text carries CODEX_PATCH_RULES.
+    expect(mgr.conn.sent).toContainEqual({
+      method: "thread/start",
+      params: { ephemeral: false, personality: "none", baseInstructions: "ISOLADE PROMPT" },
+    });
+  });
+
+  it("layers rather than replaces when the profile keeps codex's own prompt", async () => {
+    const mgr = new FakeCodexManager();
+    mgr.conn.script = [["turn/completed", { turn: { status: "completed" } }]];
+    const backend = new CodexBackend(
+      {} as unknown as SandboxClient,
+      noopChatManager,
+      mgr as unknown as CodexManager,
+    );
+
+    await backend.sendMessage({
+      vmId: "vm",
+      chatId: "chat",
+      message: "hi",
+      model: "gpt-5-codex",
+      effort: "medium",
+      systemPrompt: { text: "MY PRELUDE", mode: "append" as const },
+      onDelta: () => {},
+    });
+
+    // developerInstructions leaves codex's base prompt — and so its own patch
+    // guidance — in place, so ours would be redundant here.
+    expect(mgr.conn.sent).toContainEqual({
+      method: "thread/start",
+      params: { ephemeral: false, personality: "none", developerInstructions: "MY PRELUDE" },
+    });
+  });
+
+  it("does not re-send the prompt when resuming an existing thread", async () => {
+    // thread/resume accepts no instruction fields; codex keeps the ones set at
+    // start. Sending them here would just be rejected params.
+    const mgr = new FakeCodexManager();
+    mgr.conn.script = [["turn/completed", { turn: { status: "completed" } }]];
+    const backend = new CodexBackend(
+      {} as unknown as SandboxClient,
+      noopChatManager,
+      mgr as unknown as CodexManager,
+    );
+
+    await backend.sendMessage({
+      vmId: "vm",
+      chatId: "chat",
+      message: "hi",
+      model: "gpt-5-codex",
+      effort: "medium",
+      sessionId: "thread-1",
+      systemPrompt: { text: "ISOLADE PROMPT", mode: "replace" as const },
+      onDelta: () => {},
+    });
+
+    expect(mgr.conn.sent).toContainEqual({
+      method: "thread/resume",
+      params: { threadId: "thread-1" },
+    });
+    expect(mgr.conn.sent.some((s) => s.method === "thread/start")).toBe(false);
   });
 
   it("resumes an existing thread before starting the turn", async () => {
@@ -336,7 +419,7 @@ describe("CodexBackend notification parsing", () => {
     });
     expect(mgr.conn.sent).toContainEqual({
       method: "thread/start",
-      params: { ephemeral: false },
+      params: { ephemeral: false, personality: "none" },
     });
     expect(updated).toEqual([{ codexThreadId: "thread-new" }]);
     expect(result.sessionId).toBe("thread-new");
