@@ -175,6 +175,27 @@ const SYSTEM_REMINDERS = `Injected text such as <system-reminder> comes from the
 bears no relation to the message it sits in.`;
 
 /**
+ * Nothing else names the guest CLI (buildInstallCliCommand), so untold an agent cannot
+ * hand over a server or attach a PR at all. Ports is offered rather than instructed,
+ * since most servers an agent starts are its own scaffolding. Bare `isolade` prints the
+ * usage, so `ports rm` and the `pr` variants go unlisted.
+ */
+const ISOLADE_CLI = `The in-VM \`isolade\` CLI reaches the app around this chat and prints its usage when run
+bare. When the user wants to look at a server you started, \`isolade ports add 5173\`
+publishes it for them to open. Attach a pull request the chat is about with
+\`isolade pr add 123\` from its checkout, as soon as it comes up.`;
+
+/**
+ * The one line that corrects the vendor prompts rather than filling a gap: both promise
+ * a monospace or CLI-styled surface, while Isolade renders `![](…)` inline from bytes
+ * captured out of the VM as the reply streams (agent-images.ts). The example path is
+ * absolute because a relative one resolves against the workspace root, not the cwd. No
+ * nudge to use it, deliberately.
+ */
+const IMAGES = `Replies render as markdown, images included: \`![](/workspace/out/chart.png)\` shows the
+file itself, from an absolute path in this VM or a URL, in any format a browser draws.`;
+
+/**
  * The model line and the attribution trailer both interpolate the id rather than
  * leaving it for the model to fill in, which is the whole point on the codex
  * side: its base prompt only says "based on GPT-5" and its
@@ -284,10 +305,17 @@ export function buildSystemPrompt(opts: {
   // reporting, automatic summarization, the injected-text framing, the working
   // directory, and on Claude the model id.
   //
-  // What is left is four things:
+  // What is left is six things:
   //
   //   The VM. Neither prompt mentions one, so neither says the environment is
   //   disposable.
+  //
+  //   The `isolade` CLI, both. Nothing outside this file names it under any base, so
+  //   keeping the vendor prompt costs an agent the capability entirely.
+  //
+  //   Inline images, both, and the one item here that is a correction rather than a
+  //   gap: a monospace font and "plain text styled by the CLI" are what the two
+  //   prompts promise, and this transcript is neither.
   //
   //   The permission posture, Claude only. Not merely missing there but contradicted:
   //   its prompt says "Tools run behind a user-selected permission mode; a denied
@@ -311,6 +339,8 @@ export function buildSystemPrompt(opts: {
       OVERLAY_IDENTITY,
       ...(isClaude ? [SANDBOX] : []),
       CREDENTIALS,
+      ISOLADE_CLI,
+      IMAGES,
       ...(isClaude ? [] : [modelIdentity(modelName, opts.model)]),
       attribution(opts.model),
       ...(prelude ? [PRELUDE_PRECEDENCE, ...preludeBlocks] : []),
@@ -332,6 +362,12 @@ export function buildSystemPrompt(opts: {
     ...(isClaude ? [SYSTEM_REMINDERS] : []),
     COMPACTION,
     DELIVERY,
+    // Before the patch rules rather than after: they open a `# Editing files`
+    // heading, and a heading opens a section, so a paragraph following it would
+    // read as more advice about editing files (the same reason the minimal branch
+    // heads the prelude on codex).
+    ISOLADE_CLI,
+    IMAGES,
     ...patchRules,
     modelIdentity(modelName, opts.model),
     attribution(opts.model),

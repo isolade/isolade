@@ -413,7 +413,7 @@ describe.skipIf(!hasCodex)("codex against a stub API", () => {
         expect(ours?.trimEnd().endsWith(PRELUDE)).toBe(true);
         // Blank lines between blocks survive the trip, so the text the model reads is
         // paragraphed the way buildSystemPrompt wrote it.
-        if (base === "extended") expect(ours).toContain("ask first.\n\nYou are running");
+        if (base === "extended") expect(ours).toContain("ask first.\n\nThe in-VM");
       }
     }, 120_000);
 
