@@ -570,7 +570,17 @@ export default function PanelWorkspace({
         if (x < r.left || x >= r.right || y < r.top || y >= r.bottom) continue;
         const panelId = body.dataset.bodyId as string;
         const zone = computeZone((x - r.left) / r.width, (y - r.top) / r.height);
-        return { target: { panelId, kind: "body", zone }, preview: previewForZone(zone, r) };
+        // An edge drop creates a panel whose bounds include its new tab strip.
+        // Hit-test against the body so the existing strip keeps handling tab
+        // reordering, but preview the split against the whole panel.
+        const previewRect =
+          zone === "center"
+            ? r
+            : (body.closest<HTMLElement>("[data-panel-id]")?.getBoundingClientRect() ?? r);
+        return {
+          target: { panelId, kind: "body", zone },
+          preview: previewForZone(zone, previewRect),
+        };
       }
       return null;
     },
@@ -1342,22 +1352,34 @@ function AddTabMenu({ panelId, align }: { panelId: string; align: "start" | "end
 
 // The floating overlay shown only during a drag: a full-window capture layer
 // (so the pointer can't get stuck inside a preview iframe), the drop-target
-// highlight, and a small ghost following the cursor. Portal it to <body> so
-// the retained instance's `contain: strict` cannot turn viewport coordinates
-// into coordinates relative to the instance wrapper.
+// highlight, and a small ghost following the cursor. Portal it past the retained
+// instance's `contain: strict`, which would turn viewport coordinates into
+// coordinates relative to that instance. In the browser, stop at the simulated
+// macOS window so its rounded frame clips the feedback exactly like a native
+// window does.
 export function DragLayer({ drag }: { drag: DragState | null }) {
   if (!drag) return null;
   const Icon = TAB_ICON[drag.kind];
+  const frame = document.querySelector<HTMLElement>(".mac-window");
+  const frameRect = frame?.getBoundingClientRect();
+  const offsetX = frameRect?.left ?? 0;
+  const offsetY = frameRect?.top ?? 0;
   return createPortal(
-    <>
-      <div data-panel-drag-capture className="fixed inset-0 z-[60] cursor-grabbing select-none" />
+    <div
+      data-panel-drag-boundary
+      className={cn(
+        "overflow-hidden",
+        frame ? "absolute inset-0 z-[55] [border-radius:inherit]" : "fixed inset-0 z-[60]",
+      )}
+    >
+      <div data-panel-drag-capture className="absolute inset-0 cursor-grabbing select-none" />
       {drag.preview && (
         <div
           data-panel-drag-preview
-          className="fixed z-[65] pointer-events-none rounded-sm bg-primary/20 border-2 border-primary/70"
+          className="absolute z-[5] pointer-events-none rounded-sm bg-primary/20 border-2 border-primary/70"
           style={{
-            left: drag.preview.left,
-            top: drag.preview.top,
+            left: drag.preview.left - offsetX,
+            top: drag.preview.top - offsetY,
             width: drag.preview.width,
             height: drag.preview.height,
           }}
@@ -1365,13 +1387,13 @@ export function DragLayer({ drag }: { drag: DragState | null }) {
       )}
       <div
         data-panel-drag-ghost
-        className="fixed z-[70] pointer-events-none flex items-center gap-1.5 px-2.5 h-7 rounded border border-border bg-background text-xs text-foreground shadow-md"
-        style={{ left: drag.x + 12, top: drag.y + 12 }}
+        className="absolute z-[10] pointer-events-none flex items-center gap-1.5 px-2.5 h-7 rounded border border-border bg-background text-xs text-foreground shadow-md"
+        style={{ left: drag.x + 12 - offsetX, top: drag.y + 12 - offsetY }}
       >
         <Icon className="size-3.5" />
         <span className="truncate max-w-[160px]">{drag.label}</span>
       </div>
-    </>,
-    document.body,
+    </div>,
+    frame ?? document.body,
   );
 }

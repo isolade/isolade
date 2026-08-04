@@ -1426,15 +1426,94 @@ test.describe("message renderer browser gate", () => {
     await expect(tabs.nth(1)).toHaveAttribute("aria-selected", "true");
   });
 
+  test("includes the new tab strip in a panel split preview", async ({ page }) => {
+    await page.route("**/api/instances/panel-gesture-instance/layout", async (route) => {
+      if (route.request().method() === "PATCH") {
+        await route.fulfill({ json: {} });
+        return;
+      }
+      await route.fulfill({
+        json: {
+          layout: {
+            type: "panel",
+            id: "split-preview-panel",
+            tabs: [
+              { id: "split-preview-tab-1", kind: "ports" },
+              { id: "split-preview-tab-2", kind: "browser" },
+            ],
+            activeTabId: "split-preview-tab-1",
+          },
+        },
+      });
+    });
+    await page.goto("/test/browser/harness/index.html?panelGesture=1");
+
+    const panel = page.locator('[data-panel-id="split-preview-panel"]');
+    const slot = page.locator('[data-body-id="split-preview-panel"]');
+    const tab = page.locator('[data-tab-id="split-preview-tab-2"]');
+    const [panelBounds, slotBounds, tabBounds] = await Promise.all([
+      panel.boundingBox(),
+      slot.boundingBox(),
+      tab.boundingBox(),
+    ]);
+    if (!panelBounds || !slotBounds || !tabBounds) {
+      throw new Error("Missing panel split preview bounds");
+    }
+
+    await page.mouse.move(tabBounds.x + tabBounds.width / 2, tabBounds.y + tabBounds.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(
+      tabBounds.x + tabBounds.width / 2,
+      tabBounds.y + tabBounds.height / 2 + 8,
+    );
+    await page.mouse.move(
+      slotBounds.x + slotBounds.width * 0.92,
+      slotBounds.y + slotBounds.height / 2,
+    );
+
+    await expect(page.locator("[data-panel-drag-preview]")).toHaveJSProperty(
+      "offsetHeight",
+      panelBounds.height,
+    );
+    expect(await page.locator("[data-panel-drag-preview]").boundingBox()).toEqual({
+      x: panelBounds.x + panelBounds.width / 2,
+      y: panelBounds.y,
+      width: panelBounds.width / 2,
+      height: panelBounds.height,
+    });
+
+    await page.mouse.move(0, 0);
+    await page.mouse.up();
+  });
+
   test("positions panel drag feedback in viewport coordinates", async ({ page }) => {
     await page.goto("/test/browser/harness/index.html?dragLayer=1");
 
     const preview = page.locator("[data-panel-drag-preview]");
     const ghost = page.locator("[data-panel-drag-ghost]");
-    await expect(preview).toHaveCSS("position", "fixed");
-    expect(await preview.evaluate((element) => element.parentElement === document.body)).toBe(true);
+    const boundary = page.locator("[data-panel-drag-boundary]");
+    await expect(boundary).toHaveCSS("position", "fixed");
+    expect(await boundary.evaluate((element) => element.parentElement === document.body)).toBe(
+      true,
+    );
     expect(await preview.boundingBox()).toEqual({ x: 160, y: 120, width: 240, height: 180 });
     expect(await ghost.boundingBox()).toMatchObject({ x: 212, y: 172, height: 28 });
+  });
+
+  test("clips panel drag feedback to the simulated macOS window", async ({ page }) => {
+    await page.goto("/test/browser/harness/index.html?dragLayer=1&macFrame=1");
+
+    const frame = page.locator(".mac-window");
+    const boundary = page.locator("[data-panel-drag-boundary]");
+    const preview = page.locator("[data-panel-drag-preview]");
+    await expect(boundary).toHaveCSS("position", "absolute");
+    await expect(boundary).toHaveCSS("overflow", "hidden");
+    await expect(boundary).toHaveCSS("border-radius", "16px");
+    expect(
+      await boundary.evaluate((element) => element.parentElement?.classList.contains("mac-window")),
+    ).toBe(true);
+    expect(await boundary.boundingBox()).toEqual(await frame.boundingBox());
+    expect(await preview.boundingBox()).toEqual({ x: 160, y: 120, width: 240, height: 180 });
   });
 
   test("positions a hydrated tail in its first populated commit", async ({ page }) => {
