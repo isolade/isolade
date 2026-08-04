@@ -2,7 +2,7 @@
   <img src="packages/web/src/assets/wordmark.svg" alt="Isolade" width="240">
   <br>
   <strong>Local-first coding agent workbench with secretless microVMs</strong>
-  <img src="https://isolade.com/demo.webp" alt="Demo" width="100%">
+  <img src="https://isolade.com/demo.webp?v=2" alt="Demo" width="100%">
   <img src="packages/web/src/assets/tagline.svg" alt="You sip. They ship." width="150">
 </div>
 
@@ -41,3 +41,7 @@ curl -fsSL https://isolade.com/install.sh | sh
 ```
 
 For other options, please visit the [installation docs](https://isolade.com/docs/installation).
+
+## Contributing
+
+We currently take contributions as issues rather than pull requests. See [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
