@@ -281,31 +281,51 @@ function PanelGestureHarness() {
   );
 }
 
+function DragLayerFixture() {
+  // Let an optional simulated window mount first, just as it has by the time a
+  // real user starts dragging a tab.
+  const [mounted, setMounted] = useState(false);
+  useLayoutEffect(() => setMounted(true), []);
+  if (!mounted) return null;
+  return (
+    <DragLayer
+      drag={{
+        tabId: "test-tab",
+        label: "Dragged tab",
+        kind: "chat",
+        x: 200,
+        y: 160,
+        preview: { left: 160, top: 120, width: 240, height: 180 },
+      }}
+    />
+  );
+}
+
 export function RendererHarness() {
-  if (new URLSearchParams(window.location.search).get("panelGesture") === "1") {
+  const parameters = new URLSearchParams(window.location.search);
+  if (parameters.get("panelGesture") === "1") {
     return <PanelGestureHarness />;
   }
-  if (new URLSearchParams(window.location.search).get("dragLayer") === "1") {
-    return (
+  if (parameters.get("dragLayer") === "1") {
+    const layer = (
       <main className="relative h-screen bg-background text-foreground">
         <div
           data-drag-containing-block
           className="absolute"
           style={{ left: 100, top: 80, width: 500, height: 400, contain: "strict" }}
         >
-          <DragLayer
-            drag={{
-              tabId: "test-tab",
-              label: "Dragged tab",
-              kind: "chat",
-              x: 200,
-              y: 160,
-              preview: { left: 160, top: 120, width: 240, height: 180 },
-            }}
-          />
+          <DragLayerFixture />
         </div>
       </main>
     );
+    if (parameters.get("macFrame") === "1") {
+      return (
+        <div className="mac-stage">
+          <div className="mac-window">{layer}</div>
+        </div>
+      );
+    }
+    return layer;
   }
   return <MessageRendererHarness />;
 }
