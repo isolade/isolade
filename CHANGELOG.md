@@ -6,6 +6,8 @@ We loosely follow [Keep a Changelog](https://keepachangelog.com/).
 
 _Changes landed on `main` that haven't shipped in a release yet._
 
+## [0.6.1] - 2026-08-04
+
 ### Fixed
 
 - Panel split previews now include the new panel's tab bar, so the highlighted
